@@ -1,13 +1,15 @@
-# paton_nn
+# Paton-NN
 
-[![Actions Status][actions-badge]][actions-link]
-[![Documentation Status][rtd-badge]][rtd-link]
+A [Flax](https://github.com/google/flax) neural network implementation of The Paton.
 
-[![PyPI version][pypi-version]][pypi-link]
-[![Conda-Forge][conda-badge]][conda-link]
-[![PyPI platforms][pypi-platforms]][pypi-link]
+<!-- [![Actions Status][actions-badge]][actions-link] -->
+<!-- [![Documentation Status][rtd-badge]][rtd-link] -->
 
-[![GitHub Discussion][github-discussions-badge]][github-discussions-link]
+<!-- [![PyPI version][pypi-version]][pypi-link] -->
+<!-- [![Conda-Forge][conda-badge]][conda-link] -->
+<!-- [![PyPI platforms][pypi-platforms]][pypi-link] -->
+
+<!-- [![GitHub Discussion][github-discussions-badge]][github-discussions-link] -->
 
 <!-- SPHINX-START -->
 
