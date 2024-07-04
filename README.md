@@ -1,6 +1,7 @@
 # Paton-NN
 
-A [Flax](https://github.com/google/flax) neural network implementation of The Paton.
+A [Flax](https://github.com/google/flax)-based neural network implementation of The
+Paton (citation needed).
 
 <!-- [![Actions Status][actions-badge]][actions-link] -->
 <!-- [![Documentation Status][rtd-badge]][rtd-link] -->
