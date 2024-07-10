@@ -9,13 +9,13 @@ from numpyro.contrib.module import random_flax_module
 
 
 class PatonNN(nn.Module):
-    n_labels: int
-    n_latents: int
+    n_label: int
+    n_latent: int
     n_hidden: int | tuple[int]
     n_flux: int
 
     def setup(self) -> None:
-        self.labels = nn.Dense(self.n_labels)
+        self.label = nn.Dense(self.n_label)
         if hasattr(self.n_hidden, "__iter__"):
             hidden_layers = []
             for i, n in enumerate(self.n_hidden):
@@ -30,40 +30,56 @@ class PatonNN(nn.Module):
 
     def __call__(self, z: jax.Array) -> tuple[jax.Array, jax.Array]:
         # Linear transformation of the latents:
-        labels = self.labels(z)
+        label = self.label(z)
 
         # potentially "deep" layers
         hidden = z
         for layer in self._hidden_layers:
-            # TODO: relu or sigmoid? APW thinks sigmoid
-            hidden = jax.nn.sigmoid(layer(hidden))
+            # TODO: relu or sigmoid or what?
+            # hidden = jax.nn.sigmoid(layer(hidden))
+            hidden = jax.nn.softplus(layer(hidden))
 
         # Assumes the flux is continuum normalized to [0,1]ish
         flux = self.flux(hidden)
 
-        return labels, flux
+        return label, flux
 
     def numpyro_model(self, data: dict[str, jax.Array]) -> None:
         n_stars = data["label"].shape[0]
         assert data["flux"].shape[0] == n_stars
 
+        label_k_scale = jnp.concatenate(
+            (jnp.ones(self.n_label), 0.1 * jnp.ones(self.n_latent - self.n_label))
+        )[:, None]
+        # label_k_scale = 0.1
+        flax_priors = {
+            "flux.bias": dist.Normal(),
+            "flux.kernel": dist.Laplace(scale=0.1),
+            "label.bias": dist.Normal(),
+            "label.kernel": dist.Laplace(scale=label_k_scale),
+        }
+        if isinstance(self.n_hidden, int):
+            flax_priors["hidden.bias"] = dist.Normal()
+            flax_priors["hidden.kernel"] = dist.Laplace()
+        else:
+            for i, _ in enumerate(self.n_hidden):
+                flax_priors[f"hidden_{i}.bias"] = dist.Normal()
+                flax_priors[f"hidden_{i}.kernel"] = dist.Laplace()
+
+        # flax_priors = dist.Normal()
+
         paton = random_flax_module(
             "paton",
             self,
-            prior=dist.Normal(),
-            # Note: could instead specify custom priors for the kernel/bias of each layer
-            # prior={
-            #     "flux.bias": dist.Normal(scale=0.1),
-            #     "flux.kernel": dist.Normal(),
-            #     ...
-            input_shape=(n_stars, self.n_latents),
+            prior=flax_priors,
+            input_shape=(n_stars, self.n_latent),
         )
 
-        mean = numpyro.sample(
-            "zeta_mean", dist.Normal(), sample_shape=(self.n_latents,)
-        )
+        mean = numpyro.sample("zeta_mean", dist.Normal(), sample_shape=(self.n_latent,))
+
+        # TODO: revisit this prior?
         log_std = numpyro.sample(
-            "zeta_logstd", dist.Normal(), sample_shape=(self.n_latents,)
+            "zeta_logstd", dist.Normal(-2, 1), sample_shape=(self.n_latent,)
         )
         zeta = numpyro.sample(
             "zeta",
@@ -76,10 +92,10 @@ class PatonNN(nn.Module):
 
         model_label, model_flux = paton(zeta)
         numpyro.sample(
-            "label", dist.Normal(model_label, data["label_err"]), obs=data["label"]
+            "label_obs", dist.Normal(model_label, data["label_err"]), obs=data["label"]
         )
         numpyro.sample(
-            "flux", dist.Normal(model_flux, data["flux_err"]), obs=data["flux"]
+            "flux_obs", dist.Normal(model_flux, data["flux_err"]), obs=data["flux"]
         )
 
     def numpyro_model_label(
