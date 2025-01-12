@@ -1,141 +1,288 @@
-from typing import Any
+import inspect
+from dataclasses import dataclass
+from typing import Any, Protocol
 
-import flax.linen as nn
+import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpyro
 import numpyro.distributions as dist
-from numpyro.contrib.module import random_flax_module
+from jax.typing import ArrayLike
+
+# TransformT = Callable[[jax.Array, *tuple[jax.Array]], jax.Array]
+TransformParamsT = dict[str, dist.Distribution]
 
 
-class PatonNN(nn.Module):
-    n_label: int
-    n_latent: int
-    n_hidden: int | tuple[int]
-    n_flux: int
+class TransformT(Protocol):
+    def __call__(
+        self, latent: jax.Array, *args: jax.Array, **kwargs: jax.Array
+    ) -> jax.Array: ...
 
-    def setup(self) -> None:
-        self.label = nn.Dense(self.n_label)
-        if hasattr(self.n_hidden, "__iter__"):
-            hidden_layers = []
-            for i, n in enumerate(self.n_hidden):
-                setattr(self, f"hidden_{i}", nn.Dense(n))
-                hidden_layers.append(getattr(self, f"hidden_{i}"))
-        else:
-            self.hidden = nn.Dense(self.n_hidden)
-            hidden_layers = [self.hidden]
 
-        self._hidden_layers = hidden_layers
-        self.flux = nn.Dense(self.n_flux)
+class PatonValidationError(Exception):
+    pass
 
-    def __call__(self, z: jax.Array) -> tuple[jax.Array, jax.Array]:
-        # Linear transformation of the latents:
-        label = self.label(z)
 
-        # potentially "deep" layers
-        hidden = z
-        for layer in self._hidden_layers:
-            # TODO: relu or sigmoid or what?
-            # hidden = jax.nn.sigmoid(layer(hidden))
-            hidden = jax.nn.softplus(layer(hidden))
+@dataclass
+class Output:
+    size: int
+    transform: TransformT
+    transform_params: TransformParamsT
 
-        # Assumes the flux is continuum normalized to [0,1]ish
-        flux = self.flux(hidden)
+    def __post_init__(self) -> None:
+        # Validate transform parameters match signature
+        sig = inspect.signature(self.transform)
+        param_names = list(sig.parameters.keys())
 
-        return label, flux
+        if len(param_names) < 1:
+            msg = "transform must accept at least one argument (latent vector)"
+            raise PatonValidationError(msg)
 
-    def numpyro_model(self, data: dict[str, jax.Array]) -> None:
-        n_stars = data["label"].shape[0]
-        assert data["flux"].shape[0] == n_stars
+        # Skip first parameter (latent vector)
+        expected_params = set(param_names[1:])
+        provided_params = set(self.transform_params.keys())
 
-        label_k_scale = jnp.concatenate(
-            (jnp.ones(self.n_label), 0.1 * jnp.ones(self.n_latent - self.n_label))
-        )[:, None]
-        # label_k_scale = 0.1
-        flax_priors = {
-            "flux.bias": dist.Normal(),
-            "flux.kernel": dist.Laplace(scale=0.1),
-            "label.bias": dist.Normal(),
-            "label.kernel": dist.Laplace(scale=label_k_scale),
-        }
-        if isinstance(self.n_hidden, int):
-            flax_priors["hidden.bias"] = dist.Normal()
-            flax_priors["hidden.kernel"] = dist.Laplace()
-        else:
-            for i, _ in enumerate(self.n_hidden):
-                flax_priors[f"hidden_{i}.bias"] = dist.Normal()
-                flax_priors[f"hidden_{i}.kernel"] = dist.Laplace()
+        if expected_params != provided_params:
+            missing = expected_params - provided_params
+            extra = provided_params - expected_params
+            msgs = []
+            if missing:
+                msgs.append(f"Missing parameters: {missing}")
+            if extra:
+                msgs.append(f"Unexpected parameters: {extra}")
+            raise PatonValidationError(". ".join(msgs))
 
-        # flax_priors = dist.Normal()
+        # Validate all priors are proper distributions
+        for name, prior in self.transform_params.items():
+            if not isinstance(prior, dist.Distribution):
+                msg = f"Prior '{name}' must be a numpyro Distribution instance"
+                raise PatonValidationError(msg)
 
-        paton = random_flax_module(
-            "paton",
-            self,
-            prior=flax_priors,
-            input_shape=(n_stars, self.n_latent),
+        # TODO: make sure transform_params is in the order of the transform signature
+        # (or at least that the order of the keys matches the order of the signature)
+
+        # now we make sure to vmap over latents:
+        self.transform = jax.vmap(
+            self.transform, in_axes=(0, *tuple([None] * len(expected_params)))
         )
 
-        mean = numpyro.sample("zeta_mean", dist.Normal(), sample_shape=(self.n_latent,))
 
-        # TODO: revisit this prior?
-        log_std = numpyro.sample(
-            "zeta_logstd", dist.Normal(-2, 1), sample_shape=(self.n_latent,)
-        )
-        zeta = numpyro.sample(
-            "zeta",
-            dist.Normal(mean, jnp.exp(log_std)),
-            sample_shape=(n_stars,),
-        )
+class Paton(eqx.Module):
+    latent_size: int
+    outputs: dict[str, Output] = eqx.field(default_factory=dict)
 
-        # TODO: additional L1 regularization on the latents beyond n_labels?
-        # numpyro.factor("zeta_L1", -jnp.abs(zeta[:, self.n_labels:] / 0.1).sum())
-
-        model_label, model_flux = paton(zeta)
-        numpyro.sample(
-            "label_obs", dist.Normal(model_label, data["label_err"]), obs=data["label"]
-        )
-        numpyro.sample(
-            "flux_obs", dist.Normal(model_flux, data["flux_err"]), obs=data["flux"]
-        )
-
-    def numpyro_model_label(
+    def register_output(
         self,
-        data: dict[str, jax.Array],
-        paton_params: dict[str, Any],
-        other_params: dict[str, jax.Array],
+        name: str,
+        size: int,
+        transform: TransformT,
+        transform_params: TransformParamsT,
     ) -> None:
-        n_stars = data["label"].shape[0]
-        zeta = numpyro.sample(
-            "zeta",
-            dist.Normal(
-                other_params["zeta_mean"], jnp.exp(other_params["zeta_logstd"])
-            ),
-            sample_shape=(n_stars,),
+        """Register a new output with its transform and parameter priors."""
+        self.outputs[name] = Output(
+            size=size, transform=transform, transform_params=transform_params
         )
 
-        model_label, model_flux = self.apply(paton_params, zeta)
-        numpyro.sample(
-            "flux", dist.Normal(model_flux, data["flux_err"]), obs=data["flux"]
-        )
-        numpyro.deterministic("label", model_label)
-
-    def numpyro_model_flux(
+    def predict_outputs(
         self,
-        data: dict[str, jax.Array],
-        paton_params: dict[str, Any],
-        other_params: dict[str, jax.Array],
-    ) -> None:
-        n_stars = data["label"].shape[0]
-        zeta = numpyro.sample(
-            "zeta",
-            dist.Normal(
-                other_params["zeta_mean"], jnp.exp(other_params["zeta_logstd"])
-            ),
-            sample_shape=(n_stars,),
-        )
+        latent_z: jax.Array,
+        params: dict[str, Any],
+        which: list[str] | str | None = None,
+    ) -> jax.Array | dict[str, jax.Array]:
+        """Predict outputs for given latent vectors and parameters.
 
-        model_label, model_flux = self.apply(paton_params, zeta)
-        numpyro.sample(
-            "label", dist.Normal(model_label, data["label_err"]), obs=data["label"]
-        )
-        numpyro.deterministic("flux", model_flux)
+        Parameters
+        ----------
+        latent_z
+            The latent vectors for your sample of stars.
+        params
+            A dictionary of parameters for each output in the model.
+        which
+            A list of output names to predict. If None, predict all outputs.
+
+        Returns
+        -------
+        dict
+            A dictionary of predicted outputs, where the keys are the output names.
+        """
+
+        if which is None:
+            which = list(self.outputs.keys())
+        elif isinstance(which, str):
+            which = [which]
+
+        results = {}
+        for name in which:
+            output = self.outputs[name]
+
+            # Note: needs to be a list or iterable because of how vmap works
+            # output_params = {k: params[name][k] for k in output.transform_params}
+            output_params = [params[name][k] for k in output.transform_params]
+            results[name] = output.transform(latent_z, *output_params)
+
+        return results
+
+    def _validate_data(
+        self, data: dict[str, ArrayLike], errs: dict[str, ArrayLike]
+    ) -> tuple[dict[str, jax.Array], dict[str, jax.Array]]:
+        """Validate data and errors, returning as jax arrays."""
+        # check that data and errs have the same keys
+        if set(data.keys()) != set(errs.keys()):
+            msg = "Data and errors must have the same keys"
+            raise PatonValidationError(msg)
+
+        _data = {k: jnp.array(v) for k, v in data.items()}
+        _errs = {k: jnp.array(v) for k, v in errs.items()}
+        return _data, _errs
+
+    def setup_numpyro(
+        self,
+        latent_z: jax.Array,
+        data: dict[str, ArrayLike],
+        errs: dict[str, ArrayLike],
+        which: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Sample parameters and set up basic numpyro model.
+
+        Parameters
+        ----------
+        latent_z
+            The latent vectors for your sample of stars.
+        data
+            A dictionary of observed data.
+        errs
+            A dictionary of errors for the observed data.
+        which
+            A list of output names to include in the model. If None, use all outputs.
+
+        Returns
+        -------
+        dict
+            A dictionary of sampled parameters for each output.
+        """
+        which = which or list(self.outputs.keys())
+
+        params: dict[str, dict[str, Any]] = {}
+        for name in which:
+            output = self.outputs[name]
+            params[name] = {}
+            for param_name, prior in output.transform_params.items():
+                params[name][param_name] = numpyro.sample(f"{name}:{param_name}", prior)
+
+        outputs = self.predict_outputs(latent_z, params, which=which)
+        for name in which:
+            pred = outputs[name]
+            numpyro.sample(f"obs:{name}", dist.Normal(pred, errs[name]), obs=data[name])
+
+        return params
+
+    def default_numpyro_model(
+        self,
+        data: dict[str, ArrayLike],
+        errs: dict[str, ArrayLike],
+        latent_prior: dist.Distribution | None = None,
+        fixed_params: dict[str, jax.Array] | None = None,
+    ) -> None:
+        """Create the default numpyro model for the Paton.
+
+        The default model uses the specified latent vector prior and assumes that the
+        data are Gaussian distributed away from the true (predicted) values given the
+        specified errors.
+
+        Parameters
+        ----------
+        data
+            A dictionary of observed data.
+        errs
+            A dictionary of errors for the observed data.
+        latent_prior
+            The prior distribution for the latent vectors. If None, use a unit Gaussian.
+        fixed_params
+            A dictionary of fixed parameters to condition on. If None, all parameters
+            will be sampled.
+
+        """
+        if latent_prior is None:
+            latent_prior = dist.Normal()
+
+        if latent_prior.batch_shape != (self.latent_size,):
+            latent_prior = latent_prior.expand((self.latent_size,))
+
+        data_, errs_ = self._validate_data(data, errs)
+        n_data = len(data_[next(iter(data_.keys()))])
+
+        # Use condition handler to fix parameters if specified
+        with numpyro.handlers.condition(data=fixed_params or {}):
+            latent_z = numpyro.sample(
+                "latent_z",
+                latent_prior,
+                sample_shape=(n_data,),
+            )
+            params = self.setup_numpyro(latent_z, data_, errs_)
+
+    def unpack_numpyro_params(
+        self, params: dict[str, jax.Array]
+    ) -> dict[str, dict[str, jax.Array]]:
+        """Unpack numpyro parameters into a nested structure.
+
+        Numpyro parameters use names like "output_name:param_name" to make the numpyro
+        internal names unique. However, this method unpacks these into a nested
+        dictionary keyed on [output_name][param_name].
+
+        Parameters
+        ----------
+        params
+            A dictionary of numpyro parameters. The keys should be in the format
+            "output_name:param_name".
+
+        Returns
+        -------
+        dict
+            A nested dictionary of parameters, where the top level keys are the output
+            names.
+        """
+        unpacked: dict[str, Any | dict[str, Any]] = {}
+        handled_params = set()
+        for name, output in self.outputs.items():
+            unpacked[name] = {}
+            for k in output.transform_params:
+                numpyro_name = f"{name}:{k}"
+                unpacked[name][k] = params[numpyro_name]
+                handled_params.add(numpyro_name)
+
+        for name in set(params.keys()) - handled_params:
+            unpacked[name] = params[name]
+
+        return unpacked
+
+    def pack_numpyro_params(
+        self, params: dict[str, dict[str, jax.Array]]
+    ) -> dict[str, jax.Array]:
+        """Pack parameters into a flat dictionary keyed on numpyro names.
+
+        This method is the inverse of `unpack_numpyro_params`. It takes a nested
+        dictionary of parameters and flattens it into a dictionary of numpyro
+        parameters. For example, it takes a nested dictionary keyed like
+        [output_name][param_name] and flattens it into a dictionary keyed like
+        "output_name:param_name".
+
+        Parameters
+        ----------
+        params
+            A nested dictionary of parameters, where the top level keys are the output
+            names.
+
+        Returns
+        -------
+        dict
+            A dictionary of numpyro parameters. The keys are in the format
+            "output_name:param_name
+
+        """
+        packed: dict[str, jax.Array] = {}
+        for name, output in self.outputs.items():
+            for k in output.transform_params:
+                numpyro_name = f"{name}:{k}"
+                packed[numpyro_name] = params[name][k]
+
+        return packed
