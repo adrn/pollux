@@ -7,9 +7,9 @@ import numpyro
 import numpyro.distributions as dist
 from jax.typing import ArrayLike
 
-from .._src.exceptions import ModelValidationError
-from .._src.model_shared import Output
-from .._src.typing import TransformParamsT, TransformT
+from ..exceptions import ModelValidationError
+from ..shared import Output
+from ..typing import TransformParamsT, TransformT
 
 
 class Paton(eqx.Module):

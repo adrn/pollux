@@ -43,6 +43,10 @@ test = [
 dev = [
   "pytest >=6",
   "pytest-cov >=3",
+  "ipykernel",
+  "jupyter_client",
+  "matplotlib",
+  "numpy"
 ]
 docs = [
   "sphinx>=7.0",
