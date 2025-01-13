@@ -172,10 +172,16 @@ class AbstractModel(eqx.Module):
 
         return packed
 
+    # Abstract methods to be implemented by the specific models:
+
     @abc.abstractmethod
     def setup_numpyro(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         pass
 
     @abc.abstractmethod
     def default_numpyro_model(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    @abc.abstractmethod
+    def predict_outputs(self, *args: Any, **kwargs: Any) -> None:
         pass
