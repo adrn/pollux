@@ -1,7 +1,7 @@
 """
-Copyright (c) 2024 adrn. All rights reserved.
+Copyright (c) 2024-2025 adrn. All rights reserved.
 
-pollux: A NN version of The Paton
+pollux: Data-driven models of stellar spectra.
 """
 
 from __future__ import annotations
