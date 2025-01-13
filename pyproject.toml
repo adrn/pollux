@@ -8,12 +8,11 @@ name = "pollux"
 authors = [
   { name = "adrn", email = "adrian.prw@gmail.com" },
 ]
-description = "A NN version of The Paton"
+description = "JAX implementations of data-driven models for stellar spectroscopy"
 readme = "README.md"
 license.file = "LICENSE"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 classifiers = [
-  "Development Status :: 1 - Planning",
   "Intended Audience :: Science/Research",
   "Intended Audience :: Developers",
   "License :: OSI Approved :: MIT License",
@@ -21,9 +20,9 @@ classifiers = [
   "Programming Language :: Python",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
-  "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
   "Topic :: Scientific/Engineering",
   "Typing :: Typed",
 ]
@@ -149,7 +148,7 @@ ignore = [
 
 
 [tool.pylint]
-py-version = "3.10"
+py-version = "3.11"
 ignore-paths = [".*/_version.py"]
 reports.output-format = "colorized"
 similarities.ignore-imports = "yes"
