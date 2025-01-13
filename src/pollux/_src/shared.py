@@ -183,5 +183,7 @@ class AbstractModel(eqx.Module):
         pass
 
     @abc.abstractmethod
-    def predict_outputs(self, *args: Any, **kwargs: Any) -> None:
+    def predict_outputs(
+        self, *args: Any, **kwargs: Any
+    ) -> jax.Array | dict[str, jax.Array]:
         pass
