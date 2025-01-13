@@ -218,14 +218,14 @@ class Paton(eqx.Module):
                 latent_prior,
                 sample_shape=(n_data,),
             )
-            params = self.setup_numpyro(latent_z, data_, errs_)
+            self.setup_numpyro(latent_z, data_, errs_)  # type: ignore[arg-type]
 
     def unpack_numpyro_params(
         self, params: dict[str, jax.Array]
     ) -> dict[str, dict[str, jax.Array]]:
         """Unpack numpyro parameters into a nested structure.
 
-        Numpyro parameters use names like "output_name:param_name" to make the numpyro
+        numpyro parameters use names like "output_name:param_name" to make the numpyro
         internal names unique. However, this method unpacks these into a nested
         dictionary keyed on [output_name][param_name].
 
