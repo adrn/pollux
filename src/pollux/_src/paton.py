@@ -1,6 +1,4 @@
-import inspect
-from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any
 
 import equinox as eqx
 import jax
@@ -9,62 +7,9 @@ import numpyro
 import numpyro.distributions as dist
 from jax.typing import ArrayLike
 
-# TransformT = Callable[[jax.Array, *tuple[jax.Array]], jax.Array]
-TransformParamsT = dict[str, dist.Distribution]
-
-
-class TransformT(Protocol):
-    def __call__(
-        self, latent: jax.Array, *args: jax.Array, **kwargs: jax.Array
-    ) -> jax.Array: ...
-
-
-class PatonValidationError(Exception):
-    pass
-
-
-@dataclass
-class Output:
-    size: int
-    transform: TransformT
-    transform_params: TransformParamsT
-
-    def __post_init__(self) -> None:
-        # Validate transform parameters match signature
-        sig = inspect.signature(self.transform)
-        param_names = list(sig.parameters.keys())
-
-        if len(param_names) < 1:
-            msg = "transform must accept at least one argument (latent vector)"
-            raise PatonValidationError(msg)
-
-        # Skip first parameter (latent vector)
-        expected_params = set(param_names[1:])
-        provided_params = set(self.transform_params.keys())
-
-        if expected_params != provided_params:
-            missing = expected_params - provided_params
-            extra = provided_params - expected_params
-            msgs = []
-            if missing:
-                msgs.append(f"Missing parameters: {missing}")
-            if extra:
-                msgs.append(f"Unexpected parameters: {extra}")
-            raise PatonValidationError(". ".join(msgs))
-
-        # Validate all priors are proper distributions
-        for name, prior in self.transform_params.items():
-            if not isinstance(prior, dist.Distribution):
-                msg = f"Prior '{name}' must be a numpyro Distribution instance"
-                raise PatonValidationError(msg)
-
-        # TODO: make sure transform_params is in the order of the transform signature
-        # (or at least that the order of the keys matches the order of the signature)
-
-        # now we make sure to vmap over latents:
-        self.transform = jax.vmap(
-            self.transform, in_axes=(0, *tuple([None] * len(expected_params)))
-        )
+from .._src.exceptions import ModelValidationError
+from .._src.model_shared import Output
+from .._src.typing import TransformParamsT, TransformT
 
 
 class Paton(eqx.Module):
@@ -129,7 +74,7 @@ class Paton(eqx.Module):
         # check that data and errs have the same keys
         if set(data.keys()) != set(errs.keys()):
             msg = "Data and errors must have the same keys"
-            raise PatonValidationError(msg)
+            raise ModelValidationError(msg)
 
         _data = {k: jnp.array(v) for k, v in data.items()}
         _errs = {k: jnp.array(v) for k, v in errs.items()}
