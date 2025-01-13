@@ -1,7 +1,7 @@
-# Paton-NN
+# Pollux
 
-A [Flax](https://github.com/google/flax)-based neural network implementation of The
-Paton (citation needed).
+JAX implementations of data-driven models for stellar spectroscopy, like the
+_Cannon_ and the _Paton_.
 
 <!-- [![Actions Status][actions-badge]][actions-link] -->
 <!-- [![Documentation Status][rtd-badge]][rtd-link] -->
