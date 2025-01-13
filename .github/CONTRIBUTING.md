@@ -71,7 +71,7 @@ pytest
 Use pytest-cov to generate coverage reports:
 
 ```bash
-pytest --cov=paton_nn
+pytest --cov=pollux
 ```
 
 # Building docs

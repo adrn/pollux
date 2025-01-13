@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import importlib.metadata
 
-import paton_nn as m
+import pollux as m
 
 
 def test_version():
-    assert importlib.metadata.version("paton_nn") == m.__version__
+    assert importlib.metadata.version("pollux") == m.__version__

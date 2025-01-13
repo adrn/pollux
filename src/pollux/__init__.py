@@ -1,7 +1,7 @@
 """
 Copyright (c) 2024 adrn. All rights reserved.
 
-paton_nn: A NN version of The Paton
+pollux: A NN version of The Paton
 """
 
 from __future__ import annotations

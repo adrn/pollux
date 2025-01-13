@@ -15,16 +15,16 @@ Paton (citation needed).
 <!-- SPHINX-START -->
 
 <!-- prettier-ignore-start -->
-[actions-badge]:            https://github.com/adrn/paton_nn/workflows/CI/badge.svg
-[actions-link]:             https://github.com/adrn/paton_nn/actions
-[conda-badge]:              https://img.shields.io/conda/vn/conda-forge/paton_nn
-[conda-link]:               https://github.com/conda-forge/paton_nn-feedstock
+[actions-badge]:            https://github.com/adrn/pollux/workflows/CI/badge.svg
+[actions-link]:             https://github.com/adrn/pollux/actions
+[conda-badge]:              https://img.shields.io/conda/vn/conda-forge/pollux
+[conda-link]:               https://github.com/conda-forge/pollux-feedstock
 [github-discussions-badge]: https://img.shields.io/static/v1?label=Discussions&message=Ask&color=blue&logo=github
-[github-discussions-link]:  https://github.com/adrn/paton_nn/discussions
-[pypi-link]:                https://pypi.org/project/paton_nn/
-[pypi-platforms]:           https://img.shields.io/pypi/pyversions/paton_nn
-[pypi-version]:             https://img.shields.io/pypi/v/paton_nn
-[rtd-badge]:                https://readthedocs.org/projects/paton_nn/badge/?version=latest
-[rtd-link]:                 https://paton_nn.readthedocs.io/en/latest/?badge=latest
+[github-discussions-link]:  https://github.com/adrn/pollux/discussions
+[pypi-link]:                https://pypi.org/project/pollux/
+[pypi-platforms]:           https://img.shields.io/pypi/pyversions/pollux
+[pypi-version]:             https://img.shields.io/pypi/v/pollux
+[rtd-badge]:                https://readthedocs.org/projects/pollux/badge/?version=latest
+[rtd-link]:                 https://pollux.readthedocs.io/en/latest/?badge=latest
 
 <!-- prettier-ignore-end -->

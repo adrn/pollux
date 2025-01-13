@@ -1,4 +1,4 @@
-# paton_nn
+# pollux
 
 ```{toctree}
 :maxdepth: 2

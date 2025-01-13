@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 
 [project]
-name = "paton_nn"
+name = "pollux"
 authors = [
   { name = "adrn", email = "adrian.prw@gmail.com" },
 ]
@@ -29,9 +29,11 @@ classifiers = [
 ]
 dynamic = ["version"]
 dependencies = [
+  "equinox",
   "jax",
-  "flax",
-  "optax"
+  "jaxopt",
+  "numpyro",
+  "numpyro-ext",
 ]
 
 [project.optional-dependencies]
@@ -52,15 +54,15 @@ docs = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/adrn/paton_nn"
-"Bug Tracker" = "https://github.com/adrn/paton_nn/issues"
-Discussions = "https://github.com/adrn/paton_nn/discussions"
-Changelog = "https://github.com/adrn/paton_nn/releases"
+Homepage = "https://github.com/adrn/pollux"
+"Bug Tracker" = "https://github.com/adrn/pollux/issues"
+Discussions = "https://github.com/adrn/pollux/discussions"
+Changelog = "https://github.com/adrn/pollux/releases"
 
 
 [tool.hatch]
 version.source = "vcs"
-build.hooks.vcs.version-file = "src/paton_nn/_version.py"
+build.hooks.vcs.version-file = "src/pollux/_version.py"
 
 [tool.hatch.envs.default]
 features = ["test"]
@@ -81,7 +83,7 @@ testpaths = [
 
 
 [tool.coverage]
-run.source = ["paton_nn"]
+run.source = ["pollux"]
 report.exclude_also = [
   '\.\.\.',
   'if typing.TYPE_CHECKING:',
@@ -89,7 +91,7 @@ report.exclude_also = [
 
 [tool.mypy]
 files = ["src", "tests"]
-python_version = "3.10"
+python_version = "3.11"
 warn_unused_configs = true
 strict = true
 enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
@@ -99,7 +101,7 @@ disallow_incomplete_defs = false
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
-module = "paton_nn.*"
+module = "pollux.*"
 disallow_untyped_defs = true
 disallow_incomplete_defs = true
 
@@ -139,7 +141,7 @@ ignore = [
 ]
 # isort.required-imports = []
 # Uncomment if using a _compat.typing backport
-# typing-modules = ["paton_nn._compat.typing"]
+# typing-modules = ["pollux._compat.typing"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["T20"]

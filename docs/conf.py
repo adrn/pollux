@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import importlib.metadata
 
-project = "paton_nn"
+project = "pollux"
 copyright = "2024, adrn"
 author = "adrn"
-version = release = importlib.metadata.version("paton_nn")
+version = release = importlib.metadata.version("pollux")
 
 extensions = [
     "myst_parser",
