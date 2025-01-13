@@ -1,3 +1,11 @@
+"""The Paton model and associated functionality.
+
+TODO:
+- Docstrings and examples
+- Is there a general way of registering the name of latent_z (paton) and features
+  (cannon) so we can share the predict_outputs and setup_numpyro implementations?
+"""
+
 from typing import Any
 
 import jax
