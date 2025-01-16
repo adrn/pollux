@@ -41,7 +41,7 @@ class OutputData(eqx.Module):
     input data::
 
     >>> import numpy as np
-    >>> from pollux import OutputData
+    >>> from pollux.data import OutputData
     >>> rng = np.random.default_rng(seed=42)
     >>> spectra = rng.uniform(0, 10, size=(128, 2048))
     >>> spectra_err = rng.uniform(0, 1, size=spectra.shape)
@@ -57,7 +57,15 @@ class OutputData(eqx.Module):
     >>> assert np.all(flux_data.data_processed == flux_data.data)
     >>> assert np.all(flux_data.err_processed == flux_data.err)
 
-    Instead, we could specify TODO
+    Instead, we could specify a data pre-processor to rescale and center the input data.
+    For this, we use the ``NormalizePreprocessor``, which centers the data on the mean
+    and scales to unit variance::
+
+    >>> from pollux.data import NormalizePreprocessor
+    >>> flux_data = OutputData(
+    ...     data=spectra, err=spectra_err, preprocessor=NormalizePreprocessor()
+    ... )
+    >>> assert np.allclose(np.std(flux_data.data_processed, axis=0), 1.0)
 
     """
 

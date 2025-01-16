@@ -52,7 +52,22 @@ class AbstractPreprocessor(eqx.Module):
 
 
 class NullPreprocessor(AbstractPreprocessor):
-    """A preprocessor that does nothing to data."""
+    """A preprocessor that does nothing to data.
+
+    Examples
+    --------
+    This data preprocessor does nothing to the  centers the data on the mean and scales to unit
+    variance, both computed along axis=0::
+
+    >>> import numpy as np
+    >>> from pollux.data import NormalizePreprocessor
+    >>> rng = np.random.default_rng(0)
+    >>> X = rng.normal(1.0, 2.0, size=(1024, 10))
+    >>> preprocessor = NormalizePreprocessor()
+    >>> preprocessor.fit(X)
+    >>> assert np.allclose(preprocessor.loc, np.mean(X, axis=0))
+    >>> assert np.allclose(preprocessor.scale, np.std(X, axis=0))
+    """
 
     def fit(self, X: jax.Array) -> None:
         pass
@@ -71,14 +86,40 @@ class NullPreprocessor(AbstractPreprocessor):
 
 
 class NormalizePreprocessor(AbstractPreprocessor):
-    """Recenter on the mean and scale to unit variance."""
+    """Recenter on the mean and scale to unit variance.
 
+    Examples
+    --------
+    By default, this data preprocessor centers the data on the mean and scales to unit
+    variance, both computed along axis=0::
+
+    >>> import numpy as np
+    >>> from pollux.data import NormalizePreprocessor
+    >>> rng = np.random.default_rng(0)
+    >>> X = rng.normal(1.0, 2.0, size=(1024, 10))
+    >>> preprocessor = NormalizePreprocessor()
+    >>> preprocessor.fit(X)
+    >>> processed_X = preprocessor.transform(X)
+    >>> assert np.allclose(np.mean(processed_X, axis=0), 0.0)
+    >>> assert np.allclose(np.std(processed_X, axis=0), 1.0)
+
+    To instead use the mean and standard deviation computed over all axes, set the axis
+    to None::
+
+    >>> preprocessor = NormalizePreprocessor(axis=None)
+    >>> preprocessor.fit(X)
+    >>> assert np.allclose(preprocessor.loc, np.mean(X))
+    >>> assert np.allclose(preprocessor.scale, np.std(X))
+
+    """
+
+    axis: int | None = 0
     loc: jax.Array | None = None
     scale: jax.Array | None = None
 
     def fit(self, X: jax.Array) -> None:
-        self.loc = jnp.mean(X, axis=0)
-        self.scale = jnp.std(X, axis=0)
+        self.loc = jnp.mean(X, axis=self.axis)
+        self.scale = jnp.std(X, axis=self.axis)
 
     def transform(self, X: jax.Array) -> jax.Array:
         self._validate_parameters()
@@ -104,11 +145,13 @@ class PercentilePreprocessor(NormalizePreprocessor):
     percentile_high: float = 84.0
 
     def fit(self, X: jax.Array) -> None:
-        self.loc = jnp.median(X, axis=0)
+        self.loc = jnp.median(X, axis=self.axis)
         self.scale = (
             jnp.diff(
                 jnp.percentile(
-                    X, jnp.array([self.percentile_low, self.percentile_high]), axis=0
+                    X,
+                    jnp.array([self.percentile_low, self.percentile_high]),
+                    axis=self.axis,
                 ),
                 axis=0,
             )
