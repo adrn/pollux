@@ -33,6 +33,8 @@ dependencies = [
   "jaxopt",
   "numpyro",
   "numpyro-ext",
+  "typing-extensions",
+  "xmmutablemap"
 ]
 
 [project.optional-dependencies]
