@@ -1,5 +1,3 @@
-import inspect
-from dataclasses import dataclass
 from typing import Any
 
 import equinox as eqx
@@ -7,98 +5,65 @@ import jax
 import numpyro
 import numpyro.distributions as dist
 
-from ..data.data import PolluxData
-from ..exceptions import ModelValidationError
-from ..typing import TransformParamsT, TransformT
-
-
-@dataclass
-class ModelOutput:
-    size: int
-    transform: TransformT
-    transform_params: TransformParamsT
-
-    def __post_init__(self) -> None:
-        # Validate transform parameters match signature
-        sig = inspect.signature(self.transform)
-        param_names = list(sig.parameters.keys())
-
-        if len(param_names) < 1:
-            msg = "transform must accept at least one argument (feature vector)"
-            raise ModelValidationError(msg)
-
-        # Skip first parameter (feature vector)
-        expected_params = set(param_names[1:])
-        provided_params = set(self.transform_params.keys())
-
-        if expected_params != provided_params:
-            missing = expected_params - provided_params
-            extra = provided_params - expected_params
-            msgs = []
-            if missing:
-                msgs.append(f"Missing parameters: {missing}")
-            if extra:
-                msgs.append(f"Unexpected parameters: {extra}")
-            raise ModelValidationError(". ".join(msgs))
-
-        # Validate all priors are proper distributions
-        for name, prior in self.transform_params.items():
-            if not isinstance(prior, dist.Distribution):
-                msg = f"Prior '{name}' must be a numpyro Distribution instance"
-                raise ModelValidationError(msg)
-
-        # TODO: make sure transform_params is in the order of the transform signature
-        # (or at least that the order of the keys matches the order of the signature)
-
-        # now we make sure to vmap over stars:
-        self.transform = jax.vmap(
-            self.transform, in_axes=(0, *tuple([None] * len(expected_params)))
-        )
+from ..data import PolluxData
+from ..typing import BatchedLatentsT, BatchedOutputT
+from .transforms import AbstractOutputTransform
 
 
 class PolluxModel(eqx.Module):
-    """Blah
+    """A latent variable model with multiple outputs.
+
+    A Pollux model is a generative, latent variable model for output data. This is a
+    general framework for constructing multi-output or multi-task models in which the
+    output data is generated as a transformation away from some embedded representation
+    of each object. While this class and model structure can be used in a broad range of
+    applications, this package and implementation was written with particular model
+    structures in mind with applications to stellar spectroscopy data.
 
     Parameters
     ----------
-    feature_size : int
-        The size of the input feature vector.
+    latent_size : int
+        The size of the latent vector.
     """
 
-    feature_size: int
-    outputs: dict[str, ModelOutput] = eqx.field(default_factory=dict, init=False)
+    latent_size: int
+    outputs: dict[str, AbstractOutputTransform] = eqx.field(
+        default_factory=dict, init=False
+    )
 
-    def register_output(
-        self,
-        name: str,
-        size: int,
-        transform: TransformT,
-        transform_params: TransformParamsT,
-    ) -> None:
-        """Register a new output with its transform and parameter priors."""
-        self.outputs[name] = ModelOutput(
-            size=size, transform=transform, transform_params=transform_params
-        )
-
-    def predict_outputs(
-        self,
-        features: jax.Array,
-        params: dict[str, Any],
-        which: list[str] | str | None = None,
-    ) -> jax.Array | dict[str, jax.Array]:
-        """Predict outputs for given feature vectors and parameters.
+    def register_output(self, name: str, transform: AbstractOutputTransform) -> None:
+        """Register a new output given a transform function and parameter priors.
 
         Parameters
         ----------
-        features
-            The feature vectors that transform into the outputs. In the case of the
-            Paton, these are the (unknown) latent vectors. In the case of the Cannon,
-            these are the observed features for the training set (combinations of
-            stellar labels).
+        name
+            The name of the output data.
+        transform
+            The transform function and parameter priors for the output data.
+        """
+        # TODO: do we need to do anything else here? validate the input?
+        self.outputs[name] = transform
+
+    def predict_outputs(
+        self,
+        latents: BatchedLatentsT,
+        params: dict[str, Any],
+        names: list[str] | str | None = None,
+    ) -> BatchedOutputT | dict[str, BatchedOutputT]:
+        """Predict outputs for given latent vectors and parameters.
+
+        Parameters
+        ----------
+        latents
+            The latent vectors that transform into the outputs. For example, in the case
+            of the Paton, these are the (unknown) latent vectors. In the case of the
+            Cannon, these are the observed features for the training set (combinations
+            of stellar labels).
         params
             A dictionary of parameters for each output in the model.
-        which
-            A list of output names to predict. If None, predict all outputs.
+        names
+            A single string or a list of output names to predict. If None, predict all
+            outputs (default).
 
         Returns
         -------
@@ -106,64 +71,63 @@ class PolluxModel(eqx.Module):
             A dictionary of predicted outputs, where the keys are the output names.
         """
 
-        if which is None:
-            which = list(self.outputs.keys())
-        elif isinstance(which, str):
-            which = [which]
+        # TODO: validate that latents.shape[-1] == self.latent_size??
+
+        if names is None:
+            names = list(self.outputs.keys())
+        elif isinstance(names, str):
+            names = [names]
 
         results = {}
-        for name in which:
-            output = self.outputs[name]
-
-            # Note: needs to be a list or iterable because of how vmap works
-            output_params = [params[name][k] for k in output.transform_params]
-            results[name] = output.transform(features, *output_params)
+        for name in names:
+            results[name] = self.outputs[name].apply(latents, **params[name])
 
         return results
 
     def setup_numpyro(
         self,
-        features: jax.Array,
+        latents: BatchedLatentsT,
         data: PolluxData,
-        which: list[str] | None = None,
+        names: list[str] | None = None,
     ) -> dict[str, Any]:
         """Sample parameters and set up basic numpyro model.
 
         Parameters
         ----------
-        features
-            The feature vectors that transform into the outputs. In the case of the
+        latents
+            The latent vectors that transform into the outputs. In the case of the
             Paton, these are the (unknown) latent vectors. In the case of the Cannon,
-            these are the observed features for the training set (combinations of
+            these are the observed latents for the training set (combinations of
             stellar labels).
         data
             A dictionary of observed data.
         errs
             A dictionary of errors for the observed data.
-        which
-            A list of output names to include in the model. If None, use all outputs.
+        names
+            A single string or a list of output names to set up. If None, set up all
+            outputs (default).
 
         Returns
         -------
         dict
             A dictionary of sampled parameters for each output.
         """
-        which = which or list(self.outputs.keys())
+        names = names or list(self.outputs.keys())
 
         params: dict[str, dict[str, Any]] = {}
-        for name in which:
-            output = self.outputs[name]
+        for name in names:
+            priors = self.outputs[name].get_priors(self.latent_size)
             params[name] = {}
-            for param_name, prior in output.transform_params.items():
+            for param_name, prior in priors.items():
                 params[name][param_name] = numpyro.sample(f"{name}:{param_name}", prior)
 
-        outputs = self.predict_outputs(features, params, which=which)
-        for name in which:
+        outputs = self.predict_outputs(latents, params, names=names)
+        for name in names:
             pred = outputs[name]
             numpyro.sample(
                 f"obs:{name}",
-                dist.Normal(pred, data[name].data_processed),
-                obs=data[name].err_processed,
+                dist.Normal(pred, data._err_processed[name]),
+                obs=data._data_processed[name],
             )
 
         return params
@@ -171,7 +135,7 @@ class PolluxModel(eqx.Module):
     def default_numpyro_model(
         self,
         data: PolluxData,
-        feature_prior: dist.Distribution | None | bool = None,
+        latent_prior: dist.Distribution | None | bool = None,
         fixed_params: dict[str, jax.Array] | None = None,
     ) -> None:
         """Create the default numpyro model for ...
@@ -186,9 +150,9 @@ class PolluxModel(eqx.Module):
             A dictionary of observed data.
         errs
             A dictionary of errors for the observed data.
-        feature_prior
-            TODO
-            The prior distribution for the latent vectors. If None, use a unit Gaussian.
+        latent_prior
+            The prior distribution for the latent vectors. If not specified, use a unit
+            Gaussian. If False, use an improper uniform prior.
         fixed_params
             A dictionary of fixed parameters to condition on. If None, all parameters
             will be sampled.
@@ -196,11 +160,11 @@ class PolluxModel(eqx.Module):
         """
         n_data = len(data)
 
-        if feature_prior is None:
-            _feature_prior = dist.Normal()
+        if latent_prior is None:
+            _latent_prior = dist.Normal()
 
-        elif feature_prior is False:
-            _feature_prior = dist.ImproperUniform(
+        elif latent_prior is False:
+            _latent_prior = dist.ImproperUniform(
                 dist.constraints.real,
                 (),
                 # event_shape=(self.latent_size,),  # TODO: or batch size?
@@ -208,24 +172,24 @@ class PolluxModel(eqx.Module):
                 sample_shape=(n_data,),
             )
 
-        elif not isinstance(feature_prior, dist.Distribution):
-            msg = "feature_prior must be a numpyro distribution instance"
+        elif not isinstance(latent_prior, dist.Distribution):
+            msg = "latent_prior must be a numpyro distribution instance"
             raise TypeError(msg)
 
         else:
-            _feature_prior = feature_prior
+            _latent_prior = latent_prior
 
-        if _feature_prior.batch_shape != (self.feature_size,):
-            _feature_prior = _feature_prior.expand((self.feature_size,))
+        if _latent_prior.batch_shape != (self.latent_size,):
+            _latent_prior = _latent_prior.expand((self.latent_size,))
 
         # Use condition handler to fix parameters if specified
         with numpyro.handlers.condition(data=fixed_params or {}):
-            features = numpyro.sample(
-                "features",
-                _feature_prior,
+            latents = numpyro.sample(
+                "latents",
+                _latent_prior,
                 sample_shape=(n_data,),
             )
-            self.setup_numpyro(features, data)
+            self.setup_numpyro(latents, data)
 
     def unpack_numpyro_params(
         self, params: dict[str, jax.Array]
@@ -252,7 +216,7 @@ class PolluxModel(eqx.Module):
         handled_params = set()
         for name, output in self.outputs.items():
             unpacked[name] = {}
-            for k in output.transform_params:
+            for k in output.param_priors:
                 numpyro_name = f"{name}:{k}"
                 unpacked[name][k] = params[numpyro_name]
                 handled_params.add(numpyro_name)
@@ -288,7 +252,7 @@ class PolluxModel(eqx.Module):
         """
         packed: dict[str, jax.Array] = {}
         for name, output in self.outputs.items():
-            for k in output.transform_params:
+            for k in output.param_priors:
                 numpyro_name = f"{name}:{k}"
                 packed[numpyro_name] = params[name][k]
 

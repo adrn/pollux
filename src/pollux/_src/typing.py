@@ -1,14 +1,22 @@
 """Custom type hints for Pollux."""
 
-from typing import Protocol
+from collections.abc import Callable
+from typing import Concatenate, TypeAlias
 
-import jax
-import numpyro.distributions as dist
+from jaxtyping import Array, Float
+from typing_extensions import ParamSpec
 
-TransformParamsT = dict[str, dist.Distribution]
+LatentsT = Float[Array, "latents"]
+DataT = Float[Array, "output"]
 
+QuadT = Float[Array, "output latents latents"]
+LinearT = Float[Array, "output latents"]
+OutputT = Float[Array, "output"]
 
-class TransformT(Protocol):
-    def __call__(
-        self, latent: jax.Array, *args: jax.Array, **kwargs: jax.Array
-    ) -> jax.Array: ...
+BatchedDataT = Float[Array, "#stars output"]
+BatchedLatentsT = Float[Array, "#stars latents"]
+AnyShapeFloatT = Float[Array, "..."]
+BatchedOutputT = Float[Array, "#stars output"]
+
+P = ParamSpec("P")
+TransformFuncT: TypeAlias = Callable[Concatenate[LatentsT, P], OutputT]

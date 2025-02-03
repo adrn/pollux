@@ -12,9 +12,13 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 
+from ..typing import BatchedDataT
+
 
 class AbstractPreprocessor(eqx.Module):
     """Base class for data preprocessors."""
+
+    data: BatchedDataT
 
     def _validate_parameters(self) -> None:
         for field in fields(self):
@@ -26,26 +30,22 @@ class AbstractPreprocessor(eqx.Module):
                 raise ValueError(msg)
 
     @abstractmethod
-    def fit(self, X: jax.Array) -> None:
-        """Compute internal transform parameters from the input data."""
-
-    @abstractmethod
-    def transform(self, X: jax.Array) -> jax.Array:
+    def transform(self, X: BatchedDataT) -> BatchedDataT:
         """Apply preprocessing to data."""
 
     @abstractmethod
-    def inverse_transform(self, X: jax.Array) -> jax.Array:
+    def inverse_transform(self, X: BatchedDataT) -> BatchedDataT:
         """Reverse preprocessing."""
 
     @abstractmethod
-    def transform_err(self, X_err: jax.Array) -> jax.Array:
+    def transform_err(self, X_err: BatchedDataT) -> BatchedDataT:
         """Apply preprocessing to uncertainty."""
 
     @abstractmethod
-    def inverse_transform_err(self, X_err: jax.Array) -> jax.Array:
+    def inverse_transform_err(self, X_err: BatchedDataT) -> BatchedDataT:
         """Reverse preprocessing to uncertainty."""
 
-    def __call__(self, X: jax.Array, inverse: bool = False) -> jax.Array:
+    def __call__(self, X: BatchedDataT, inverse: bool = False) -> BatchedDataT:
         if inverse:
             return self.inverse_transform(X)
         return self.transform(X)
@@ -69,19 +69,16 @@ class NullPreprocessor(AbstractPreprocessor):
     >>> assert np.allclose(preprocessor.scale, np.std(X, axis=0))
     """
 
-    def fit(self, X: jax.Array) -> None:
-        pass
-
-    def transform(self, X: jax.Array) -> jax.Array:
+    def transform(self, X: BatchedDataT) -> BatchedDataT:
         return X
 
-    def inverse_transform(self, X: jax.Array) -> jax.Array:
+    def inverse_transform(self, X: BatchedDataT) -> BatchedDataT:
         return X
 
-    def transform_err(self, X_err: jax.Array) -> jax.Array:
+    def transform_err(self, X_err: BatchedDataT) -> BatchedDataT:
         return X_err
 
-    def inverse_transform_err(self, X_err: jax.Array) -> jax.Array:
+    def inverse_transform_err(self, X_err: BatchedDataT) -> BatchedDataT:
         return X_err
 
 
@@ -113,27 +110,29 @@ class NormalizePreprocessor(AbstractPreprocessor):
 
     """
 
-    axis: int | None = 0
     loc: jax.Array | None = None
     scale: jax.Array | None = None
+    axis: int = 0
 
-    def fit(self, X: jax.Array) -> None:
-        self.loc = jnp.mean(X, axis=self.axis)
-        self.scale = jnp.std(X, axis=self.axis)
+    def __post_init__(self) -> None:
+        self.loc = jnp.mean(self.data, axis=self.axis) if self.loc is None else self.loc
+        self.scale = (
+            jnp.std(self.data, axis=self.axis) if self.scale is None else self.scale
+        )
 
-    def transform(self, X: jax.Array) -> jax.Array:
+    def transform(self, X: BatchedDataT) -> BatchedDataT:
         self._validate_parameters()
         return (X - self.loc) / self.scale
 
-    def inverse_transform(self, X: jax.Array) -> jax.Array:
+    def inverse_transform(self, X: BatchedDataT) -> BatchedDataT:
         self._validate_parameters()
         return X * self.scale + self.loc
 
-    def transform_err(self, X_err: jax.Array) -> jax.Array:
+    def transform_err(self, X_err: BatchedDataT) -> BatchedDataT:
         self._validate_parameters()
         return X_err / self.scale
 
-    def inverse_transform_err(self, X_err: jax.Array) -> jax.Array:
+    def inverse_transform_err(self, X_err: BatchedDataT) -> BatchedDataT:
         self._validate_parameters()
         return X_err * self.scale
 
@@ -144,12 +143,14 @@ class PercentilePreprocessor(NormalizePreprocessor):
     percentile_low: float = 16.0
     percentile_high: float = 84.0
 
-    def fit(self, X: jax.Array) -> None:
-        self.loc = jnp.median(X, axis=self.axis)
-        self.scale = (
+    def __post_init__(self) -> None:
+        self.loc = (
+            jnp.median(self.data, axis=self.axis) if self.loc is None else self.loc
+        )
+        _scale = (
             jnp.diff(
                 jnp.percentile(
-                    X,
+                    self.data,
                     jnp.array([self.percentile_low, self.percentile_high]),
                     axis=self.axis,
                 ),
@@ -157,3 +158,4 @@ class PercentilePreprocessor(NormalizePreprocessor):
             )
             / 2.0
         )
+        self.scale = _scale if self.scale is None else self.scale

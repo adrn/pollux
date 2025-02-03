@@ -6,7 +6,8 @@ pollux: Data-driven models of stellar spectra.
 
 from __future__ import annotations
 
-from ._src import data, models
+from . import data, models
 from ._version import version as __version__
+from .models import PolluxModel
 
-__all__ = ["__version__", "data", "models"]
+__all__ = ["PolluxModel", "__version__", "data", "models"]

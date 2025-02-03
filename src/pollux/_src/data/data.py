@@ -1,9 +1,13 @@
-from typing import TYPE_CHECKING
+__all__ = ["OutputData", "PolluxData"]
+
+from typing import TYPE_CHECKING, Any
 
 import equinox as eqx
 import jax
 from jax.typing import ArrayLike
+from xmmutablemap import ImmutableMap
 
+from ..typing import BatchedDataT
 from .preprocessor import AbstractPreprocessor, NullPreprocessor
 
 
@@ -50,9 +54,7 @@ class OutputData(eqx.Module):
     OutputData(
         data=f32[128,2048],
         err=f32[128,2048],
-        preprocessor=NullPreprocessor(),
-        data_processed=f32[128,2048],
-        err_processed=f32[128,2048]
+        preprocessor=NullPreprocessor
     )
     >>> assert np.all(flux_data.data_processed == flux_data.data)
     >>> assert np.all(flux_data.err_processed == flux_data.err)
@@ -63,37 +65,46 @@ class OutputData(eqx.Module):
 
     >>> from pollux.data import NormalizePreprocessor
     >>> flux_data = OutputData(
-    ...     data=spectra, err=spectra_err, preprocessor=NormalizePreprocessor()
+    ...     data=spectra, err=spectra_err, preprocessor=NormalizePreprocessor
     ... )
     >>> assert np.allclose(np.std(flux_data.data_processed, axis=0), 1.0)
 
     """
 
-    data: jax.Array = eqx.field(converter=jax.numpy.asarray)
-    err: jax.Array | None = eqx.field(
+    data: BatchedDataT = eqx.field(converter=jax.numpy.asarray)
+    err: BatchedDataT | None = eqx.field(
         default=None,
         converter=lambda x: jax.numpy.asarray(x) if x is not None else None,
     )
-    preprocessor: AbstractPreprocessor = eqx.field(default=NullPreprocessor())
-    data_processed: jax.Array | None = eqx.field(default=None)
-    err_processed: jax.Array | None = eqx.field(default=None)
+    preprocessor: AbstractPreprocessor | type[AbstractPreprocessor] = eqx.field(
+        default=NullPreprocessor
+    )
+    _proc: AbstractPreprocessor = eqx.field(init=False, repr=False)
 
     def __post_init__(self) -> None:
+        """Validate the input data and preprocessor."""
         if self.err is not None and self.data.shape != self.err.shape:
             msg = "Data and error arrays must have the same shape"
             raise ValueError(msg)
-        self._preprocess()
 
-    def _preprocess(self) -> None:
-        self.preprocessor.fit(self.data)
-        self.data_processed = self.preprocessor.transform(self.data)
-        # TODO: need to also process the errors
+        self._proc = (
+            self.preprocessor(self.data)
+            if not isinstance(self.preprocessor, AbstractPreprocessor)
+            else self.preprocessor
+        )
+
+    def get_processed_data(self) -> tuple[BatchedDataT, BatchedDataT | None]:
+        """Process the data using the preprocessor."""
+        return (
+            self._proc.transform(self.data),
+            self._proc.transform_err(self.err) if self.err is not None else None,
+        )
 
     def __len__(self) -> int:
         return len(self.data)
 
     def __getitem__(self, key: int | slice | ArrayLike) -> "OutputData":
-        """Get a slice of the data.
+        """Get a slice of the data. This preserves the preprocessor.
 
         Parameters
         ----------
@@ -107,20 +118,10 @@ class OutputData(eqx.Module):
         """
         sliced_data = self.data[key]
         sliced_err = None if self.err is None else self.err[key]
-        return type(self)(
-            data=sliced_data,
-            err=sliced_err,
-            preprocessor=self.preprocessor,
-            data_processed=None
-            if self.data_processed is None
-            else self.data_processed[key],
-            err_processed=None
-            if self.err_processed is None
-            else self.err_processed[key],
-        )
+        return type(self)(data=sliced_data, err=sliced_err, preprocessor=self._proc)
 
 
-class PolluxData(dict[str, OutputData]):
+class PolluxData(ImmutableMap[str, OutputData]):  # type: ignore[misc]
     def __init__(self, **kwargs: OutputData) -> None:
         """A data container for storing observed outputs from a Pollux model.
 
@@ -137,6 +138,12 @@ class PolluxData(dict[str, OutputData]):
         """
         super().__init__(**kwargs)
         self._validate()
+        self._data_processed, self._err_processed = self.get_processed_data()
+
+    def __getitem__(self, key: int | slice | ArrayLike | str) -> "OutputData" | Any:
+        if isinstance(key, str):
+            return super().__getitem__(key)
+        return self.__class__(**{name: output[key] for name, output in self.items()})
 
     def _validate(self) -> None:
         for name, output in self.items():
@@ -153,6 +160,15 @@ class PolluxData(dict[str, OutputData]):
                     f"key: {name})"
                 )
                 raise ValueError(msg)
+
+    def get_processed_data(
+        self,
+    ) -> tuple[dict[str, BatchedDataT], dict[str, BatchedDataT]]:
+        """Get the processed data and errors for each output."""
+        tmp = {name: output.get_processed_data() for name, output in self.items()}
+        data = {name: data for name, (data, _) in tmp.items()}
+        errs = {name: err for name, (_, err) in tmp.items()}
+        return data, errs
 
     def __len__(self) -> int:
         return len(next(iter(self.values())).data)
