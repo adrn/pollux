@@ -1,4 +1,4 @@
 from . import transforms
-from .pollux import PolluxModel
+from .pollux import LuxModel
 
-__all__ = ["PolluxModel", "transforms"]
+__all__ = ["LuxModel", "transforms"]

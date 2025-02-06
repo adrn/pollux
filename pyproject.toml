@@ -34,7 +34,8 @@ dependencies = [
   "numpyro",
   "numpyro-ext",
   "typing-extensions",
-  "xmmutablemap"
+  "xmmutablemap",
+  "dataclassish"
 ]
 
 [project.optional-dependencies]

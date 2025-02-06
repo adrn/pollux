@@ -10,7 +10,7 @@ from ..typing import BatchedLatentsT, BatchedOutputT
 from .transforms import AbstractOutputTransform
 
 
-class PolluxModel(eqx.Module):
+class LuxModel(eqx.Module):
     """A latent variable model with multiple outputs.
 
     A Pollux model is a generative, latent variable model for output data. This is a

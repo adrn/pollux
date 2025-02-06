@@ -1,9 +1,10 @@
 __all__ = ["OutputData", "PolluxData"]
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Union
 
 import equinox as eqx
-import jax
+import jax.numpy as jnp
+from dataclassish.converters import Optional
 from jax.typing import ArrayLike
 from xmmutablemap import ImmutableMap
 
@@ -12,26 +13,25 @@ from .preprocessor import AbstractPreprocessor, NullPreprocessor
 
 
 class OutputData(eqx.Module):
-    """A container for observed output data.
+    """A container for single block of output data.
 
-    This class is used to store a single block of observed output data, such as fluxes
-    for a collection of stars, or stellar labels for a set of stars, or other data like
-    broadband fluxes, etc. Each instance of this class should correspond to a single
+    This class is used to store data for a single output of a model, such as fluxes for
+    a collection of stars, or stellar labels for a set of stars, or other data like
+    broadband magnitudes, etc. Each instance of this class should correspond to a single
     output data type (e.g., spectral fluxes should be a separate instance from stellar
     labels).
 
     Parameters
     ----------
     data : array-like
-        The observed output data.
+        The output data.
     err : array-like, optional
-        The errors on the observed output data.
+        The uncertainties (errors) of the output data.
     preprocessor : AbstractPreprocessor, optional
-        A preprocessor to apply to the data. For example, this might center on the mean
-        and scale to unit variance (using the ``NormalizePreprocessor``).
-    processed : array-like, optional
-        The preprocessed data. This is set to None by default and is updated when the
-        ``.preprocess()`` method is called.
+        A preprocessor to apply to the data. For example, this might recenter the data
+        on the mean and scale to unit variance (using the ``NormalizePreprocessor``).
+        Use the ``.processed`` attribute to check if an instance has already been
+        preprocessed.
 
     Examples
     --------
@@ -40,9 +40,7 @@ class OutputData(eqx.Module):
     stored in a 2D array with shape (128, 2048). You also have the errors on the fluxes,
     which are stored in a 2D array with the same shape. You can create an instance of
     ``OutputData`` to store this data. In the example below, we will generate some
-    random data to represent this case for the sake of illustration and will initially
-    use a no-op data preprocessor, so the pre-processed data should be equal to the
-    input data::
+    random data to represent this case (for the sake of illustration)::
 
     >>> import numpy as np
     >>> from pollux.data import OutputData
@@ -56,29 +54,35 @@ class OutputData(eqx.Module):
         err=f32[128,2048],
         preprocessor=NullPreprocessor
     )
-    >>> assert np.all(flux_data.data_processed == flux_data.data)
-    >>> assert np.all(flux_data.err_processed == flux_data.err)
+    >>> assert flux_data.processed == False
 
-    Instead, we could specify a data pre-processor to rescale and center the input data.
-    For this, we use the ``NormalizePreprocessor``, which centers the data on the mean
-    and scales to unit variance::
+    We did not specify a preprocessor, so the data are not preprocessed even if we call
+    ``.preprocess()``. In this case, the processed data should equal the unprocessed
+    data::
+
+    >>> tmp = flux_data.preprocess()
+    >>> assert tmp.processed == False
+    >>> assert np.all(tmp.data, flux_data.data)
+
+    We can instead specify a data preprocessor to rescale and center the input data. For
+    this, we use the ``NormalizePreprocessor``, which centers the data on the mean and
+    scales the data to unit variance, by default along ``axis=0``::
 
     >>> from pollux.data import NormalizePreprocessor
     >>> flux_data = OutputData(
     ...     data=spectra, err=spectra_err, preprocessor=NormalizePreprocessor
     ... )
-    >>> assert np.allclose(np.std(flux_data.data_processed, axis=0), 1.0)
+    >>> processed_data = flux_data.preprocess()
+    >>> assert processed_data.processed
+    >>> assert np.allclose(np.mean(processed_data.data, axis=0), 0.0)
+    >>> assert np.allclose(np.std(processed_data.data, axis=0), 1.0)
 
     """
 
-    data: BatchedDataT = eqx.field(converter=jax.numpy.asarray)
-    err: BatchedDataT | None = eqx.field(
-        default=None,
-        converter=lambda x: jax.numpy.asarray(x) if x is not None else None,
-    )
-    preprocessor: AbstractPreprocessor | type[AbstractPreprocessor] = eqx.field(
-        default=NullPreprocessor
-    )
+    data: BatchedDataT = eqx.field(converter=jnp.asarray)
+    err: BatchedDataT | None = eqx.field(default=None, converter=Optional(jnp.asarray))
+    preprocessor: AbstractPreprocessor = eqx.field(default=NullPreprocessor())
+    processed: bool = eqx.field(default=False)
 
     # definitive instance of preprocessor, for typing concreteness
     _preprocessor: AbstractPreprocessor = eqx.field(init=False, repr=False)
@@ -89,26 +93,40 @@ class OutputData(eqx.Module):
             msg = "Data and error arrays must have the same shape"
             raise ValueError(msg)
 
-        self._preprocessor = (
-            self.preprocessor(self.data)
-            if not isinstance(self.preprocessor, AbstractPreprocessor)
-            else self.preprocessor
-        )
+    def preprocess(self) -> "OutputData":
+        """Preprocess the data using the preprocessor."""
+        if self.processed:
+            return self
 
-    def get_processed_data(self) -> tuple[BatchedDataT, BatchedDataT | None]:
-        """Process the data using the preprocessor."""
-        return (
-            self._preprocessor.transform(self.data),
-            self._preprocessor.transform_err(self.err)
+        return OutputData(
+            data=self._preprocessor.transform(self.data),
+            err=self._preprocessor.transform_err(self.err)
             if self.err is not None
             else None,
+            preprocessor=self._preprocessor,
+            processed=True,
+        )
+
+    def unprocess(self, data: BatchedDataT) -> "OutputData":
+        """Unprocess the data using the preprocessor."""
+        if not self.processed:
+            msg = "Data is not processed, so it cannot be unprocessed"
+            raise ValueError(msg)
+
+        return OutputData(
+            data=self._preprocessor.inverse_transform(data),
+            err=self._preprocessor.inverse_transform_err(data)
+            if self.err is not None
+            else None,
+            preprocessor=self._preprocessor,
+            processed=False,
         )
 
     def __len__(self) -> int:
         return len(self.data)
 
     def __getitem__(self, key: int | slice | ArrayLike) -> "OutputData":
-        """Get a slice of the data. This preserves the preprocessor.
+        """Get a slice of the data. This preserves the preprocessor instance.
 
         Parameters
         ----------
@@ -122,14 +140,14 @@ class OutputData(eqx.Module):
         """
         sliced_data = self.data[key]
         sliced_err = None if self.err is None else self.err[key]
-        return type(self)(
+        return OutputData(
             data=sliced_data, err=sliced_err, preprocessor=self._preprocessor
         )
 
 
 class PolluxData(ImmutableMap[str, OutputData]):  # type: ignore[misc]
     def __init__(self, **kwargs: OutputData) -> None:
-        """A data container for storing observed outputs from a Pollux model.
+        """A data container for observed outputs from a Pollux model.
 
         For example, this could be the observed fluxes, labels, and errors for a set of
         stars.
@@ -146,7 +164,9 @@ class PolluxData(ImmutableMap[str, OutputData]):  # type: ignore[misc]
         self._validate()
         self._data_processed, self._err_processed = self.get_processed_data()
 
-    def __getitem__(self, key: int | slice | ArrayLike | str) -> "OutputData" | Any:
+    def __getitem__(
+        self, key: int | slice | ArrayLike | str
+    ) -> Union["OutputData", Any]:
         if isinstance(key, str):
             return super().__getitem__(key)
         return self.__class__(**{name: output[key] for name, output in self.items()})
