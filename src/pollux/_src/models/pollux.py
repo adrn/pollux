@@ -95,9 +95,7 @@ class LuxModel(eqx.Module):
 
             # TODO: or add a .predict_outputs_unprocessed or something method?
             if data is not None and name in data:
-                results[name] = data[name]._preprocessor.inverse_transform(
-                    results[name]
-                )
+                results[name] = data[name].preprocessor.inverse_transform(results[name])
 
         return results
 

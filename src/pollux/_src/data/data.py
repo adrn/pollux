@@ -84,11 +84,8 @@ class OutputData(eqx.Module):
     preprocessor: AbstractPreprocessor = eqx.field(default=NullPreprocessor())
     processed: bool = eqx.field(default=False)
 
-    # definitive instance of preprocessor, for typing concreteness
-    _preprocessor: AbstractPreprocessor = eqx.field(init=False, repr=False)
-
     def __post_init__(self) -> None:
-        """Validate the input data and preprocessor."""
+        """Validate the input data."""
         if self.err is not None and self.data.shape != self.err.shape:
             msg = "Data and error arrays must have the same shape"
             raise ValueError(msg)
@@ -99,11 +96,11 @@ class OutputData(eqx.Module):
             return self
 
         return OutputData(
-            data=self._preprocessor.transform(self.data),
-            err=self._preprocessor.transform_err(self.err)
+            data=self.preprocessor.transform(self.data),
+            err=self.preprocessor.transform_err(self.err)
             if self.err is not None
             else None,
-            preprocessor=self._preprocessor,
+            preprocessor=self.preprocessor,
             processed=True,
         )
 
@@ -114,11 +111,11 @@ class OutputData(eqx.Module):
             raise ValueError(msg)
 
         return OutputData(
-            data=self._preprocessor.inverse_transform(data),
-            err=self._preprocessor.inverse_transform_err(data)
+            data=self.preprocessor.inverse_transform(data),
+            err=self.preprocessor.inverse_transform_err(data)
             if self.err is not None
             else None,
-            preprocessor=self._preprocessor,
+            preprocessor=self.preprocessor,
             processed=False,
         )
 
@@ -141,7 +138,7 @@ class OutputData(eqx.Module):
         sliced_data = self.data[key]
         sliced_err = None if self.err is None else self.err[key]
         return OutputData(
-            data=sliced_data, err=sliced_err, preprocessor=self._preprocessor
+            data=sliced_data, err=sliced_err, preprocessor=self.preprocessor
         )
 
 
@@ -162,7 +159,6 @@ class PolluxData(ImmutableMap[str, OutputData]):  # type: ignore[misc]
         """
         super().__init__(**kwargs)
         self._validate()
-        self._data_processed, self._err_processed = self.get_processed_data()
 
     def __getitem__(
         self, key: int | slice | ArrayLike | str
@@ -187,14 +183,11 @@ class PolluxData(ImmutableMap[str, OutputData]):  # type: ignore[misc]
                 )
                 raise ValueError(msg)
 
-    def get_processed_data(
-        self,
-    ) -> tuple[dict[str, BatchedDataT], dict[str, BatchedDataT]]:
-        """Get the processed data and errors for each output."""
-        tmp = {name: output.get_processed_data() for name, output in self.items()}
-        data = {name: data for name, (data, _) in tmp.items()}
-        errs = {name: err for name, (_, err) in tmp.items()}
-        return data, errs
+    def preprocess(self) -> "PolluxData":
+        """Preprocess all output data."""
+        return self.__class__(
+            **{name: output.preprocess() for name, output in self.items()}
+        )
 
     def __len__(self) -> int:
         return len(next(iter(self.values())).data)
