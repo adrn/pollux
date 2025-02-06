@@ -51,7 +51,6 @@ class LuxModel(eqx.Module):
         self,
         latents: BatchedLatentsT,
         params: dict[str, Any],
-        data: PolluxData | None = None,
         names: list[str] | str | None = None,
     ) -> BatchedOutputT | dict[str, BatchedOutputT]:
         """Predict output values for given latent vectors and parameters.
@@ -62,10 +61,6 @@ class LuxModel(eqx.Module):
             The latent vectors that transform into the outputs.
         params
             A dictionary of parameters for each output transformation in the model.
-        data
-            A dictionary-like object of observed data for each output. If provided, the
-            predicted output values will be inverse transformed back into the observed
-            space.
         names
             A single string or a list of output names to predict. If None, predict all
             outputs (default).
@@ -92,10 +87,6 @@ class LuxModel(eqx.Module):
         results = {}
         for name in names:
             results[name] = self.outputs[name].apply(latents, **params[name])
-
-            # TODO: or add a .predict_outputs_unprocessed or something method?
-            if data is not None and name in data:
-                results[name] = data[name].preprocessor.inverse_transform(results[name])
 
         return results
 

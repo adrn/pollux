@@ -104,11 +104,20 @@ class OutputData(eqx.Module):
             processed=True,
         )
 
-    def unprocess(self, data: BatchedDataT) -> "OutputData":
-        """Unprocess the data using the preprocessor."""
-        if not self.processed:
+    def unprocess(self, data: BatchedDataT | None = None) -> "OutputData":
+        """Unprocess the data using the preprocessor.
+
+        Parameters
+        ----------
+        data
+            The data to unprocess. If None, the instance's data will be unprocessed.
+        """
+        if data is not None and not self.processed:
             msg = "Data is not processed, so it cannot be unprocessed"
             raise ValueError(msg)
+
+        if data is None:
+            data = self.data
 
         return OutputData(
             data=self.preprocessor.inverse_transform(data),
@@ -187,6 +196,20 @@ class PolluxData(ImmutableMap[str, OutputData]):  # type: ignore[misc]
         """Preprocess all output data."""
         return self.__class__(
             **{name: output.preprocess() for name, output in self.items()}
+        )
+
+    def unprocess(
+        self, data: Union["PolluxData", dict[str, BatchedDataT], None] = None
+    ) -> "PolluxData":
+        """Unprocess all output data."""
+        data = data or self
+
+        if set(self.keys()) != set(data.keys()):
+            msg = "Data to unprocess must have the same keys as the instance"
+            raise ValueError(msg)
+
+        return self.__class__(
+            **{name: self[name].unprocess(output) for name, output in data.items()}
         )
 
     def __len__(self) -> int:
