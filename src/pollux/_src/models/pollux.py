@@ -143,7 +143,7 @@ class LuxModel(eqx.Module):
         latent_prior: dist.Distribution | None | bool = None,
         fixed_params: dict[str, jax.Array] | None = None,
     ) -> None:
-        """Create the default numpyro model for ...
+        """Create the default numpyro model for this Lux model.
 
         The default model uses the specified latent vector prior and assumes that the
         data are Gaussian distributed away from the true (predicted) values given the
