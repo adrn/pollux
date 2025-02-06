@@ -30,6 +30,7 @@ class TestOutputData:
 
     def test_creation_with_errors(self, sample_arrays):
         col = OutputData(data=sample_arrays["flux"], err=sample_arrays["flux_err"])
+        assert col.err is not None  # to make sure mypy doesn't complain in next line
         assert col.err.shape == col.data.shape
         assert col.processed is False
 
