@@ -1,7 +1,7 @@
 # Pollux
 
-JAX implementations of data-driven models for stellar spectroscopy, like the _Cannon_
-and the _Paton_.
+JAX implementations of data-driven models for stellar spectroscopy, like _Lux_ and the
+_Cannon_.
 
 <!-- [![Actions Status][actions-badge]][actions-link] -->
 <!-- [![Documentation Status][rtd-badge]][rtd-link] -->
