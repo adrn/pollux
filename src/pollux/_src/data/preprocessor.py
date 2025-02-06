@@ -40,21 +40,17 @@ class AbstractPreprocessor(eqx.Module):
 
 
 class NullPreprocessor(AbstractPreprocessor):
-    """A preprocessor that does nothing to data.
+    """A preprocessor that does nothing to the input data.
 
     Examples
     --------
-    This data preprocessor does nothing to the  centers the data on the mean and scales to unit
-    variance, both computed along axis=0::
-
-    >>> import numpy as np
-    >>> from pollux.data import NormalizePreprocessor
-    >>> rng = np.random.default_rng(0)
-    >>> X = rng.normal(1.0, 2.0, size=(1024, 10))
-    >>> preprocessor = NormalizePreprocessor()
-    >>> preprocessor.fit(X)
-    >>> assert np.allclose(preprocessor.loc, np.mean(X, axis=0))
-    >>> assert np.allclose(preprocessor.scale, np.std(X, axis=0))
+    >>> import jax.numpy as jnp
+    >>> import jax.random as jrnd
+    >>> from pollux.data import NullPreprocessor
+    >>> data = jrnd.normal(jrnd.PRNGKey(0), shape=(1024, 10))
+    >>> preprocessor = NullPreprocessor()
+    >>> new_data = preprocessor.transform(data)
+    >>> assert jnp.all(new_data == data)
     """
 
     @classmethod
@@ -110,8 +106,7 @@ class ShiftScalePreprocessor(AbstractPreprocessor):
 
     >>> preprocessor = ShiftScalePreprocessor.from_data(data, axis=None)
     >>> processed_data = preprocessor.transform(data)
-    >>> assert jnp.allclose(jnp.mean(processed_data, axis=0), jnp.mean(processed_data))
-    >>> assert jnp.allclose(jnp.std(processed_data, axis=0), jnp.std(processed_data))
+    >>> assert jnp.allclose(processed_data, (data - jnp.mean(data)) / jnp.std(data), atol=1e-5)
 
     An alternative way of computing the preprocessing parameters uses the
     ``from_data_percentiles()`` class method, which computes the median and the

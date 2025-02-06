@@ -42,40 +42,44 @@ class OutputData(eqx.Module):
     ``OutputData`` to store this data. In the example below, we will generate some
     random data to represent this case (for the sake of illustration)::
 
-    >>> import numpy as np
+    >>> import jax.numpy as jnp
+    >>> import jax.random as jrnd
     >>> from pollux.data import OutputData
-    >>> rng = np.random.default_rng(seed=42)
-    >>> spectra = rng.uniform(0, 10, size=(128, 2048))
-    >>> spectra_err = rng.uniform(0, 1, size=spectra.shape)
+    >>> rngs = jrnd.split(jrnd.PRNGKey(0), 2)
+    >>> spectra = jrnd.uniform(rngs[0], minval=0, maxval=10, shape=(128, 2048))
+    >>> spectra_err = jrnd.uniform(rngs[1], minval=0.1, maxval=1, shape=spectra.shape)
     >>> flux_data = OutputData(data=spectra, err=spectra_err)
     >>> flux_data
     OutputData(
-        data=f32[128,2048],
-        err=f32[128,2048],
-        preprocessor=NullPreprocessor
+      data=f32[128,2048],
+      err=f32[128,2048],
+      preprocessor=NullPreprocessor(),
+      processed=False
     )
-    >>> assert flux_data.processed == False
+    >>> assert flux_data.processed is False
 
     We did not specify a preprocessor, so the data are not preprocessed even if we call
     ``.preprocess()``. In this case, the processed data should equal the unprocessed
     data::
 
     >>> tmp = flux_data.preprocess()
-    >>> assert tmp.processed == False
-    >>> assert np.all(tmp.data, flux_data.data)
+    >>> assert tmp.processed
+    >>> assert jnp.all(tmp.data == flux_data.data)
 
     We can instead specify a data preprocessor to rescale and center the input data. For
-    this, we use the ``NormalizePreprocessor``, which centers the data on the mean and
-    scales the data to unit variance, by default along ``axis=0``::
+    this, we use the ``ShiftScalePreprocessor``, which centers the data on the specified
+    location and scales the data by default along ``axis=0``::
 
-    >>> from pollux.data import NormalizePreprocessor
+    >>> from pollux.data import ShiftScalePreprocessor
     >>> flux_data = OutputData(
-    ...     data=spectra, err=spectra_err, preprocessor=NormalizePreprocessor
+    ...     data=spectra,
+    ...     err=spectra_err,
+    ...     preprocessor=ShiftScalePreprocessor.from_data(spectra)
     ... )
     >>> processed_data = flux_data.preprocess()
     >>> assert processed_data.processed
-    >>> assert np.allclose(np.mean(processed_data.data, axis=0), 0.0)
-    >>> assert np.allclose(np.std(processed_data.data, axis=0), 1.0)
+    >>> assert jnp.allclose(jnp.mean(processed_data.data, axis=0), 0.0, atol=1e-5)
+    >>> assert jnp.allclose(jnp.std(processed_data.data, axis=0), 1.0, atol=1e-5)
 
     """
 
