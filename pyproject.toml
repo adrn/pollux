@@ -42,6 +42,7 @@ dependencies = [
 test = [
   "pytest >=6",
   "pytest-cov >=3",
+  "pytest-arraydiff >=0.6",
 ]
 docs = [
   "jupyter_client",
