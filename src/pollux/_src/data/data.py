@@ -79,8 +79,10 @@ class OutputData(eqx.Module):
 
     """
 
-    data: BatchedDataT = eqx.field(converter=jnp.asarray)
-    err: BatchedDataT | None = eqx.field(default=None, converter=Optional(jnp.asarray))
+    data: BatchedDataT = eqx.field(converter=jnp.atleast_2d)
+    err: BatchedDataT | None = eqx.field(
+        default=None, converter=Optional(jnp.atleast_2d)
+    )
     preprocessor: AbstractPreprocessor = eqx.field(default=NullPreprocessor())
     processed: bool = eqx.field(default=False)
 
@@ -104,7 +106,9 @@ class OutputData(eqx.Module):
             processed=True,
         )
 
-    def unprocess(self, data: BatchedDataT | None = None) -> "OutputData":
+    def unprocess(
+        self, data: Union[BatchedDataT, "OutputData", None] = None
+    ) -> "OutputData":
         """Unprocess the data using the preprocessor.
 
         Parameters
@@ -118,11 +122,15 @@ class OutputData(eqx.Module):
 
         if data is None:
             data = self.data
+            err = self.err
+        elif isinstance(data, OutputData):
+            err = data.err
+            data = data.data
 
         return OutputData(
             data=self.preprocessor.inverse_transform(data),
-            err=self.preprocessor.inverse_transform_err(data)
-            if self.err is not None
+            err=self.preprocessor.inverse_transform_err(err)
+            if err is not None
             else None,
             preprocessor=self.preprocessor,
             processed=False,
@@ -169,9 +177,7 @@ class PolluxData(ImmutableMap[str, OutputData]):  # type: ignore[misc]
         super().__init__(**kwargs)
         self._validate()
 
-    def __getitem__(
-        self, key: int | slice | ArrayLike | str
-    ) -> Union["OutputData", Any]:
+    def __getitem__(self, key: slice | ArrayLike | str) -> Union["OutputData", Any]:
         if isinstance(key, str):
             return super().__getitem__(key)
         return self.__class__(**{name: output[key] for name, output in self.items()})
