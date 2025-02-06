@@ -30,7 +30,7 @@ jobs:
           python-version-file: ".python-version"
 
       - name: Install the project
-        run: uv sync --group nox
+        run: uv pip install ".[test]" nox
 
       - uses: pre-commit/action@v3.0.1
 
@@ -60,7 +60,7 @@ jobs:
         run: uv python install ${{ matrix.python-version }}
 
       - name: Install the project
-        run: uv sync --group test
+        run: uv pip install ".[test]"
 
       - name: Test package
         run: >-
