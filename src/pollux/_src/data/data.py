@@ -79,7 +79,9 @@ class OutputData(eqx.Module):
     preprocessor: AbstractPreprocessor | type[AbstractPreprocessor] = eqx.field(
         default=NullPreprocessor
     )
-    _proc: AbstractPreprocessor = eqx.field(init=False, repr=False)
+
+    # definitive instance of preprocessor, for typing concreteness
+    _preprocessor: AbstractPreprocessor = eqx.field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         """Validate the input data and preprocessor."""
@@ -87,7 +89,7 @@ class OutputData(eqx.Module):
             msg = "Data and error arrays must have the same shape"
             raise ValueError(msg)
 
-        self._proc = (
+        self._preprocessor = (
             self.preprocessor(self.data)
             if not isinstance(self.preprocessor, AbstractPreprocessor)
             else self.preprocessor
@@ -96,8 +98,10 @@ class OutputData(eqx.Module):
     def get_processed_data(self) -> tuple[BatchedDataT, BatchedDataT | None]:
         """Process the data using the preprocessor."""
         return (
-            self._proc.transform(self.data),
-            self._proc.transform_err(self.err) if self.err is not None else None,
+            self._preprocessor.transform(self.data),
+            self._preprocessor.transform_err(self.err)
+            if self.err is not None
+            else None,
         )
 
     def __len__(self) -> int:
@@ -118,7 +122,9 @@ class OutputData(eqx.Module):
         """
         sliced_data = self.data[key]
         sliced_err = None if self.err is None else self.err[key]
-        return type(self)(data=sliced_data, err=sliced_err, preprocessor=self._proc)
+        return type(self)(
+            data=sliced_data, err=sliced_err, preprocessor=self._preprocessor
+        )
 
 
 class PolluxData(ImmutableMap[str, OutputData]):  # type: ignore[misc]

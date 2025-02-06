@@ -15,15 +15,16 @@ class PolluxModel(eqx.Module):
 
     A Pollux model is a generative, latent variable model for output data. This is a
     general framework for constructing multi-output or multi-task models in which the
-    output data is generated as a transformation away from some embedded representation
-    of each object. While this class and model structure can be used in a broad range of
-    applications, this package and implementation was written with particular model
-    structures in mind with applications to stellar spectroscopy data.
+    output data is generated as a transformation away from some embedded vector
+    representation of each object. While this class and model structure can be used in a
+    broad range of applications, this package and implementation was written with
+    applications to stellar spectroscopic data in mind.
 
     Parameters
     ----------
     latent_size : int
-        The size of the latent vector.
+        The size of the latent vector representation for each object (i.e. the embedded
+        dimensionality).
     """
 
     latent_size: int
@@ -32,35 +33,39 @@ class PolluxModel(eqx.Module):
     )
 
     def register_output(self, name: str, transform: AbstractOutputTransform) -> None:
-        """Register a new output given a transform function and parameter priors.
+        """Register a new output of the model given a specified transform.
 
         Parameters
         ----------
         name
-            The name of the output data.
+            The name of the output. If you intend to use this model with numpyro and
+            specified data, this name should correspond to the name of data passed in
+            via a `pollux.data.PolluxData` object.
         transform
-            The transform function and parameter priors for the output data.
+            A specification of the transformation function that takes a latent vector
+            representation in and predicts the output values.
         """
-        # TODO: do we need to do anything else here? validate the input?
         self.outputs[name] = transform
 
     def predict_outputs(
         self,
         latents: BatchedLatentsT,
         params: dict[str, Any],
+        data: PolluxData | None = None,
         names: list[str] | str | None = None,
     ) -> BatchedOutputT | dict[str, BatchedOutputT]:
-        """Predict outputs for given latent vectors and parameters.
+        """Predict output values for given latent vectors and parameters.
 
         Parameters
         ----------
         latents
-            The latent vectors that transform into the outputs. For example, in the case
-            of the Paton, these are the (unknown) latent vectors. In the case of the
-            Cannon, these are the observed features for the training set (combinations
-            of stellar labels).
+            The latent vectors that transform into the outputs.
         params
-            A dictionary of parameters for each output in the model.
+            A dictionary of parameters for each output transformation in the model.
+        data
+            A dictionary-like object of observed data for each output. If provided, the
+            predicted output values will be inverse transformed back into the observed
+            space.
         names
             A single string or a list of output names to predict. If None, predict all
             outputs (default).
@@ -68,10 +73,16 @@ class PolluxModel(eqx.Module):
         Returns
         -------
         dict
-            A dictionary of predicted outputs, where the keys are the output names.
+            A dictionary of predicted output values, where the keys are the output
+            names.
         """
 
-        # TODO: validate that latents.shape[-1] == self.latent_size??
+        if latents.shape[-1] != self.latent_size:
+            msg = (
+                f"Latent vectors have size {latents.shape[-1]} along their final axis, "
+                f"but expected them to have size {self.latent_size} "
+            )
+            raise ValueError(msg)
 
         if names is None:
             names = list(self.outputs.keys())
@@ -81,6 +92,12 @@ class PolluxModel(eqx.Module):
         results = {}
         for name in names:
             results[name] = self.outputs[name].apply(latents, **params[name])
+
+            # TODO: or add a .predict_outputs_unprocessed or something method?
+            if data is not None and name in data:
+                results[name] = data[name]._preprocessor.inverse_transform(
+                    results[name]
+                )
 
         return results
 
@@ -100,9 +117,8 @@ class PolluxModel(eqx.Module):
             these are the observed latents for the training set (combinations of
             stellar labels).
         data
-            A dictionary of observed data.
-        errs
-            A dictionary of errors for the observed data.
+            A dictionary-like object of observed data for each output. The keys should
+            correspond to the output names.
         names
             A single string or a list of output names to set up. If None, set up all
             outputs (default).
