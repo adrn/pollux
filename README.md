@@ -3,10 +3,9 @@
 JAX implementations of data-driven models for stellar spectroscopy, like _Lux_ and the
 _Cannon_.
 
-[![Actions Status][actions-badge]][actions-link]
-
 <!-- [![Documentation Status][rtd-badge]][rtd-link] -->
 
+[![Actions Status][actions-badge]][actions-link]
 [![Coverage Status][codecov-badge]][codecov-link]
 
 <!-- [![PyPI version][pypi-version]][pypi-link] -->
