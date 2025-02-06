@@ -50,7 +50,7 @@ class TestOutputData:
         col = OutputData(
             data=sample_arrays["flux"],
             err=sample_arrays["flux_err"],
-            preprocessor=ShiftScalePreprocessor(1.0, 2.0),
+            preprocessor=ShiftScalePreprocessor(1.0, 2.0),  # type: ignore[arg-type]
         )
         new_col = col.preprocess()
         assert new_col.processed is True
@@ -121,11 +121,11 @@ class TestPolluxData:
         ddata = {
             "flux": OutputData(
                 data=sample_arrays["flux"],
-                preprocessor=ShiftScalePreprocessor(1.0, 2.0),
+                preprocessor=ShiftScalePreprocessor(1.0, 2.0),  # type: ignore[arg-type]
             ),
             "label": OutputData(
                 data=sample_arrays["label"],
-                preprocessor=ShiftScalePreprocessor(0.0, 1.0),
+                preprocessor=ShiftScalePreprocessor(0.0, 1.0),  # type: ignore[arg-type]
             ),
         }
         data = PolluxData(**ddata)
