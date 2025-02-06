@@ -98,9 +98,7 @@ filterwarnings = [
   "error",
 ]
 log_cli_level = "INFO"
-testpaths = [
-  "tests",
-]
+testpaths = ["src", "docs", "tests"]
 
 
 [tool.coverage]
