@@ -84,18 +84,21 @@ scripts.test = "pytest {args}"
 
 
 [tool.pytest.ini_options]
-minversion = "6.0"
+minversion = "8.3"
 addopts = [
     "-ra",
     "--arraydiff",
     "--showlocals",
     "--strict-markers",
     "--strict-config",
+    "--doctest-modules",
     "--doctest-glob='*.rst | *.py'",
   ]
 xfail_strict = true
 filterwarnings = [
   "error",
+  "ignore:jax\\.core\\.call_p is deprecated:DeprecationWarning",
+  "ignore:jax\\.core\\.closed_call_p is deprecated:DeprecationWarning",
 ]
 log_cli_level = "INFO"
 testpaths = ["src", "docs", "tests"]
