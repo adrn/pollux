@@ -25,7 +25,8 @@ language = "en"
 # -- General configuration ---------------------------------------------------
 
 extensions = [
-    "myst_parser",
+    "myst_nb",
+    # "myst_parser",
     "sphinx_design",
     "sphinx.ext.autodoc",
     "sphinx.ext.autosummary",
@@ -51,7 +52,7 @@ exclude_patterns = [
     ".venv",
 ]
 
-source_suffix = [".md", ".rst"]
+source_suffix = [".md", ".rst", ".ipynb"]
 
 intersphinx_mapping = {
     "python": ("https://docs.python.org/3", None),
