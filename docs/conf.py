@@ -109,7 +109,7 @@ myst_heading_anchors = 3
 
 html_theme = "sphinx_book_theme"
 html_title = "pollux"
-html_logo = "_static/favicon.png"
+html_logo = "_static/Pollux-logo.png"
 html_copy_source = True
 html_favicon = "_static/favicon.png"
 
