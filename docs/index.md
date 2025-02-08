@@ -11,8 +11,8 @@ tutorials/Simulated-data-test.ipynb
 ## Get Started
 
 Pollux is a Python library for constructing generative models of astronomical spectra
-and other kinds of data. It is built on top of [JAX][jax] and is designed to be fast
-when used in probabilistic and machine learning contexts.
+and other kinds of data. It is built on top of [JAX][jax] and is designed for use in
+probabilistic and machine learning contexts.
 
 Two classes of models are currently supported:
 
