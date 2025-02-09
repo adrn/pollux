@@ -5,10 +5,18 @@
 :hidden:
 :caption: Tutorials
 
-tutorials/Simulated-data-test.ipynb
+tutorials/Lux-linear-simulated-data.ipynb
 ```
 
-## Get Started
+```{toctree}
+:maxdepth: 1
+:hidden:
+:caption: API Reference
+
+api/index.md
+```
+
+## Introduction
 
 Pollux is a Python library for constructing generative models of astronomical spectra
 and other kinds of data. It is built on top of [JAX][jax] and is designed for use in
@@ -33,3 +41,7 @@ Two classes of models are currently supported:
 [pypi-link]: https://pypi.org/project/TODO/
 [pypi-platforms]: https://img.shields.io/pypi/pyversions/TODO
 [pypi-version]: https://img.shields.io/pypi/v/TODO
+
+## Get Started
+
+TODO: how to set up a model and basic tour of the API

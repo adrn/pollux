@@ -63,6 +63,7 @@ docs = [
 ]
 dev = [
   "ipykernel",
+  "ipywidgets",
   "nox",
   "pollux[test,docs]"
 ]
