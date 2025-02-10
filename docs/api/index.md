@@ -13,7 +13,7 @@ models.md
 
 ---
 
-```{eval-rst}
+<!-- ```{eval-rst}
 
 .. currentmodule:: pollux
 
@@ -21,4 +21,4 @@ models.md
     :exclude-members:
     :noindex:
 
-```
+``` -->
