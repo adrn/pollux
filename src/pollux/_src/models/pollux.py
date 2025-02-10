@@ -217,6 +217,7 @@ class LuxModel(eqx.Module):
         optimizer: OptimizerT | None = None,
         fixed_params: UnpackedParamsT | None = None,
         names: list[str] | None = None,
+        svi_run_kwargs: dict[str, Any] | None = None,
     ) -> tuple[UnpackedParamsT, Any]:
         """Optimize the model parameters.
 
@@ -246,9 +247,11 @@ class LuxModel(eqx.Module):
         # internally by stochastic optimizers:
         svi_key, sample_key = jax.random.split(rng_key, 2)
 
+        svi_run_kwargs = svi_run_kwargs or {}
+
         guide = AutoDelta(model)
         svi = SVI(model, guide, optimizer, Trace_ELBO())
-        svi_results = svi.run(svi_key, num_steps, data)
+        svi_results = svi.run(svi_key, num_steps, data, **svi_run_kwargs)
         unpacked_MAP_params = guide.sample_posterior(sample_key, svi_results.params)
         return self.unpack_numpyro_params(
             unpacked_MAP_params, skip_missing=True
