@@ -60,6 +60,7 @@ intersphinx_mapping = {
     "jax": ("https://jax.readthedocs.io/en/latest/", None),
     "jaxtyping": ("https://docs.kidger.site/jaxtyping/", None),
     "numpy": ("https://numpy.org/doc/stable/", None),
+    "numpyro": ("https://num.pyro.ai/en/stable", None),
     "unxt": ("http://unxt.readthedocs.io/en/latest/", None),
 }
 
