@@ -56,6 +56,7 @@ source_suffix = [".md", ".rst", ".ipynb"]
 
 intersphinx_mapping = {
     "python": ("https://docs.python.org/3", None),
+    "equinox": ("https://docs.kidger.site/equinox/", None),
     "jax": ("https://jax.readthedocs.io/en/latest/", None),
     "jaxtyping": ("https://docs.kidger.site/jaxtyping/", None),
     "numpy": ("https://numpy.org/doc/stable/", None),
