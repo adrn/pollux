@@ -217,7 +217,7 @@ class LuxModel(eqx.Module):
         optimizer: OptimizerT | None = None,
         fixed_params: UnpackedParamsT | None = None,
         names: list[str] | None = None,
-    ) -> UnpackedParamsT:
+    ) -> tuple[UnpackedParamsT, Any]:
         """Optimize the model parameters.
 
         Parameters
@@ -250,7 +250,9 @@ class LuxModel(eqx.Module):
         svi = SVI(model, guide, optimizer, Trace_ELBO())
         svi_results = svi.run(svi_key, num_steps, data)
         unpacked_MAP_params = guide.sample_posterior(sample_key, svi_results.params)
-        return self.unpack_numpyro_params(unpacked_MAP_params, skip_missing=True)
+        return self.unpack_numpyro_params(
+            unpacked_MAP_params, skip_missing=True
+        ), svi_results
 
     def unpack_numpyro_params(
         self, params: PackedParamsT, skip_missing: bool = False
