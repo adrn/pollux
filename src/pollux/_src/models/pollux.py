@@ -54,6 +54,9 @@ class LuxModel(eqx.Module):
             A specification of the transformation function that takes a latent vector
             representation in and predicts the output values.
         """
+        if name in self.outputs:
+            msg = f"Output with name {name} already exists"
+            raise ValueError(msg)
         self.outputs[name] = transform
 
     def predict_outputs(
