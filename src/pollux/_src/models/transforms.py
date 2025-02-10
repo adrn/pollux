@@ -139,6 +139,7 @@ class LinearTransform(AbstractOutputTransform):
     transform: TransformFuncT[LinearT] = _linear_transform
     param_priors: ParamPriorsT = eqx.field(
         default=ImmutableMap({"A": dist.Normal(0, 1)}),
+        converter=ImmutableMap,
     )
     param_shapes: ParamShapesT = ImmutableMap(
         {"A": ShapeSpec(("output_size", "latent_size"))}
@@ -156,6 +157,7 @@ class AffineTransform(AbstractOutputTransform):
     transform: TransformFuncT[LinearT, OutputT] = _affine_transform
     param_priors: ParamPriorsT = eqx.field(
         default=ImmutableMap({"A": dist.Normal(0, 1), "b": dist.Normal(0, 1)}),
+        converter=ImmutableMap,
     )
     param_shapes: ParamShapesT = ImmutableMap(
         {
@@ -178,6 +180,7 @@ class QuadraticTransform(AbstractOutputTransform):
         default=ImmutableMap(
             {"Q": dist.Normal(0, 1), "A": dist.Normal(0, 1), "b": dist.Normal(0, 1)}
         ),
+        converter=ImmutableMap,
     )
     param_shapes: ParamShapesT = ImmutableMap(
         {
