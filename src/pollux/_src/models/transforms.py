@@ -1,4 +1,9 @@
-__all__ = ["AffineTransform", "LinearTransform", "QuadraticTransform"]
+__all__ = [
+    "AbstractOutputTransform",
+    "AffineTransform",
+    "LinearTransform",
+    "QuadraticTransform",
+]
 
 import inspect
 from dataclasses import dataclass
