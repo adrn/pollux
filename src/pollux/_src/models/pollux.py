@@ -1,12 +1,21 @@
+from functools import partial
 from typing import Any
 
 import equinox as eqx
 import jax
 import numpyro
 import numpyro.distributions as dist
+from numpyro.infer import SVI, Trace_ELBO
+from numpyro.infer.autoguide import AutoDelta
 
 from ..data import PolluxData
-from ..typing import BatchedLatentsT, BatchedOutputT
+from ..typing import (
+    BatchedLatentsT,
+    BatchedOutputT,
+    OptimizerT,
+    PackedParamsT,
+    UnpackedParamsT,
+)
 from .transforms import AbstractOutputTransform
 
 
@@ -131,8 +140,8 @@ class LuxModel(eqx.Module):
             pred = outputs[name]
             numpyro.sample(
                 f"obs:{name}",
-                dist.Normal(pred, data._err_processed[name]),
-                obs=data._data_processed[name],
+                dist.Normal(pred, data[name].err),
+                obs=data[name].data,
             )
 
         return params
@@ -141,7 +150,8 @@ class LuxModel(eqx.Module):
         self,
         data: PolluxData,
         latent_prior: dist.Distribution | None | bool = None,
-        fixed_params: dict[str, jax.Array] | None = None,
+        fixed_params: PackedParamsT | None = None,
+        names: list[str] | None = None,
     ) -> None:
         """Create the default numpyro model for this Lux model.
 
@@ -160,7 +170,7 @@ class LuxModel(eqx.Module):
             Gaussian. If False, use an improper uniform prior.
         fixed_params
             A dictionary of fixed parameters to condition on. If None, all parameters
-            will be sampled.
+            will be sampled. TODO: unpacked params
 
         """
         n_data = len(data)
@@ -194,11 +204,54 @@ class LuxModel(eqx.Module):
                 _latent_prior,
                 sample_shape=(n_data,),
             )
-            self.setup_numpyro(latents, data)
+            self.setup_numpyro(latents, data, names=names)
+
+    def optimize(
+        self,
+        data: PolluxData,
+        num_steps: int,
+        rng_key: jax.Array,
+        optimizer: OptimizerT | None = None,
+        fixed_params: UnpackedParamsT | None = None,
+        names: list[str] | None = None,
+    ) -> UnpackedParamsT:
+        """Optimize the model parameters.
+
+        Parameters
+        ----------
+
+        """
+
+        # Default to using Adam optimizer:
+        optimizer = optimizer or numpyro.optim.Adam()
+
+        partial_params: dict[str, Any] = {}
+        if fixed_params is not None:
+            packed_fixed_params = self.pack_numpyro_params(fixed_params)
+            partial_params["fixed_params"] = packed_fixed_params
+
+        if names is not None:
+            partial_params["names"] = names
+
+        model: Any
+        if partial_params:
+            model = partial(self.default_numpyro_model, **partial_params)
+        else:
+            model = self.default_numpyro_model
+
+        # The RNG key shouldn't have a massive impact here, since it it only used
+        # internally by stochastic optimizers:
+        svi_key, sample_key = jax.random.split(rng_key, 2)
+
+        guide = AutoDelta(model)
+        svi = SVI(model, guide, optimizer, Trace_ELBO())
+        svi_results = svi.run(svi_key, num_steps, data)
+        unpacked_MAP_params = guide.sample_posterior(sample_key, svi_results.params)
+        return self.unpack_numpyro_params(unpacked_MAP_params, skip_missing=True)
 
     def unpack_numpyro_params(
-        self, params: dict[str, jax.Array]
-    ) -> dict[str, dict[str, jax.Array]]:
+        self, params: PackedParamsT, skip_missing: bool = False
+    ) -> UnpackedParamsT:
         """Unpack numpyro parameters into a nested structure.
 
         numpyro parameters use names like "output_name:param_name" to make the numpyro
@@ -223,6 +276,8 @@ class LuxModel(eqx.Module):
             unpacked[name] = {}
             for k in output.param_priors:
                 numpyro_name = f"{name}:{k}"
+                if numpyro_name not in params and skip_missing:
+                    continue
                 unpacked[name][k] = params[numpyro_name]
                 handled_params.add(numpyro_name)
 
@@ -231,9 +286,7 @@ class LuxModel(eqx.Module):
 
         return unpacked
 
-    def pack_numpyro_params(
-        self, params: dict[str, dict[str, jax.Array]]
-    ) -> dict[str, jax.Array]:
+    def pack_numpyro_params(self, params: UnpackedParamsT) -> PackedParamsT:
         """Pack parameters into a flat dictionary keyed on numpyro names.
 
         This method is the inverse of `unpack_numpyro_params`. It takes a nested

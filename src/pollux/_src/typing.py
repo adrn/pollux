@@ -1,9 +1,12 @@
 """Custom type hints for Pollux."""
 
 from collections.abc import Callable
-from typing import Concatenate, TypeAlias
+from typing import Any, Concatenate, TypeAlias
 
+import jax
+from jax.example_libraries.optimizers import Optimizer
 from jaxtyping import Array, Float
+from numpyro.optim import _NumPyroOptim
 from typing_extensions import ParamSpec
 
 LatentsT = Float[Array, "latents"]
@@ -20,3 +23,24 @@ BatchedOutputT = Float[Array, "#stars output"]
 
 P = ParamSpec("P")
 TransformFuncT: TypeAlias = Callable[Concatenate[LatentsT, P], OutputT]
+
+OptimizerT = _NumPyroOptim | Optimizer | Any
+
+PackedParamsT = dict[str, jax.Array]
+UnpackedParamsT = dict[str, dict[str, jax.Array] | jax.Array]
+
+__all__ = [
+    "AnyShapeFloatT",
+    "BatchedDataT",
+    "BatchedLatentsT",
+    "BatchedOutputT",
+    "DataT",
+    "LatentsT",
+    "LinearT",
+    "OptimizerT",
+    "OutputT",
+    "PackedParamsT",
+    "QuadT",
+    "TransformFuncT",
+    "UnpackedParamsT",
+]
