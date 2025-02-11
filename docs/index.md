@@ -1,21 +1,5 @@
 # pollux
 
-```{toctree}
-:maxdepth: 1
-:hidden:
-:caption: Tutorials
-
-tutorials/Lux-linear-simulated-data.ipynb
-```
-
-```{toctree}
-:maxdepth: 1
-:hidden:
-:caption: API Reference
-
-api/index.md
-```
-
 ## Introduction
 
 Pollux is a Python library for constructing generative models of astronomical spectra
@@ -34,14 +18,38 @@ Two classes of models are currently supported:
 
 ## Installation
 
-[![PyPI version][pypi-version]][pypi-link]
-[![PyPI platforms][pypi-platforms]][pypi-link]
+Install `pollux` with `pip` directly from the GitHub repository:
+
+```bash
+pip install git+https://github.com/adrn/pollux
+```
+
+In the future, we plan to provide stable releases through PyPI.
+
+<!-- [![PyPI version][pypi-version]][pypi-link] -->
+<!-- [![PyPI platforms][pypi-platforms]][pypi-link] -->
 
 [jax]: https://jax.readthedocs.io/en/latest/
-[pypi-link]: https://pypi.org/project/TODO/
-[pypi-platforms]: https://img.shields.io/pypi/pyversions/TODO
-[pypi-version]: https://img.shields.io/pypi/v/TODO
+
+<!-- [pypi-link]: https://pypi.org/project/TODO/ -->
+<!-- [pypi-platforms]: https://img.shields.io/pypi/pyversions/TODO -->
+<!-- [pypi-version]: https://img.shields.io/pypi/v/TODO -->
 
 ## Get Started
 
-TODO: how to set up a model and basic tour of the API
+The best way to get started with `pollux` is to work through the tutorials:
+
+```{toctree}
+:maxdepth: 1
+:caption: Tutorials
+
+tutorials/Lux-linear-simulated-data.ipynb
+```
+
+```{toctree}
+:maxdepth: 1
+:hidden:
+:caption: API Reference
+
+api/index.md
+```
