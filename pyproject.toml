@@ -45,6 +45,7 @@ test = [
   "pytest-arraydiff >=0.6",
 ]
 docs = [
+  "ipywidgets",
   "jupyter_client",
   "matplotlib",
   "myst-nb>=1.1.2",
@@ -63,7 +64,6 @@ docs = [
 ]
 dev = [
   "ipykernel",
-  "ipywidgets",
   "nox",
   "pollux[test,docs]"
 ]
