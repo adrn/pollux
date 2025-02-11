@@ -90,7 +90,7 @@ class OutputData(eqx.Module):
     preprocessor: AbstractPreprocessor = eqx.field(default=NullPreprocessor())
     processed: bool = eqx.field(default=False)
 
-    def __post_init__(self) -> None:
+    def __check_init__(self) -> None:
         """Validate the input data."""
         if self.err is not None and self.data.shape != self.err.shape:
             msg = "Data and error arrays must have the same shape"
