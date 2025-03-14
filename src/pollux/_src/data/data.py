@@ -156,7 +156,10 @@ class OutputData(eqx.Module):
         sliced_data = self.data[key]
         sliced_err = None if self.err is None else self.err[key]
         return OutputData(
-            data=sliced_data, err=sliced_err, preprocessor=self.preprocessor
+            data=sliced_data,
+            err=sliced_err,
+            preprocessor=self.preprocessor,
+            processed=self.processed,
         )
 
 
