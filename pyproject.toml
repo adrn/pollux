@@ -65,6 +65,7 @@ docs = [
 dev = [
   "ipykernel",
   "nox",
+  "pre-commit",
   "pollux[test,docs]"
 ]
 

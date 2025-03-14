@@ -52,17 +52,11 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
-        # with:
-        #   enable-cache: true
-        #   cache-dependency-glob: "uv.lock"
-
-      - name: Set up Python ${{ matrix.python-version }}
-        run: uv python install ${{ matrix.python-version }}
+        with:
+          python-version: ${{ matrix.python-version }}
 
       - name: Install the project
-        run: |
-          uv venv
-          uv pip install ".[dev]"
+        run: uv sync --all-extras --dev
 
       - name: Test package
         run: >-
