@@ -28,7 +28,7 @@ classifiers = [
 ]
 dynamic = ["version"]
 dependencies = [
-  "equinox",
+  "equinox >=0.11.12",
   "jax",
   "jaxopt",
   "numpyro",
