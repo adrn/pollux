@@ -3,6 +3,7 @@ from typing import Any
 
 import equinox as eqx
 import jax
+import jax.numpy as jnp
 import numpyro
 import numpyro.distributions as dist
 from numpyro.infer import SVI, Trace_ELBO
@@ -131,11 +132,12 @@ class LuxModel(eqx.Module):
         """
         names = names or list(self.outputs.keys())
 
-        params: dict[str, dict[str, Any]] = {}
+        priors: dict[str, dict[str, Any]] = {}
+        params: dict[str, dict[str, jax.Array]] = {}
         for name in names:
-            priors = self.outputs[name].get_priors(self.latent_size)
+            priors[name] = self.outputs[name].get_priors(self.latent_size)
             params[name] = {}
-            for param_name, prior in priors.items():
+            for param_name, prior in priors[name].items():
                 params[name][param_name] = numpyro.sample(f"{name}:{param_name}", prior)
 
         outputs = self.predict_outputs(latents, params, names=names)
@@ -143,7 +145,10 @@ class LuxModel(eqx.Module):
             pred = outputs[name]
             numpyro.sample(
                 f"obs:{name}",
-                dist.Normal(pred, data[name].err),
+                dist.Normal(
+                    pred,
+                    jnp.sqrt(data[name].err ** 2 + params[name].get("s", 0.0) ** 2),  # type: ignore[operator]
+                ),  # NOTE: s is the intrinsic scatter or excess variance
                 obs=data[name].data,
             )
 

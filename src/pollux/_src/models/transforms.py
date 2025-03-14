@@ -55,6 +55,9 @@ class AbstractOutputTransform(eqx.Module):
     # the call signature of the transform function
     _param_names: tuple[str, ...] = eqx.field(init=False, repr=False)
 
+    # Special parameter names that can be specified
+    _special_param_names: tuple[str] = ("s",)
+
     def __post_init__(self) -> None:
         # Validate transform parameters match signature
         sig = inspect.signature(self.transform)
@@ -66,18 +69,21 @@ class AbstractOutputTransform(eqx.Module):
             raise ModelValidationError(msg)
 
         # Skip first parameter (latent vector)
-        expected_params = set(self._param_names)
+        required_params = set(self._param_names)
+        allowed_params = required_params.union(set(self._special_param_names))
         provided_params = set(self.param_priors.keys())
 
-        if expected_params != provided_params:
-            missing = expected_params - provided_params
-            extra = provided_params - expected_params
+        if required_params != provided_params:
+            missing = required_params - provided_params
+            extra = provided_params - allowed_params
             msgs = []
             if missing:
                 msgs.append(f"Missing parameters: {missing}")
             if extra:
                 msgs.append(f"Unexpected parameters: {extra}")
-            raise ModelValidationError(". ".join(msgs))
+
+            if msgs:
+                raise ModelValidationError(". ".join(msgs))
 
         # Validate all priors are proper distributions
         for name, prior in self.param_priors.items():
@@ -85,7 +91,7 @@ class AbstractOutputTransform(eqx.Module):
                 msg = f"Prior '{name}' must be a numpyro Distribution instance"
                 raise ModelValidationError(msg)
 
-            if name not in self.param_shapes:
+            if name not in self.param_shapes and name not in self._special_param_names:
                 msg = f"Prior '{name}' must have a shape specification"
                 raise ModelValidationError(msg)
 
@@ -121,10 +127,14 @@ class AbstractOutputTransform(eqx.Module):
         # internal sizes or something, of which output_size is one.
         priors = {}
         for name, prior in self.param_priors.items():
-            shape = self.param_shapes[name].resolve(
-                {"output_size": self.output_size, "latent_size": latent_size}
-            )
-            priors[name] = prior.expand(shape)
+            # Be more permissable with the shapes of special parameters:
+            if name not in self._special_param_names:
+                shape = self.param_shapes[name].resolve(
+                    {"output_size": self.output_size, "latent_size": latent_size}
+                )
+                priors[name] = prior.expand(shape)
+            else:
+                priors[name] = prior
         return priors
 
 
