@@ -106,6 +106,8 @@ myst_heading_anchors = 3
 #     "Any": ":obj:`typing.Any`",
 # }
 
+execution_timeout = 600
+
 
 # -- HTML output -------------------------------------------------
 
