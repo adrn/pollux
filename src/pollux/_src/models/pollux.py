@@ -220,6 +220,7 @@ class LuxModel(eqx.Module):
         num_steps: int,
         rng_key: jax.Array,
         optimizer: OptimizerT | None = None,
+        latent_prior: dist.Distribution | None | bool = None,
         fixed_params: UnpackedParamsT | None = None,
         names: list[str] | None = None,
         svi_run_kwargs: dict[str, Any] | None = None,
@@ -241,6 +242,8 @@ class LuxModel(eqx.Module):
 
         if names is not None:
             partial_params["names"] = names
+
+        partial_params["latent_prior"] = latent_prior
 
         model: Any
         if partial_params:
