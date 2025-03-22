@@ -56,7 +56,7 @@ class AbstractOutputTransform(eqx.Module):
     _param_names: tuple[str, ...] = eqx.field(init=False, repr=False)
 
     # Special parameter names that can be specified
-    _special_param_names: tuple[str] = ("s",)
+    _special_param_names: tuple[str] = eqx.field(init=False, repr=False, default=("s",))
 
     def __post_init__(self) -> None:
         # Validate transform parameters match signature
@@ -114,7 +114,7 @@ class AbstractOutputTransform(eqx.Module):
             raise RuntimeError(msg) from e
         return self._transform(latents, *arg_params)
 
-    def get_priors(self, latent_size: int) -> ParamPriorsT:
+    def get_priors(self, latent_size: int, data_size: int) -> ParamPriorsT:
         """Expand the numpyro priors to the expected shapes and return them.
 
         Parameters
@@ -130,12 +130,16 @@ class AbstractOutputTransform(eqx.Module):
             # Be more permissable with the shapes of special parameters:
             if name not in self._special_param_names:
                 shape = self.param_shapes[name].resolve(
-                    {"output_size": self.output_size, "latent_size": latent_size}
+                    {
+                        "output_size": self.output_size,
+                        "latent_size": latent_size,
+                        "data_size": data_size,
+                    }
                 )
                 priors[name] = prior.expand(shape)
             else:
                 priors[name] = prior
-        return priors
+        return ImmutableMap(**priors)
 
 
 # ----

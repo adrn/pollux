@@ -135,7 +135,9 @@ class LuxModel(eqx.Module):
         priors: dict[str, dict[str, Any]] = {}
         params: dict[str, dict[str, jax.Array]] = {}
         for name in names:
-            priors[name] = self.outputs[name].get_priors(self.latent_size)
+            priors[name] = self.outputs[name].get_priors(
+                latent_size=self.latent_size, data_size=len(data)
+            )
             params[name] = {}
             for param_name, prior in priors[name].items():
                 params[name][param_name] = numpyro.sample(f"{name}:{param_name}", prior)
