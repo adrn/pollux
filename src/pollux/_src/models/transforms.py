@@ -2,6 +2,7 @@ __all__ = [
     "AbstractOutputTransform",
     "AffineTransform",
     "LinearTransform",
+    "OffsetTransform",
     "QuadraticTransform",
 ]
 
@@ -158,6 +159,22 @@ class LinearTransform(AbstractOutputTransform):
     param_shapes: ParamShapesT = ImmutableMap(
         {"A": ShapeSpec(("output_size", "latent_size"))}
     )
+
+
+# ----
+
+
+def _offset_transform(z: LatentsT, b: OutputT) -> OutputT:
+    return z + b
+
+
+class OffsetTransform(AbstractOutputTransform):
+    transform: TransformFuncT[LinearT] = _offset_transform
+    param_priors: ParamPriorsT = eqx.field(
+        default=ImmutableMap({"b": dist.Normal(0, 1)}),
+        converter=ImmutableMap,
+    )
+    param_shapes: ParamShapesT = ImmutableMap({"b": ShapeSpec(("output_size",))})
 
 
 # ----
