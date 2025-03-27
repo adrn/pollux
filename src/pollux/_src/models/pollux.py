@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from functools import partial
 from typing import Any
 
@@ -162,6 +163,8 @@ class LuxModel(eqx.Module):
         latent_prior: dist.Distribution | None | bool = None,
         fixed_params: PackedParamsT | None = None,
         names: list[str] | None = None,
+        custom_model: Callable[[BatchedLatentsT, dict[str, Any], PolluxData], None]
+        | None = None,
     ) -> None:
         """Create the default numpyro model for this Lux model.
 
@@ -173,15 +176,17 @@ class LuxModel(eqx.Module):
         ----------
         data
             A dictionary of observed data.
-        errs
-            A dictionary of errors for the observed data.
         latent_prior
             The prior distribution for the latent vectors. If not specified, use a unit
             Gaussian. If False, use an improper uniform prior.
         fixed_params
             A dictionary of fixed parameters to condition on. If None, all parameters
-            will be sampled. TODO: unpacked params
-
+            will be sampled.
+        names
+            A list of output names to include in the model. If None, include all outputs.
+        custom_model
+            Optional callable that takes latents, params, and data and adds custom
+            modeling components.
         """
         n_data = len(data)
 
@@ -192,7 +197,6 @@ class LuxModel(eqx.Module):
             _latent_prior = dist.ImproperUniform(
                 dist.constraints.real,
                 (),
-                # event_shape=(self.latent_size,),  # TODO: or batch size?
                 event_shape=(),
                 sample_shape=(n_data,),
             )
@@ -214,7 +218,11 @@ class LuxModel(eqx.Module):
                 _latent_prior,
                 sample_shape=(n_data,),
             )
-            self.setup_numpyro(latents, data, names=names)
+            params = self.setup_numpyro(latents, data, names=names)
+
+        # Call the custom model function if provided
+        if custom_model is not None:
+            custom_model(latents, params, data)
 
     def optimize(
         self,
@@ -223,6 +231,8 @@ class LuxModel(eqx.Module):
         rng_key: jax.Array,
         optimizer: OptimizerT | None = None,
         latent_prior: dist.Distribution | None | bool = None,
+        custom_model: Callable[[BatchedLatentsT, dict[str, Any], PolluxData], None]
+        | None = None,
         fixed_params: UnpackedParamsT | None = None,
         names: list[str] | None = None,
         svi_run_kwargs: dict[str, Any] | None = None,
@@ -246,6 +256,7 @@ class LuxModel(eqx.Module):
             partial_params["names"] = names
 
         partial_params["latent_prior"] = latent_prior
+        partial_params["custom_model"] = custom_model
 
         model: Any
         if partial_params:
