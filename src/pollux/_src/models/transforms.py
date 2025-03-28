@@ -2,7 +2,9 @@ __all__ = [
     "AbstractOutputTransform",
     "AffineTransform",
     "LinearTransform",
+    "OffsetTransform",
     "QuadraticTransform",
+    "TransformSequence",
 ]
 
 import inspect
@@ -33,9 +35,12 @@ class ShapeSpec:
 
     dims: tuple[str | int, ...]
 
-    def resolve(self, dim_sizes: dict[str, int]) -> tuple[int, ...]:
+    def resolve(self, dim_sizes: dict[str, int | None]) -> tuple[int, ...]:
         """Convert named dimensions to concrete sizes."""
-        return tuple(dim_sizes[d] if isinstance(d, str) else d for d in self.dims)
+        return tuple(
+            dim_sizes[d] if isinstance(d, str) and dim_sizes[d] is not None else d  # type: ignore[misc]
+            for d in self.dims
+        )
 
 
 ParamPriorsT: TypeAlias = ImmutableMap[str, dist.Distribution]
@@ -47,6 +52,7 @@ class AbstractOutputTransform(eqx.Module):
     transform: eqx.AbstractVar[TransformFuncT[Any]]
     param_priors: eqx.AbstractVar[ParamPriorsT]
     param_shapes: eqx.AbstractVar[ParamShapesT]
+    vmap: bool = True
 
     # The vmap'd transform function
     _transform: TransformFuncT[Any] = eqx.field(init=False, repr=False)
@@ -56,7 +62,7 @@ class AbstractOutputTransform(eqx.Module):
     _param_names: tuple[str, ...] = eqx.field(init=False, repr=False)
 
     # Special parameter names that can be specified
-    _special_param_names: tuple[str] = ("s",)
+    _special_param_names: tuple[str] = eqx.field(init=False, repr=False, default=("s",))
 
     def __post_init__(self) -> None:
         # Validate transform parameters match signature
@@ -96,8 +102,12 @@ class AbstractOutputTransform(eqx.Module):
                 raise ModelValidationError(msg)
 
         # now we make sure to vmap over stars:
-        self._transform = jax.vmap(
-            self.transform, in_axes=(0, *tuple([None] * len(self._param_names)))
+        self._transform = (
+            jax.vmap(
+                self.transform, in_axes=(0, *tuple([None] * len(self._param_names)))
+            )
+            if self.vmap
+            else self.transform
         )
 
     # TODO: could dispatch so that LatentsT uses self.transform and BatchedLatentsT uses
@@ -114,7 +124,9 @@ class AbstractOutputTransform(eqx.Module):
             raise RuntimeError(msg) from e
         return self._transform(latents, *arg_params)
 
-    def get_priors(self, latent_size: int) -> ParamPriorsT:
+    def get_priors(
+        self, latent_size: int, data_size: int | None = None
+    ) -> ParamPriorsT:
         """Expand the numpyro priors to the expected shapes and return them.
 
         Parameters
@@ -130,12 +142,45 @@ class AbstractOutputTransform(eqx.Module):
             # Be more permissable with the shapes of special parameters:
             if name not in self._special_param_names:
                 shape = self.param_shapes[name].resolve(
-                    {"output_size": self.output_size, "latent_size": latent_size}
+                    {
+                        "output_size": self.output_size,
+                        "latent_size": latent_size,
+                        "data_size": data_size,
+                    }
                 )
                 priors[name] = prior.expand(shape)
             else:
                 priors[name] = prior
-        return priors
+        return ImmutableMap(**priors)
+
+
+class TransformSequence(eqx.Module):
+    """A sequence of output transforms."""
+
+    transforms: tuple[AbstractOutputTransform, ...]
+
+    def __post_init__(self) -> None:
+        if not self.transforms:
+            msg = "At least one transform must be specified"
+            raise ModelValidationError(msg)
+
+    def apply(
+        self, latents: BatchedLatentsT, *param_list: dict[str, Any]
+    ) -> BatchedOutputT:
+        """Apply the transforms in sequence."""
+        output = latents
+        for transform, params in zip(self.transforms, param_list):
+            output = transform.apply(output, **params)
+        return output
+
+    def get_priors(
+        self, latent_size: int, data_size: int | None = None
+    ) -> tuple[ParamPriorsT, ...]:
+        """Get the priors for all transforms in the sequence."""
+        priors: list[ImmutableMap[str, Any]] = []
+        for transform in self.transforms:
+            priors.append(ImmutableMap(**transform.get_priors(latent_size, data_size)))
+        return tuple(priors)
 
 
 # ----
@@ -154,6 +199,22 @@ class LinearTransform(AbstractOutputTransform):
     param_shapes: ParamShapesT = ImmutableMap(
         {"A": ShapeSpec(("output_size", "latent_size"))}
     )
+
+
+# ----
+
+
+def _offset_transform(z: LatentsT, b: OutputT) -> OutputT:
+    return z + b
+
+
+class OffsetTransform(AbstractOutputTransform):
+    transform: TransformFuncT[LinearT] = _offset_transform
+    param_priors: ParamPriorsT = eqx.field(
+        default=ImmutableMap({"b": dist.Normal(0, 1)}),
+        converter=ImmutableMap,
+    )
+    param_shapes: ParamShapesT = ImmutableMap({"b": ShapeSpec(("output_size",))})
 
 
 # ----
