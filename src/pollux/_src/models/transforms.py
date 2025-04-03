@@ -7,6 +7,7 @@ __all__ = [
     "TransformSequence",
 ]
 
+import abc
 import inspect
 from dataclasses import dataclass
 from typing import Any, TypeAlias
@@ -31,12 +32,16 @@ from ..typing import (
 
 @dataclass(frozen=True)
 class ShapeSpec:
-    """Represents a shape that may contain named dimensions"""
+    """Represents a shape that may contain named dimensions."""
 
     dims: tuple[str | int, ...]
 
     def resolve(self, dim_sizes: dict[str, int | None]) -> tuple[int, ...]:
-        """Convert named dimensions to concrete sizes."""
+        """Convert named dimensions to concrete sizes.
+
+        Uses the provided dimension size mappings to convert any string dimension
+        names to their integer sizes.
+        """
         return tuple(
             dim_sizes[d] if isinstance(d, str) and dim_sizes[d] is not None else d  # type: ignore[misc]
             for d in self.dims
@@ -48,20 +53,33 @@ ParamShapesT: TypeAlias = ImmutableMap[str, ShapeSpec]
 
 
 class AbstractTransform(eqx.Module):
-    """Base class defining the transform interface."""
+    """Base class defining the transform interface.
+
+    Transforms convert latent vectors to observable quantities through parameterized
+    functions. They define the mapping between latent space and output spaces.
+    """
 
     output_size: int
     param_priors: ParamPriorsT = eqx.field(converter=ImmutableMap)
     param_shapes: ParamShapesT
 
+    @abc.abstractmethod
     def apply(self, latents: BatchedLatentsT, **params: Any) -> BatchedOutputT:
-        """Apply the transform to input latent vectors."""
+        """Apply the transform to input latent vectors.
+
+        Takes a batch of latent vectors and transforms them using the provided
+        parameters to produce output values.
+        """
         raise NotImplementedError
 
     def get_priors(
         self, latent_size: int, data_size: int | None = None
     ) -> ParamPriorsT:
-        """Get expanded parameter priors."""
+        """Get expanded parameter priors.
+
+        Expands the parameter prior distributions to the concrete shapes needed
+        for the transform, based on latent size and optional data size.
+        """
         priors = {}
         for name, prior in self.param_priors.items():
             shape = self.param_shapes[name].resolve(
@@ -76,7 +94,10 @@ class AbstractTransform(eqx.Module):
 
 
 class AbstractAtomicTransform(AbstractTransform):
-    """Mixin class providing common functionality for atomic transforms."""
+    """Base class providing common functionality for atomic transforms.
+
+    Atomic transforms apply a single operation to convert latent vectors to outputs.
+    """
 
     transform: TransformFuncT[Any]
     _param_names: tuple[str, ...] = eqx.field(init=False, repr=False)
@@ -84,6 +105,11 @@ class AbstractAtomicTransform(AbstractTransform):
     vmap: bool = True
 
     def __post_init__(self) -> None:
+        """Initialize transform parameters after object creation.
+
+        Extracts parameter names from the transform function signature and sets up
+        vectorized application if requested.
+        """
         sig = inspect.signature(self.transform)
         self._param_names = tuple(sig.parameters.keys())[1:]  # skip first (latents)
 
@@ -100,6 +126,11 @@ class AbstractAtomicTransform(AbstractTransform):
         )
 
     def apply(self, latents: BatchedLatentsT, **params: Any) -> BatchedOutputT:
+        """Apply the transform to input latent vectors.
+
+        Extracts the required parameters from the kwargs and applies the transform
+        function to the latents, handling vectorization automatically.
+        """
         try:
             arg_params = tuple(params[p] for p in self._param_names)
         except KeyError as e:
@@ -109,11 +140,20 @@ class AbstractAtomicTransform(AbstractTransform):
 
 
 class TransformSequence(AbstractTransform):
-    """A sequence of transforms applied in order."""
+    """A sequence of transforms applied in order.
+
+    Composes multiple transforms together, where the output of each transform
+    becomes the input to the next transform in the sequence.
+    """
 
     transforms: tuple[AbstractTransform, ...]
 
     def __init__(self, transforms: tuple[AbstractTransform, ...]):
+        """Initialize a sequence of transforms.
+
+        Combines the parameter priors and shapes from all transforms in the sequence,
+        prefixing them with indices to maintain uniqueness.
+        """
         if not transforms:
             msg = "At least one transform required"
             raise ModelValidationError(msg)
@@ -127,6 +167,7 @@ class TransformSequence(AbstractTransform):
 
     @staticmethod
     def _combine_priors(transforms: tuple[AbstractTransform, ...]) -> ParamPriorsT:
+        """Combine parameter priors from multiple transforms."""
         return ImmutableMap(
             **{
                 f"t{i}_{name}": prior
@@ -137,6 +178,7 @@ class TransformSequence(AbstractTransform):
 
     @staticmethod
     def _combine_shapes(transforms: tuple[AbstractTransform, ...]) -> ParamShapesT:
+        """Combine parameter shapes from multiple transforms."""
         return ImmutableMap(
             **{
                 f"t{i}_{name}": shape
@@ -146,6 +188,11 @@ class TransformSequence(AbstractTransform):
         )
 
     def apply(self, latents: BatchedLatentsT, **params: Any) -> BatchedOutputT:
+        """Apply the sequence of transforms to input latent vectors.
+
+        Passes the input through each transform in sequence, routing the appropriate
+        parameters to each transform based on the prefixed parameter names.
+        """
         output = latents
         for i, transform in enumerate(self.transforms):
             transform_params = {
@@ -161,10 +208,19 @@ class TransformSequence(AbstractTransform):
 
 
 def _linear_transform(z: LatentsT, A: LinearT) -> OutputT:
+    """Apply a linear transformation.
+
+    Computes the matrix product A @ z.
+    """
     return A @ z
 
 
 class LinearTransform(AbstractAtomicTransform):
+    """Linear transformation from latent to output space.
+
+    Implements the transformation: y = A @ z, where A is a matrix and z is a latent vector.
+    """
+
     transform: TransformFuncT[LinearT] = _linear_transform
     param_priors: ParamPriorsT = eqx.field(
         default=ImmutableMap({"A": dist.Normal(0, 1)}),
@@ -179,10 +235,19 @@ class LinearTransform(AbstractAtomicTransform):
 
 
 def _offset_transform(z: LatentsT, b: OutputT) -> OutputT:
+    """Apply an offset transformation.
+
+    Adds a bias vector b to the input: z + b.
+    """
     return z + b
 
 
 class OffsetTransform(AbstractAtomicTransform):
+    """Offset transformation that adds a bias vector to inputs.
+
+    Implements the transformation: y = z + b, where b is a bias vector.
+    """
+
     transform: TransformFuncT[LinearT] = _offset_transform
     param_priors: ParamPriorsT = eqx.field(
         default=ImmutableMap({"b": dist.Normal(0, 1)}),
@@ -195,10 +260,20 @@ class OffsetTransform(AbstractAtomicTransform):
 
 
 def _affine_transform(z: LatentsT, A: LinearT, b: OutputT) -> OutputT:
+    """Apply an affine transformation.
+
+    Computes a linear transformation followed by an offset: A @ z + b.
+    """
     return A @ z + b
 
 
 class AffineTransform(AbstractAtomicTransform):
+    """Affine transformation combining linear transform and offset.
+
+    Implements the transformation: y = A @ z + b, where A is a matrix,
+    z is a latent vector, and b is a bias vector.
+    """
+
     transform: TransformFuncT[LinearT, OutputT] = _affine_transform
     param_priors: ParamPriorsT = eqx.field(
         default=ImmutableMap({"A": dist.Normal(0, 1), "b": dist.Normal(0, 1)}),
@@ -216,10 +291,20 @@ class AffineTransform(AbstractAtomicTransform):
 
 
 def _quadratic_transform(z: LatentsT, Q: QuadT, A: LinearT, b: OutputT) -> OutputT:
+    """Apply a quadratic transformation.
+
+    Computes a quadratic form plus a linear term and an offset: z^T Q z + A @ z + b.
+    """
     return jnp.einsum("i,oij,j->o", z, Q, z) + A @ z + b
 
 
 class QuadraticTransform(AbstractAtomicTransform):
+    """Quadratic transformation of latent vectors.
+
+    Implements the transformation: y = z^T Q z + A @ z + b, where Q is a tensor,
+    A is a matrix, z is a latent vector, and b is a bias vector.
+    """
+
     transform: TransformFuncT[QuadT, LinearT, OutputT] = _quadratic_transform
     param_priors: ParamPriorsT = eqx.field(
         default=ImmutableMap(
