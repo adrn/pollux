@@ -18,7 +18,7 @@ from ..typing import (
     PackedParamsT,
     UnpackedParamsT,
 )
-from .transforms import AbstractOutputTransform
+from .transforms import AbstractTransform
 
 
 class LuxModel(eqx.Module):
@@ -39,11 +39,9 @@ class LuxModel(eqx.Module):
     """
 
     latent_size: int
-    outputs: dict[str, AbstractOutputTransform] = eqx.field(
-        default_factory=dict, init=False
-    )
+    outputs: dict[str, AbstractTransform] = eqx.field(default_factory=dict, init=False)
 
-    def register_output(self, name: str, transform: AbstractOutputTransform) -> None:
+    def register_output(self, name: str, transform: AbstractTransform) -> None:
         """Register a new output of the model given a specified transform.
 
         Parameters
@@ -100,7 +98,10 @@ class LuxModel(eqx.Module):
 
         results = {}
         for name in names:
-            results[name] = self.outputs[name].apply(latents, **params[name])
+            if isinstance(params[name], dict):
+                results[name] = self.outputs[name].apply(latents, **params[name])
+            else:
+                results[name] = self.outputs[name].apply(latents, *params[name])
 
         return results
 
