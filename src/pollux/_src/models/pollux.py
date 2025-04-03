@@ -1,4 +1,4 @@
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from functools import partial
 from typing import Any
 
@@ -134,7 +134,7 @@ class LuxModel(eqx.Module):
         """
         names = names or list(self.outputs.keys())
 
-        priors: dict[str, dict[str, Any]] = {}
+        priors: dict[str, Mapping[str, Any]] = {}
         params: dict[str, dict[str, jax.Array]] = {}
         for name in names:
             priors[name] = self.outputs[name].get_priors(
