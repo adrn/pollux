@@ -42,6 +42,8 @@ class ShapeSpec:
         Uses the provided dimension size mappings to convert any string dimension
         names to their integer sizes.
         """
+        dim_sizes = dim_sizes.copy()
+        dim_sizes["one"] = 1
         return tuple(
             dim_sizes[d] if isinstance(d, str) and dim_sizes[d] is not None else d  # type: ignore[misc]
             for d in self.dims
@@ -72,6 +74,7 @@ class AbstractTransform(eqx.Module):
         """
         raise NotImplementedError
 
+    @abc.abstractmethod
     def get_priors(
         self, latent_size: int, data_size: int | None = None
     ) -> ParamPriorsT:
@@ -80,17 +83,7 @@ class AbstractTransform(eqx.Module):
         Expands the parameter prior distributions to the concrete shapes needed
         for the transform, based on latent size and optional data size.
         """
-        priors = {}
-        for name, prior in self.param_priors.items():
-            shape = self.param_shapes[name].resolve(
-                {
-                    "output_size": self.output_size,
-                    "latent_size": latent_size,
-                    "data_size": data_size,
-                }
-            )
-            priors[name] = prior.expand(shape)
-        return ImmutableMap(**priors)
+        raise NotImplementedError
 
 
 class AbstractAtomicTransform(AbstractTransform):
@@ -137,6 +130,26 @@ class AbstractAtomicTransform(AbstractTransform):
             msg = f"Missing parameters: {self._param_names}"
             raise RuntimeError(msg) from e
         return self._transform(latents, *arg_params)
+
+    def get_priors(
+        self, latent_size: int, data_size: int | None = None
+    ) -> ParamPriorsT:
+        """Get expanded parameter priors.
+
+        Expands the parameter prior distributions to the concrete shapes needed
+        for the transform, based on latent size and optional data size.
+        """
+        priors = {}
+        for name, prior in self.param_priors.items():
+            shape = self.param_shapes[name].resolve(
+                {
+                    "output_size": self.output_size,
+                    "latent_size": latent_size,
+                    "data_size": data_size,
+                }
+            )
+            priors[name] = prior.expand(shape)
+        return ImmutableMap(**priors)
 
 
 class TransformSequence(AbstractTransform):
@@ -203,6 +216,26 @@ class TransformSequence(AbstractTransform):
             output = transform.apply(output, **transform_params)
         return output
 
+    def get_priors(
+        self, latent_size: int, data_size: int | None = None
+    ) -> ParamPriorsT:
+        """Get expanded parameter priors.
+
+        Expands the parameter prior distributions to the concrete shapes needed
+        for the transform, based on latent size and optional data size.
+        """
+        priors = {}
+        for (name, prior), trans in zip(self.param_priors.items(), self.transforms):
+            shape = self.param_shapes[name].resolve(
+                {
+                    "output_size": trans.output_size,
+                    "latent_size": latent_size,
+                    "data_size": data_size,
+                }
+            )
+            priors[name] = prior.expand(shape)
+        return ImmutableMap(**priors)
+
 
 # ----
 
@@ -254,7 +287,7 @@ class OffsetTransform(AbstractAtomicTransform):
         default=ImmutableMap({"b": dist.Normal(0, 1)}),
         converter=ImmutableMap,
     )
-    param_shapes: ParamShapesT = ImmutableMap({"b": ShapeSpec(("output_size",))})
+    param_shapes: ParamShapesT = ImmutableMap({"b": ShapeSpec(("output_size", "one"))})
 
 
 # ----
@@ -283,7 +316,7 @@ class AffineTransform(AbstractAtomicTransform):
     param_shapes: ParamShapesT = ImmutableMap(
         {
             "A": ShapeSpec(("output_size", "latent_size")),
-            "b": ShapeSpec(("output_size",)),
+            "b": ShapeSpec(("output_size", "one")),
         }
     )
 
@@ -317,7 +350,7 @@ class QuadraticTransform(AbstractAtomicTransform):
         {
             "Q": ShapeSpec(("output_size", "latent_size", "latent_size")),
             "A": ShapeSpec(("output_size", "latent_size")),
-            "b": ShapeSpec(("output_size",)),
+            "b": ShapeSpec(("output_size", "one")),
         }
     )
 
