@@ -218,7 +218,8 @@ def _linear_transform(z: LatentsT, A: LinearT) -> OutputT:
 class LinearTransform(AbstractAtomicTransform):
     """Linear transformation from latent to output space.
 
-    Implements the transformation: y = A @ z, where A is a matrix and z is a latent vector.
+    Implements the transformation: y = A @ z, where A is a matrix and z is a latent
+    vector.
     """
 
     transform: TransformFuncT[LinearT] = _linear_transform
