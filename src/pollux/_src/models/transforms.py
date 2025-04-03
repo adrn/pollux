@@ -1,5 +1,5 @@
 __all__ = [
-    "AbstractOutputTransform",
+    "AbstractTransform",
     "AffineTransform",
     "LinearTransform",
     "OffsetTransform",
@@ -48,162 +48,113 @@ ParamShapesT: TypeAlias = ImmutableMap[str, ShapeSpec]
 
 
 class AbstractTransform(eqx.Module):
-    """Base class for all transforms."""
+    """Base class defining the transform interface."""
 
     output_size: int
-
-    # The vmap'd transform function
-    _transform: TransformFuncT[Any] = eqx.field(init=False, repr=False)
-    _param_names: tuple[str, ...] = eqx.field(init=False, repr=False)
-    _special_param_names: tuple[str] = eqx.field(init=False, repr=False, default=("s",))
+    param_priors: ParamPriorsT = eqx.field(converter=ImmutableMap)
+    param_shapes: ParamShapesT
 
     def apply(self, latents: BatchedLatentsT, **params: Any) -> BatchedOutputT:
-        """Apply the transform to the input latent vectors"""
-        try:
-            arg_params = (params[p] for p in self._param_names)
-        except KeyError as e:
-            msg = (
-                "You must provide parameter values for all parameter names "
-                f"({self._param_names})"
-            )
-            raise RuntimeError(msg) from e
-        return self._transform(latents, *arg_params)
+        """Apply the transform to input latent vectors."""
+        raise NotImplementedError
 
     def get_priors(
         self, latent_size: int, data_size: int | None = None
     ) -> ParamPriorsT:
-        """Expand the numpyro priors to the expected shapes and return them.
-
-        Parameters
-        ----------
-        latent_size
-            The size of the latent vectors.
-        """
-        # TODO: this might need to be more general if we want to support, e.g., NN's
-        # with hidden layers with their own sizes. Then need to maintain a list of
-        # internal sizes or something, of which output_size is one.
+        """Get expanded parameter priors."""
         priors = {}
         for name, prior in self.param_priors.items():
-            # Be more permissable with the shapes of special parameters:
-            if name not in self._special_param_names:
-                shape = self.param_shapes[name].resolve(
-                    {
-                        "output_size": self.output_size,
-                        "latent_size": latent_size,
-                        "data_size": data_size,
-                    }
-                )
-                priors[name] = prior.expand(shape)
-            else:
-                priors[name] = prior
+            shape = self.param_shapes[name].resolve(
+                {
+                    "output_size": self.output_size,
+                    "latent_size": latent_size,
+                    "data_size": data_size,
+                }
+            )
+            priors[name] = prior.expand(shape)
         return ImmutableMap(**priors)
 
 
-class AbstractOutputTransform(AbstractTransform):
-    """Base class for atomic transforms with fixed parameter structures."""
+class AbstractAtomicTransform(AbstractTransform):
+    """Mixin class providing common functionality for atomic transforms."""
 
-    transform: eqx.AbstractVar[TransformFuncT[Any]]
-    param_priors: eqx.AbstractVar[ParamPriorsT]
-    param_shapes: eqx.AbstractVar[ParamShapesT]
+    transform: TransformFuncT[Any]
+    _param_names: tuple[str, ...] = eqx.field(init=False, repr=False)
+    _transform: TransformFuncT[Any] = eqx.field(init=False, repr=False)
     vmap: bool = True
 
     def __post_init__(self) -> None:
-        # Validate transform parameters match signature
         sig = inspect.signature(self.transform)
-        all_args = tuple(sig.parameters.keys())
-        self._param_names = all_args[1:]
+        self._param_names = tuple(sig.parameters.keys())[1:]  # skip first (latents)
 
-        if len(all_args) < 1:
-            msg = "transform must accept at least one argument (latent vector)"
+        # Validate parameters
+        if not self._param_names:
+            msg = "transform must accept parameters"
             raise ModelValidationError(msg)
 
-        # Skip first parameter (latent vector)
-        required_params = set(self._param_names)
-        allowed_params = required_params.union(set(self._special_param_names))
-        provided_params = set(self.param_priors.keys())
-
-        if required_params != provided_params:
-            missing = required_params - provided_params
-            extra = provided_params - allowed_params
-            msgs = []
-            if missing:
-                msgs.append(f"Missing parameters: {missing}")
-            if extra:
-                msgs.append(f"Unexpected parameters: {extra}")
-
-            if msgs:
-                raise ModelValidationError(". ".join(msgs))
-
-        # Validate all priors are proper distributions
-        for name, prior in self.param_priors.items():
-            if not isinstance(prior, dist.Distribution):
-                msg = f"Prior '{name}' must be a numpyro Distribution instance"
-                raise ModelValidationError(msg)
-
-            if name not in self.param_shapes and name not in self._special_param_names:
-                msg = f"Prior '{name}' must have a shape specification"
-                raise ModelValidationError(msg)
-
-        # now we make sure to vmap over stars:
+        # Set up vmap'd transform
         self._transform = (
-            jax.vmap(
-                self.transform, in_axes=(0, *tuple([None] * len(self._param_names)))
-            )
+            jax.vmap(self.transform, in_axes=(0, *([None] * len(self._param_names))))
             if self.vmap
             else self.transform
         )
 
+    def apply(self, latents: BatchedLatentsT, **params: Any) -> BatchedOutputT:
+        try:
+            arg_params = tuple(params[p] for p in self._param_names)
+        except KeyError as e:
+            msg = f"Missing parameters: {self._param_names}"
+            raise RuntimeError(msg) from e
+        return self._transform(latents, *arg_params)
+
 
 class TransformSequence(AbstractTransform):
-    """A sequence of output transforms."""
+    """A sequence of transforms applied in order."""
 
-    transforms: tuple[AbstractOutputTransform, ...]
+    transforms: tuple[AbstractTransform, ...]
 
-    _transform: TransformFuncT[Any] = eqx.field(init=False, repr=False)
-    param_priors: ParamPriorsT = eqx.field(init=False)
-    param_shapes: ParamShapesT = eqx.field(init=False)
-
-    def __init__(
-        self, transforms: tuple[AbstractOutputTransform, ...], vmap: bool = True
-    ):
+    def __init__(self, transforms: tuple[AbstractTransform, ...]):
         if not transforms:
-            msg = "At least one transform must be specified"
+            msg = "At least one transform required"
             raise ModelValidationError(msg)
 
-        super().__init__(output_size=transforms[-1].output_size)
+        super().__init__(
+            output_size=transforms[-1].output_size,
+            param_priors=self._combine_priors(transforms),
+            param_shapes=self._combine_shapes(transforms),
+        )
         self.transforms = transforms
 
-        # Build parameter mappings
-        all_priors = {}
-        all_shapes = {}
-        for i, transform in enumerate(self.transforms):
-            for name, prior in transform.param_priors.items():
-                prefixed_name = f"t{i}_{name}"
-                all_priors[prefixed_name] = prior
-            for name, shape in transform.param_shapes.items():
-                prefixed_name = f"t{i}_{name}"
-                all_shapes[prefixed_name] = shape
+    @staticmethod
+    def _combine_priors(transforms: tuple[AbstractTransform, ...]) -> ParamPriorsT:
+        return ImmutableMap(
+            **{
+                f"t{i}_{name}": prior
+                for i, transform in enumerate(transforms)
+                for name, prior in transform.param_priors.items()
+            }
+        )
 
-        self.param_priors = ImmutableMap(**all_priors)
-        self.param_shapes = ImmutableMap(**all_shapes)
-
-        def _transform(z: LatentsT, **params: Any) -> OutputT:
-            output = z
-            for i, transform in enumerate(self.transforms):
-                transform_params = {
-                    name.split("_")[1]: params[f"t{i}_{name.split('_')[1]}"]
-                    for name in params
-                    if name.startswith(f"t{i}_")
-                }
-                output = transform.apply(output, **transform_params)
-            return output
-
-        self._param_names = tuple(all_shapes.keys())
-        self._transform = _transform
+    @staticmethod
+    def _combine_shapes(transforms: tuple[AbstractTransform, ...]) -> ParamShapesT:
+        return ImmutableMap(
+            **{
+                f"t{i}_{name}": shape
+                for i, transform in enumerate(transforms)
+                for name, shape in transform.param_shapes.items()
+            }
+        )
 
     def apply(self, latents: BatchedLatentsT, **params: Any) -> BatchedOutputT:
-        """Apply the transform to the input latent vectors"""
-        return self._transform(latents, **params)
+        output = latents
+        for i, transform in enumerate(self.transforms):
+            transform_params = {
+                name.split("_")[1]: params[f"t{i}_{name.split('_')[1]}"]
+                for name in params
+                if name.startswith(f"t{i}_")
+            }
+            output = transform.apply(output, **transform_params)
+        return output
 
 
 # ----
@@ -213,7 +164,7 @@ def _linear_transform(z: LatentsT, A: LinearT) -> OutputT:
     return A @ z
 
 
-class LinearTransform(AbstractOutputTransform):
+class LinearTransform(AbstractAtomicTransform):
     transform: TransformFuncT[LinearT] = _linear_transform
     param_priors: ParamPriorsT = eqx.field(
         default=ImmutableMap({"A": dist.Normal(0, 1)}),
@@ -231,7 +182,7 @@ def _offset_transform(z: LatentsT, b: OutputT) -> OutputT:
     return z + b
 
 
-class OffsetTransform(AbstractOutputTransform):
+class OffsetTransform(AbstractAtomicTransform):
     transform: TransformFuncT[LinearT] = _offset_transform
     param_priors: ParamPriorsT = eqx.field(
         default=ImmutableMap({"b": dist.Normal(0, 1)}),
@@ -247,7 +198,7 @@ def _affine_transform(z: LatentsT, A: LinearT, b: OutputT) -> OutputT:
     return A @ z + b
 
 
-class AffineTransform(AbstractOutputTransform):
+class AffineTransform(AbstractAtomicTransform):
     transform: TransformFuncT[LinearT, OutputT] = _affine_transform
     param_priors: ParamPriorsT = eqx.field(
         default=ImmutableMap({"A": dist.Normal(0, 1), "b": dist.Normal(0, 1)}),
@@ -268,7 +219,7 @@ def _quadratic_transform(z: LatentsT, Q: QuadT, A: LinearT, b: OutputT) -> Outpu
     return jnp.einsum("i,oij,j->o", z, Q, z) + A @ z + b
 
 
-class QuadraticTransform(AbstractOutputTransform):
+class QuadraticTransform(AbstractAtomicTransform):
     transform: TransformFuncT[QuadT, LinearT, OutputT] = _quadratic_transform
     param_priors: ParamPriorsT = eqx.field(
         default=ImmutableMap(
@@ -286,7 +237,7 @@ class QuadraticTransform(AbstractOutputTransform):
 
 
 # TODO: implement a Gaussian Process transform using the tinygp library. The user should specify the kernel, and parameter priors for the kernel.
-# class GaussianProcessTransform(AbstractOutputTransform):
+# class GaussianProcessTransform(AtomicTransformMixin, AbstractTransform):
 #     transform: TransformFuncT = ...
 
 
@@ -296,7 +247,7 @@ class QuadraticTransform(AbstractOutputTransform):
 # # need to be a class factory so that the user can specify the layer shapes and
 # # activation functions and the class is constructed from that. Also, make it work with
 # # numpyro.
-# class MLPTransform(AbstractOutputTransform):
+# class MLPTransform(AtomicTransformMixin, AbstractTransform):
 #     transform: TransformFuncT = eqx.field(
 #         default=lambda z, A, b: A @ z + b, init=False, repr=False
 #     )

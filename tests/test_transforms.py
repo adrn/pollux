@@ -10,6 +10,51 @@ from pollux.models.transforms import (
 )
 
 
+def test_linear_transform():
+    n_stars = 64
+    n_latents = 16
+    n_out = 8
+    rng = np.random.default_rng(42)
+
+    trans = LinearTransform(output_size=n_out)
+    latents = jnp.array(rng.random((n_stars, n_latents)))
+    A = rng.random((n_out, n_latents))
+
+    # Test direct computation
+    expected = np.array([A @ latents[i] for i in range(n_stars)])
+    result = trans.apply(latents, A=A)
+    assert np.allclose(result, expected)
+
+    # Test with prior
+    trans_prior = LinearTransform(
+        output_size=n_out, param_priors={"A": dist.Normal(0.0, 1.0)}
+    )
+    result_prior = trans_prior.apply(latents, A=A)
+    assert np.allclose(result_prior, expected)
+
+
+def test_offset_transform():
+    n_stars = 64
+    n_dim = 8
+    rng = np.random.default_rng(42)
+
+    trans = OffsetTransform(output_size=n_stars, vmap=False)
+    x = jnp.array(rng.random((n_stars, n_dim)))
+    b = jnp.array(rng.random((n_stars, n_dim)))
+
+    # Test direct computation
+    expected = x + b
+    result = trans.apply(x, b=b)
+    assert np.allclose(result, expected)
+
+    # Test with prior
+    trans_prior = OffsetTransform(
+        output_size=n_stars, vmap=False, param_priors={"b": dist.Normal(0.0, 1.0)}
+    )
+    result_prior = trans_prior.apply(x, b=b)
+    assert np.allclose(result_prior, expected)
+
+
 def test_transform_sequence():
     n_stars = 128
     n_latents = 32
