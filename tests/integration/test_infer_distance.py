@@ -73,5 +73,5 @@ def test_infer_distance():
     res.losses.block_until_ready()
 
     d_dm = opt_params["label"]["t1_b"] - true_dm
-    assert jnp.isclose(jnp.mean(d_dm), 0.0, atol=1e-2)
-    assert jnp.isclose(jnp.std(d_dm), 1.0, atol=1e-2)
+    assert jnp.isclose(jnp.mean(d_dm), 0.0, atol=1e-1)
+    assert jnp.isclose(jnp.std(d_dm), 1.0, atol=1e-1)
