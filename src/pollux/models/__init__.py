@@ -1,4 +1,4 @@
-from .._src.models.pollux import LuxModel
+from .._src.models.lux import LuxModel
 from .._src.models.transforms import (
     AbstractTransform,
     AffineTransform,
