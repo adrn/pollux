@@ -1,3 +1,4 @@
+from collections.abc import Callable, Mapping
 from functools import partial
 from typing import Any
 
@@ -17,7 +18,7 @@ from ..typing import (
     PackedParamsT,
     UnpackedParamsT,
 )
-from .transforms import AbstractOutputTransform
+from .transforms import AbstractTransform
 
 
 class LuxModel(eqx.Module):
@@ -38,11 +39,9 @@ class LuxModel(eqx.Module):
     """
 
     latent_size: int
-    outputs: dict[str, AbstractOutputTransform] = eqx.field(
-        default_factory=dict, init=False
-    )
+    outputs: dict[str, AbstractTransform] = eqx.field(default_factory=dict, init=False)
 
-    def register_output(self, name: str, transform: AbstractOutputTransform) -> None:
+    def register_output(self, name: str, transform: AbstractTransform) -> None:
         """Register a new output of the model given a specified transform.
 
         Parameters
@@ -99,7 +98,10 @@ class LuxModel(eqx.Module):
 
         results = {}
         for name in names:
-            results[name] = self.outputs[name].apply(latents, **params[name])
+            if isinstance(params[name], dict):
+                results[name] = self.outputs[name].apply(latents, **params[name])
+            else:
+                results[name] = self.outputs[name].apply(latents, *params[name])
 
         return results
 
@@ -132,10 +134,12 @@ class LuxModel(eqx.Module):
         """
         names = names or list(self.outputs.keys())
 
-        priors: dict[str, dict[str, Any]] = {}
+        priors: dict[str, Mapping[str, Any]] = {}
         params: dict[str, dict[str, jax.Array]] = {}
         for name in names:
-            priors[name] = self.outputs[name].get_priors(self.latent_size)
+            priors[name] = self.outputs[name].get_priors(
+                latent_size=self.latent_size, data_size=len(data)
+            )
             params[name] = {}
             for param_name, prior in priors[name].items():
                 params[name][param_name] = numpyro.sample(f"{name}:{param_name}", prior)
@@ -160,6 +164,8 @@ class LuxModel(eqx.Module):
         latent_prior: dist.Distribution | None | bool = None,
         fixed_params: PackedParamsT | None = None,
         names: list[str] | None = None,
+        custom_model: Callable[[BatchedLatentsT, dict[str, Any], PolluxData], None]
+        | None = None,
     ) -> None:
         """Create the default numpyro model for this Lux model.
 
@@ -171,15 +177,17 @@ class LuxModel(eqx.Module):
         ----------
         data
             A dictionary of observed data.
-        errs
-            A dictionary of errors for the observed data.
         latent_prior
             The prior distribution for the latent vectors. If not specified, use a unit
             Gaussian. If False, use an improper uniform prior.
         fixed_params
             A dictionary of fixed parameters to condition on. If None, all parameters
-            will be sampled. TODO: unpacked params
-
+            will be sampled.
+        names
+            A list of output names to include in the model. If None, include all outputs.
+        custom_model
+            Optional callable that takes latents, params, and data and adds custom
+            modeling components.
         """
         n_data = len(data)
 
@@ -190,7 +198,6 @@ class LuxModel(eqx.Module):
             _latent_prior = dist.ImproperUniform(
                 dist.constraints.real,
                 (),
-                # event_shape=(self.latent_size,),  # TODO: or batch size?
                 event_shape=(),
                 sample_shape=(n_data,),
             )
@@ -212,7 +219,11 @@ class LuxModel(eqx.Module):
                 _latent_prior,
                 sample_shape=(n_data,),
             )
-            self.setup_numpyro(latents, data, names=names)
+            params = self.setup_numpyro(latents, data, names=names)
+
+        # Call the custom model function if provided
+        if custom_model is not None:
+            custom_model(latents, params, data)
 
     def optimize(
         self,
@@ -221,6 +232,8 @@ class LuxModel(eqx.Module):
         rng_key: jax.Array,
         optimizer: OptimizerT | None = None,
         latent_prior: dist.Distribution | None | bool = None,
+        custom_model: Callable[[BatchedLatentsT, dict[str, Any], PolluxData], None]
+        | None = None,
         fixed_params: UnpackedParamsT | None = None,
         names: list[str] | None = None,
         svi_run_kwargs: dict[str, Any] | None = None,
@@ -244,6 +257,7 @@ class LuxModel(eqx.Module):
             partial_params["names"] = names
 
         partial_params["latent_prior"] = latent_prior
+        partial_params["custom_model"] = custom_model
 
         model: Any
         if partial_params:

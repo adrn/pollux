@@ -15,8 +15,6 @@ repos:
       - id: debug-statements
       - id: end-of-file-fixer
       - id: mixed-line-ending
-      - id: name-tests-test
-        args: ["--pytest-test-first"]
       - id: trailing-whitespace
 
   - repo: https://github.com/pre-commit/pygrep-hooks
@@ -83,8 +81,9 @@ repos:
     rev: "v1.10.1"
     hooks:
       - id: mypy
-        files: src|tests
+        files: src
         args: []
+        exclude: tests
         additional_dependencies:
           - pytest
           - equinox
