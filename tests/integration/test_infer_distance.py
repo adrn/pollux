@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import numpyro
-from helpers import make_simulated_linear_data
+from integration_test_helpers import make_simulated_linear_data
 from numpyro import distributions as dist
 
 import pollux as plx
