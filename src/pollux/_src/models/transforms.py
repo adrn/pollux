@@ -255,7 +255,7 @@ class FunctionTransform(AbstractAtomicTransform):
 # ----
 
 
-def _noop_transform(z: LatentsT, *_: Any) -> OutputT:
+def _noop_transform(z: LatentsT) -> OutputT:
     """No-op transformation."""
     return z
 
