@@ -1,7 +1,13 @@
+"""
+TODO: fix the docstrings and typing?
+"""
+
 __all__ = [
     "AbstractTransform",
     "AffineTransform",
+    "FunctionTransform",
     "LinearTransform",
+    "NoOpTransform",
     "OffsetTransform",
     "QuadraticTransform",
     "TransformSequence",
@@ -63,7 +69,7 @@ class AbstractTransform(eqx.Module):
 
     output_size: int
     param_priors: ParamPriorsT = eqx.field(converter=ImmutableMap)
-    param_shapes: ParamShapesT
+    param_shapes: ParamShapesT = eqx.field(converter=ImmutableMap)
 
     @abc.abstractmethod
     def apply(self, latents: BatchedLatentsT, **params: Any) -> BatchedOutputT:
@@ -106,11 +112,6 @@ class AbstractAtomicTransform(AbstractTransform):
         sig = inspect.signature(self.transform)
         self._param_names = tuple(sig.parameters.keys())[1:]  # skip first (latents)
 
-        # Validate parameters
-        if not self._param_names:
-            msg = "transform must accept parameters"
-            raise ModelValidationError(msg)
-
         # Set up vmap'd transform
         self._transform = (
             jax.vmap(self.transform, in_axes=(0, *([None] * len(self._param_names))))
@@ -141,14 +142,17 @@ class AbstractAtomicTransform(AbstractTransform):
         """
         priors = {}
         for name, prior in self.param_priors.items():
-            shape = self.param_shapes[name].resolve(
-                {
-                    "output_size": self.output_size,
-                    "latent_size": latent_size,
-                    "data_size": data_size,
-                }
-            )
-            priors[name] = prior.expand(shape)
+            if name in self.param_shapes:
+                shape = self.param_shapes[name].resolve(
+                    {
+                        "output_size": self.output_size,
+                        "latent_size": latent_size,
+                        "data_size": data_size,
+                    }
+                )
+                priors[name] = prior.expand(shape)
+            else:
+                priors[name] = prior
         return ImmutableMap(**priors)
 
 
@@ -235,6 +239,34 @@ class TransformSequence(AbstractTransform):
             )
             priors[name] = prior.expand(shape)
         return ImmutableMap(**priors)
+
+
+class FunctionTransform(AbstractAtomicTransform):
+    """Function transformation using a user-defined function.
+
+    This transform allows for arbitrary transformations defined by the user.
+
+    Examples
+    --------
+    TODO: add in quadrature
+    """
+
+
+# ----
+
+
+def _noop_transform(z: LatentsT, *_: Any) -> OutputT:
+    """No-op transformation."""
+    return z
+
+
+class NoOpTransform(AbstractAtomicTransform):
+    """No-op transformation."""
+
+    output_size: int = 0
+    transform: TransformFuncT[Any] = _noop_transform
+    param_priors: ParamPriorsT = ImmutableMap()
+    param_shapes: ParamShapesT = ImmutableMap()
 
 
 # ----
@@ -354,6 +386,8 @@ class QuadraticTransform(AbstractAtomicTransform):
         }
     )
 
+
+# ----
 
 # TODO: implement a Gaussian Process transform using the tinygp library. The user should specify the kernel, and parameter priors for the kernel.
 # class GaussianProcessTransform(AtomicTransformMixin, AbstractTransform):
