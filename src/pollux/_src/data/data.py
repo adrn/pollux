@@ -78,20 +78,26 @@ class OutputData(eqx.Module):
     """
 
     data: BatchedDataT = eqx.field(converter=jnp.atleast_2d)
-    err: BatchedDataT = eqx.field(default=0.0, converter=jnp.asarray)
+    err: BatchedDataT = eqx.field(
+        default_factory=lambda: jnp.array(0.0), converter=jnp.asarray
+    )
     preprocessor: AbstractPreprocessor = eqx.field(default=NullPreprocessor())
     processed: bool = eqx.field(default=False)
 
     def __post_init__(self) -> None:
         """Validate the input data."""
-        is_broadcastable = (
-            jnp.broadcast_shapes(self.err.shape, self.data.shape) == self.data.shape
+        msg = (
+            "Data and error arrays must have the same shape, or error array must "
+            "be broadcastable to the shape of the input data."
         )
-        if not is_broadcastable:
-            msg = (
-                "Data and error arrays must have the same shape, or error array must "
-                "be broadcastable to the shape of the input data."
+        try:
+            is_broadcastable = (
+                jnp.broadcast_shapes(self.err.shape, self.data.shape) == self.data.shape
             )
+        except Exception as e:
+            raise ValueError(msg) from e
+
+        if not is_broadcastable:
             raise ValueError(msg)
 
     def preprocess(self) -> "OutputData":
@@ -152,9 +158,13 @@ class OutputData(eqx.Module):
         OutputData
             A new OutputData instance with the sliced data
         """
+        if self.err.shape != self.data.shape:
+            err = jnp.broadcast_to(self.err, self.data.shape)
+        else:
+            err = self.err
         return OutputData(
             data=self.data[key],
-            err=self.err[key],
+            err=err[key],
             preprocessor=self.preprocessor,
             processed=self.processed,
         )
