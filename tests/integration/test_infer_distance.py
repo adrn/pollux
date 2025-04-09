@@ -43,7 +43,7 @@ def test_infer_distance():
     )
 
     model = plx.LuxModel(latent_size=n_latents)
-    model.register_output("flux", transform=plx.models.LinearTransform(output_size=128))
+    model.register_output("flux", plx.models.LinearTransform(output_size=128))
 
     trans = plx.models.TransformSequence(
         transforms=(
@@ -57,7 +57,7 @@ def test_infer_distance():
             ),
         )
     )
-    model.register_output("label", transform=trans)
+    model.register_output("label", trans)
 
     params = {"flux": {"A": truth["B"]}, "label": {"t0_A": truth["A"], "t1_b": true_dm}}
     test_out = model.predict_outputs(truth["latents"], params)

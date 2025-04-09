@@ -4,7 +4,6 @@ from typing import TYPE_CHECKING, Any, Union
 
 import equinox as eqx
 import jax.numpy as jnp
-from dataclassish.converters import Optional
 from jax.typing import ArrayLike
 from xmmutablemap import ImmutableMap
 
@@ -79,16 +78,26 @@ class OutputData(eqx.Module):
     """
 
     data: BatchedDataT = eqx.field(converter=jnp.atleast_2d)
-    err: BatchedDataT | None = eqx.field(
-        default=None, converter=Optional(jnp.atleast_2d)
+    err: BatchedDataT = eqx.field(
+        default_factory=lambda: jnp.array(0.0), converter=jnp.asarray
     )
     preprocessor: AbstractPreprocessor = eqx.field(default=NullPreprocessor())
     processed: bool = eqx.field(default=False)
 
-    def __check_init__(self) -> None:
+    def __post_init__(self) -> None:
         """Validate the input data."""
-        if self.err is not None and self.data.shape != self.err.shape:
-            msg = "Data and error arrays must have the same shape"
+        msg = (
+            "Data and error arrays must have the same shape, or error array must "
+            "be broadcastable to the shape of the input data."
+        )
+        try:
+            is_broadcastable = (
+                jnp.broadcast_shapes(self.err.shape, self.data.shape) == self.data.shape
+            )
+        except Exception as e:
+            raise ValueError(msg) from e
+
+        if not is_broadcastable:
             raise ValueError(msg)
 
     def preprocess(self) -> "OutputData":
@@ -98,9 +107,7 @@ class OutputData(eqx.Module):
 
         return OutputData(
             data=self.preprocessor.transform(self.data),
-            err=self.preprocessor.transform_err(self.err)
-            if self.err is not None
-            else None,
+            err=self.preprocessor.transform_err(self.err),
             preprocessor=self.preprocessor,
             processed=True,
         )
@@ -122,17 +129,15 @@ class OutputData(eqx.Module):
             raise ValueError(msg)
 
         if isinstance(data, OutputData):
-            vals = data.data
-            err = data.err
-        else:
-            vals = data
-            err = None
+            return OutputData(
+                data=self.preprocessor.inverse_transform(data.data),
+                err=self.preprocessor.inverse_transform_err(data.err),
+                preprocessor=self.preprocessor,
+                processed=False,
+            )
 
         return OutputData(
-            data=self.preprocessor.inverse_transform(vals),
-            err=self.preprocessor.inverse_transform_err(err)
-            if err is not None
-            else None,
+            data=self.preprocessor.inverse_transform(data),
             preprocessor=self.preprocessor,
             processed=False,
         )
@@ -153,11 +158,13 @@ class OutputData(eqx.Module):
         OutputData
             A new OutputData instance with the sliced data
         """
-        sliced_data = self.data[key]
-        sliced_err = None if self.err is None else self.err[key]
+        if self.err.shape != self.data.shape:
+            err = jnp.broadcast_to(self.err, self.data.shape)
+        else:
+            err = self.err
         return OutputData(
-            data=sliced_data,
-            err=sliced_err,
+            data=self.data[key],
+            err=err[key],
             preprocessor=self.preprocessor,
             processed=self.processed,
         )

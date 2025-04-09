@@ -1,7 +1,13 @@
+"""
+TODO: fix the docstrings and typing?
+"""
+
 __all__ = [
     "AbstractTransform",
     "AffineTransform",
+    "FunctionTransform",
     "LinearTransform",
+    "NoOpTransform",
     "OffsetTransform",
     "QuadraticTransform",
     "TransformSequence",
@@ -63,7 +69,7 @@ class AbstractTransform(eqx.Module):
 
     output_size: int
     param_priors: ParamPriorsT = eqx.field(converter=ImmutableMap)
-    param_shapes: ParamShapesT
+    param_shapes: ParamShapesT = eqx.field(converter=ImmutableMap)
 
     @abc.abstractmethod
     def apply(self, latents: BatchedLatentsT, **params: Any) -> BatchedOutputT:
@@ -92,9 +98,9 @@ class AbstractAtomicTransform(AbstractTransform):
     Atomic transforms apply a single operation to convert latent vectors to outputs.
     """
 
-    transform: TransformFuncT[Any]
+    transform: TransformFuncT
     _param_names: tuple[str, ...] = eqx.field(init=False, repr=False)
-    _transform: TransformFuncT[Any] = eqx.field(init=False, repr=False)
+    _transform: TransformFuncT = eqx.field(init=False, repr=False)
     vmap: bool = True
 
     def __post_init__(self) -> None:
@@ -105,11 +111,6 @@ class AbstractAtomicTransform(AbstractTransform):
         """
         sig = inspect.signature(self.transform)
         self._param_names = tuple(sig.parameters.keys())[1:]  # skip first (latents)
-
-        # Validate parameters
-        if not self._param_names:
-            msg = "transform must accept parameters"
-            raise ModelValidationError(msg)
 
         # Set up vmap'd transform
         self._transform = (
@@ -141,14 +142,17 @@ class AbstractAtomicTransform(AbstractTransform):
         """
         priors = {}
         for name, prior in self.param_priors.items():
-            shape = self.param_shapes[name].resolve(
-                {
-                    "output_size": self.output_size,
-                    "latent_size": latent_size,
-                    "data_size": data_size,
-                }
-            )
-            priors[name] = prior.expand(shape)
+            if name in self.param_shapes:
+                shape = self.param_shapes[name].resolve(
+                    {
+                        "output_size": self.output_size,
+                        "latent_size": latent_size,
+                        "data_size": data_size,
+                    }
+                )
+                priors[name] = prior.expand(shape)
+            else:
+                priors[name] = prior
         return ImmutableMap(**priors)
 
 
@@ -237,6 +241,34 @@ class TransformSequence(AbstractTransform):
         return ImmutableMap(**priors)
 
 
+class FunctionTransform(AbstractAtomicTransform):
+    """Function transformation using a user-defined function.
+
+    This transform allows for arbitrary transformations defined by the user.
+
+    Examples
+    --------
+    TODO: add in quadrature
+    """
+
+
+# ----
+
+
+def _noop_transform(z: LatentsT) -> OutputT:
+    """No-op transformation."""
+    return z
+
+
+class NoOpTransform(AbstractAtomicTransform):
+    """No-op transformation."""
+
+    output_size: int = 0
+    transform: TransformFuncT = _noop_transform
+    param_priors: ParamPriorsT = ImmutableMap()
+    param_shapes: ParamShapesT = ImmutableMap()
+
+
 # ----
 
 
@@ -255,7 +287,7 @@ class LinearTransform(AbstractAtomicTransform):
     vector.
     """
 
-    transform: TransformFuncT[LinearT] = _linear_transform
+    transform: TransformFuncT = _linear_transform
     param_priors: ParamPriorsT = eqx.field(
         default=ImmutableMap({"A": dist.Normal(0, 1)}),
         converter=ImmutableMap,
@@ -282,7 +314,7 @@ class OffsetTransform(AbstractAtomicTransform):
     Implements the transformation: y = z + b, where b is a bias vector.
     """
 
-    transform: TransformFuncT[LinearT] = _offset_transform
+    transform: TransformFuncT = _offset_transform
     param_priors: ParamPriorsT = eqx.field(
         default=ImmutableMap({"b": dist.Normal(0, 1)}),
         converter=ImmutableMap,
@@ -308,7 +340,7 @@ class AffineTransform(AbstractAtomicTransform):
     z is a latent vector, and b is a bias vector.
     """
 
-    transform: TransformFuncT[LinearT, OutputT] = _affine_transform
+    transform: TransformFuncT = _affine_transform
     param_priors: ParamPriorsT = eqx.field(
         default=ImmutableMap({"A": dist.Normal(0, 1), "b": dist.Normal(0, 1)}),
         converter=ImmutableMap,
@@ -339,7 +371,7 @@ class QuadraticTransform(AbstractAtomicTransform):
     A is a matrix, z is a latent vector, and b is a bias vector.
     """
 
-    transform: TransformFuncT[QuadT, LinearT, OutputT] = _quadratic_transform
+    transform: TransformFuncT = _quadratic_transform
     param_priors: ParamPriorsT = eqx.field(
         default=ImmutableMap(
             {"Q": dist.Normal(0, 1), "A": dist.Normal(0, 1), "b": dist.Normal(0, 1)}
@@ -354,6 +386,8 @@ class QuadraticTransform(AbstractAtomicTransform):
         }
     )
 
+
+# ----
 
 # TODO: implement a Gaussian Process transform using the tinygp library. The user should specify the kernel, and parameter priors for the kernel.
 # class GaussianProcessTransform(AtomicTransformMixin, AbstractTransform):

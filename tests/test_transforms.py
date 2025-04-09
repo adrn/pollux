@@ -109,7 +109,7 @@ def test_transform_sequence_priors():
     params = {"mags": {"t0_A": A, "t1_b": b}}
 
     model = plx.LuxModel(latent_size=n_latents)
-    model.register_output("mags", transform=trans)
+    model.register_output("mags", trans)
     out = model.predict_outputs(latents, params)
 
     assert np.allclose(out["mags"], tmp)

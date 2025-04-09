@@ -4,7 +4,6 @@ from typing import Any
 
 import equinox as eqx
 import jax
-import jax.numpy as jnp
 import numpyro
 import numpyro.distributions as dist
 from numpyro.infer import SVI, Trace_ELBO
@@ -18,7 +17,15 @@ from ..typing import (
     PackedParamsT,
     UnpackedParamsT,
 )
-from .transforms import AbstractTransform
+from .transforms import AbstractTransform, NoOpTransform
+
+
+class LuxOutput(eqx.Module):
+    data_transform: AbstractTransform
+    err_transform: AbstractTransform
+
+
+# err_transform.apply(data[output_name].err, **err_params[output_name])
 
 
 class LuxModel(eqx.Module):
@@ -39,9 +46,14 @@ class LuxModel(eqx.Module):
     """
 
     latent_size: int
-    outputs: dict[str, AbstractTransform] = eqx.field(default_factory=dict, init=False)
+    outputs: dict[str, LuxOutput] = eqx.field(default_factory=dict, init=False)
 
-    def register_output(self, name: str, transform: AbstractTransform) -> None:
+    def register_output(
+        self,
+        name: str,
+        data_transform: AbstractTransform,
+        err_transform: AbstractTransform | None = None,
+    ) -> None:
         """Register a new output of the model given a specified transform.
 
         Parameters
@@ -50,14 +62,16 @@ class LuxModel(eqx.Module):
             The name of the output. If you intend to use this model with numpyro and
             specified data, this name should correspond to the name of data passed in
             via a `pollux.data.PolluxData` object.
-        transform
+        data_transform
             A specification of the transformation function that takes a latent vector
             representation in and predicts the output values.
         """
         if name in self.outputs:
             msg = f"Output with name {name} already exists"
             raise ValueError(msg)
-        self.outputs[name] = transform
+        if err_transform is None:
+            err_transform = NoOpTransform()
+        self.outputs[name] = LuxOutput(data_transform, err_transform)
 
     def predict_outputs(
         self,
@@ -99,9 +113,13 @@ class LuxModel(eqx.Module):
         results = {}
         for name in names:
             if isinstance(params[name], dict):
-                results[name] = self.outputs[name].apply(latents, **params[name])
+                results[name] = self.outputs[name].data_transform.apply(
+                    latents, **params[name]
+                )
             else:
-                results[name] = self.outputs[name].apply(latents, *params[name])
+                results[name] = self.outputs[name].data_transform.apply(
+                    latents, *params[name]
+                )
 
         return results
 
@@ -132,31 +150,56 @@ class LuxModel(eqx.Module):
         dict
             A dictionary of sampled parameters for each output.
         """
-        names = names or list(self.outputs.keys())
+        output_names = names or list(self.outputs.keys())
 
-        priors: dict[str, Mapping[str, Any]] = {}
-        params: dict[str, dict[str, jax.Array]] = {}
-        for name in names:
-            priors[name] = self.outputs[name].get_priors(
+        data_priors: dict[str, Mapping[str, Any]] = {}
+        err_priors: dict[str, Mapping[str, Any]] = {}
+        data_params: dict[str, dict[str, jax.Array]] = {}
+        err_params: dict[str, dict[str, jax.Array]] = {}
+        for output_name in output_names:
+            # Priors for latent -> data transformation:
+            data_priors[output_name] = self.outputs[
+                output_name
+            ].data_transform.get_priors(
                 latent_size=self.latent_size, data_size=len(data)
             )
-            params[name] = {}
-            for param_name, prior in priors[name].items():
-                params[name][param_name] = numpyro.sample(f"{name}:{param_name}", prior)
+            data_params[output_name] = {}
+            for param_name, prior in data_priors[output_name].items():
+                data_params[output_name][param_name] = numpyro.sample(
+                    f"{output_name}:{param_name}", prior
+                )
 
-        outputs = self.predict_outputs(latents, params, names=names)
-        for name in names:
-            pred = outputs[name]
+            # Priors and parameters for transformation of the errors:
+            err_priors[output_name] = self.outputs[
+                output_name
+            ].err_transform.get_priors(
+                latent_size=self.latent_size, data_size=len(data)
+            )
+            err_params[output_name] = {}
+            for param_name, prior in err_priors[output_name].items():
+                err_params[output_name][param_name] = numpyro.sample(
+                    f"{output_name}:err:{param_name}", prior
+                )
+
+        outputs = self.predict_outputs(latents, data_params, names=output_names)
+        for output_name in output_names:
+            pred = outputs[output_name]
+
+            # TODO NOTE: failure mode where .err is None and the err_transform doesn't
+            # add a modeled intrinsic scatter. Detect this and raise an error?
+            err = self.outputs[output_name].err_transform.apply(
+                data[output_name].err, **err_params[output_name]
+            )
             numpyro.sample(
-                f"obs:{name}",
-                dist.Normal(
-                    pred,
-                    jnp.sqrt(data[name].err ** 2 + params[name].get("s", 0.0) ** 2),  # type: ignore[operator]
-                ),  # NOTE: s is the intrinsic scatter or excess variance
-                obs=data[name].data,
+                f"obs:{output_name}",
+                dist.Normal(pred, err),
+                obs=data[output_name].data,
             )
 
-        return params
+        for output_name in output_names:
+            data_params[output_name].update(err_params.get(output_name, {}))
+
+        return data_params
 
     def default_numpyro_model(
         self,
@@ -304,8 +347,15 @@ class LuxModel(eqx.Module):
         handled_params = set()
         for name, output in self.outputs.items():
             unpacked[name] = {}
-            for k in output.param_priors:
+            for k in output.data_transform.param_priors:
                 numpyro_name = f"{name}:{k}"
+                if numpyro_name not in params and skip_missing:
+                    continue
+                unpacked[name][k] = params[numpyro_name]
+                handled_params.add(numpyro_name)
+
+            for k in output.err_transform.param_priors:
+                numpyro_name = f"{name}:err:{k}"
                 if numpyro_name not in params and skip_missing:
                     continue
                 unpacked[name][k] = params[numpyro_name]
@@ -340,8 +390,12 @@ class LuxModel(eqx.Module):
         """
         packed: dict[str, jax.Array] = {}
         for name, output in self.outputs.items():
-            for k in output.param_priors:
+            for k in output.data_transform.param_priors:
                 numpyro_name = f"{name}:{k}"
+                packed[numpyro_name] = params[name][k]
+
+            for k in output.err_transform.param_priors:
+                numpyro_name = f"{name}:err:{k}"
                 packed[numpyro_name] = params[name][k]
 
         return packed

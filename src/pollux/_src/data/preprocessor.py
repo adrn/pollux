@@ -98,8 +98,8 @@ class ShiftScalePreprocessor(AbstractPreprocessor):
     >>> from pollux.data import ShiftScalePreprocessor
     >>> preprocessor = ShiftScalePreprocessor.from_data(data)
     >>> processed_data = preprocessor.transform(data)
-    >>> assert jnp.allclose(jnp.mean(processed_data, axis=0), 0.0)
-    >>> assert jnp.allclose(jnp.std(processed_data, axis=0), 1.0)
+    >>> assert jnp.allclose(jnp.mean(processed_data, axis=0), 0.0, atol=1e-5)
+    >>> assert jnp.allclose(jnp.std(processed_data, axis=0), 1.0, atol=1e-5)
 
     To instead use the mean and standard deviation computed over all axes at the same
     time, set the axis to None::
@@ -114,9 +114,11 @@ class ShiftScalePreprocessor(AbstractPreprocessor):
     using (1/2 times) the difference of the 84th and 16th percentile values as the
     scale::
 
-    >>> preprocessor = ShiftScalePreprocessor.from_data_percentiles(data, 16.0, 84.0)
+    >>> preprocessor = ShiftScalePreprocessor.from_data_percentiles(
+    ...     data, scale_percentiles=(5.0, 95.0)
+    ... )
     >>> processed_data = preprocessor.transform(data)
-    >>> assert jnp.allclose(jnp.median(processed_data, axis=0), 0.0)
+    >>> assert jnp.allclose(jnp.median(processed_data, axis=0), 0.0, atol=1e-4)
 
 
     """
@@ -141,8 +143,8 @@ class ShiftScalePreprocessor(AbstractPreprocessor):
     def from_data_percentiles(
         cls,
         data: BatchedDataT,
-        percentile_low: float = 16.0,
-        percentile_high: float = 84.0,
+        loc_percentile: float = 50.0,
+        scale_percentiles: tuple[float, float] = (16.0, 84.0),
         axis: int = 0,
     ) -> "ShiftScalePreprocessor":
         """Compute preprocessing parameters from data.
@@ -160,16 +162,16 @@ class ShiftScalePreprocessor(AbstractPreprocessor):
         """
         _scale = (
             jnp.diff(
-                jnp.percentile(
+                jnp.nanpercentile(
                     data,
-                    jnp.array([percentile_low, percentile_high]),
+                    jnp.array(scale_percentiles),
                     axis=axis,
                 ),
                 axis=0,
             )
             / 2.0
-        )
-        return cls(jnp.median(data, axis=axis), _scale)
+        )[0]
+        return cls(jnp.nanpercentile(data, loc_percentile, axis=axis), _scale)
 
     def transform(self, X: BatchedDataT) -> BatchedDataT:
         """Apply preprocessing transform to the input data."""

@@ -25,8 +25,11 @@ def make_simulated_linear_data(
 
     latents = rng.normal(size=(n_stars, n_latents))
 
-    labels = (A @ latents.T).T
-    fluxs = (B @ latents.T).T
+    with np.errstate(all="ignore"):
+        labels = (A @ latents.T).T
+        fluxs = (B @ latents.T).T
+    assert np.all(np.isfinite(labels))
+    assert np.all(np.isfinite(fluxs))
 
     label_err = rng.uniform(0.01, 0.1, size=labels.shape)
     flux_err = rng.uniform(0.01, 0.1, size=fluxs.shape)
