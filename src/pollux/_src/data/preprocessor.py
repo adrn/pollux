@@ -141,8 +141,8 @@ class ShiftScalePreprocessor(AbstractPreprocessor):
     def from_data_percentiles(
         cls,
         data: BatchedDataT,
-        percentile_low: float = 16.0,
-        percentile_high: float = 84.0,
+        loc_percentile: float = 50.0,
+        scale_percentiles: tuple[float, float] = (16.0, 84.0),
         axis: int = 0,
     ) -> "ShiftScalePreprocessor":
         """Compute preprocessing parameters from data.
@@ -160,16 +160,16 @@ class ShiftScalePreprocessor(AbstractPreprocessor):
         """
         _scale = (
             jnp.diff(
-                jnp.percentile(
+                jnp.nanpercentile(
                     data,
-                    jnp.array([percentile_low, percentile_high]),
+                    jnp.array(scale_percentiles),
                     axis=axis,
                 ),
                 axis=0,
             )
             / 2.0
-        )
-        return cls(jnp.median(data, axis=axis), _scale)
+        )[0]
+        return cls(jnp.nanpercentile(data, loc_percentile, axis=axis), _scale)
 
     def transform(self, X: BatchedDataT) -> BatchedDataT:
         """Apply preprocessing transform to the input data."""
