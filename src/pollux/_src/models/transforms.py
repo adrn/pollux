@@ -98,9 +98,9 @@ class AbstractAtomicTransform(AbstractTransform):
     Atomic transforms apply a single operation to convert latent vectors to outputs.
     """
 
-    transform: TransformFuncT[Any]
+    transform: TransformFuncT
     _param_names: tuple[str, ...] = eqx.field(init=False, repr=False)
-    _transform: TransformFuncT[Any] = eqx.field(init=False, repr=False)
+    _transform: TransformFuncT = eqx.field(init=False, repr=False)
     vmap: bool = True
 
     def __post_init__(self) -> None:
@@ -264,7 +264,7 @@ class NoOpTransform(AbstractAtomicTransform):
     """No-op transformation."""
 
     output_size: int = 0
-    transform: TransformFuncT[Any] = _noop_transform
+    transform: TransformFuncT = _noop_transform
     param_priors: ParamPriorsT = ImmutableMap()
     param_shapes: ParamShapesT = ImmutableMap()
 
@@ -287,7 +287,7 @@ class LinearTransform(AbstractAtomicTransform):
     vector.
     """
 
-    transform: TransformFuncT[LinearT] = _linear_transform
+    transform: TransformFuncT = _linear_transform
     param_priors: ParamPriorsT = eqx.field(
         default=ImmutableMap({"A": dist.Normal(0, 1)}),
         converter=ImmutableMap,
@@ -314,7 +314,7 @@ class OffsetTransform(AbstractAtomicTransform):
     Implements the transformation: y = z + b, where b is a bias vector.
     """
 
-    transform: TransformFuncT[LinearT] = _offset_transform
+    transform: TransformFuncT = _offset_transform
     param_priors: ParamPriorsT = eqx.field(
         default=ImmutableMap({"b": dist.Normal(0, 1)}),
         converter=ImmutableMap,
@@ -340,7 +340,7 @@ class AffineTransform(AbstractAtomicTransform):
     z is a latent vector, and b is a bias vector.
     """
 
-    transform: TransformFuncT[LinearT, OutputT] = _affine_transform
+    transform: TransformFuncT = _affine_transform
     param_priors: ParamPriorsT = eqx.field(
         default=ImmutableMap({"A": dist.Normal(0, 1), "b": dist.Normal(0, 1)}),
         converter=ImmutableMap,
@@ -371,7 +371,7 @@ class QuadraticTransform(AbstractAtomicTransform):
     A is a matrix, z is a latent vector, and b is a bias vector.
     """
 
-    transform: TransformFuncT[QuadT, LinearT, OutputT] = _quadratic_transform
+    transform: TransformFuncT = _quadratic_transform
     param_priors: ParamPriorsT = eqx.field(
         default=ImmutableMap(
             {"Q": dist.Normal(0, 1), "A": dist.Normal(0, 1), "b": dist.Normal(0, 1)}
