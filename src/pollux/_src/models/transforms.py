@@ -57,7 +57,7 @@ class ShapeSpec:
 
 
 ParamPriorsT: TypeAlias = ImmutableMap[str, dist.Distribution]
-ParamShapesT: TypeAlias = ImmutableMap[str, ShapeSpec]
+ParamShapesT: TypeAlias = ImmutableMap[str, ShapeSpec | tuple[int, ...]]
 
 
 class AbstractTransform(eqx.Module):
@@ -143,12 +143,17 @@ class AbstractAtomicTransform(AbstractTransform):
         priors = {}
         for name, prior in self.param_priors.items():
             if name in self.param_shapes:
-                shape = self.param_shapes[name].resolve(
-                    {
-                        "output_size": self.output_size,
-                        "latent_size": latent_size,
-                        "data_size": data_size,
-                    }
+                shapespec = self.param_shapes[name]
+                shape = (
+                    shapespec.resolve(
+                        {
+                            "output_size": self.output_size,
+                            "latent_size": latent_size,
+                            "data_size": data_size,
+                        }
+                    )
+                    if isinstance(shapespec, ShapeSpec)
+                    else shapespec
                 )
                 priors[name] = prior.expand(shape)
             else:
@@ -229,15 +234,29 @@ class TransformSequence(AbstractTransform):
         for the transform, based on latent size and optional data size.
         """
         priors = {}
-        for (name, prior), trans in zip(self.param_priors.items(), self.transforms):
-            shape = self.param_shapes[name].resolve(
-                {
-                    "output_size": trans.output_size,
-                    "latent_size": latent_size,
-                    "data_size": data_size,
-                }
-            )
-            priors[name] = prior.expand(shape)
+        for name, prior in self.param_priors.items():
+            # Extract transform index from parameter name (e.g., "t0_A" -> 0)
+            transform_idx = int(
+                name.split("_")[0][1:]
+            )  # Remove 't' prefix and convert to int
+            trans = self.transforms[transform_idx]
+
+            if name in self.param_shapes:
+                shapespec = self.param_shapes[name]
+                shape = (
+                    shapespec.resolve(
+                        {
+                            "output_size": trans.output_size,
+                            "latent_size": latent_size,
+                            "data_size": data_size,
+                        }
+                    )
+                    if isinstance(shapespec, ShapeSpec)
+                    else shapespec
+                )
+                priors[name] = prior.expand(shape)
+            else:
+                priors[name] = prior
         return ImmutableMap(**priors)
 
 
