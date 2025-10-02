@@ -17,12 +17,12 @@ from ..typing import (
     PackedParamsT,
     UnpackedParamsT,
 )
-from .transforms import AbstractTransform, NoOpTransform
+from .transforms import AbstractSingleTransform, NoOpTransform, TransformSequence
 
 
 class LuxOutput(eqx.Module):
-    data_transform: AbstractTransform
-    err_transform: AbstractTransform
+    data_transform: AbstractSingleTransform | TransformSequence
+    err_transform: AbstractSingleTransform | TransformSequence
 
 
 # err_transform.apply(data[output_name].err, **err_params[output_name])
@@ -51,8 +51,8 @@ class LuxModel(eqx.Module):
     def register_output(
         self,
         name: str,
-        data_transform: AbstractTransform,
-        err_transform: AbstractTransform | None = None,
+        data_transform: AbstractSingleTransform | TransformSequence,
+        err_transform: AbstractSingleTransform | TransformSequence | None = None,
     ) -> None:
         """Register a new output of the model given a specified transform.
 
@@ -87,6 +87,9 @@ class LuxModel(eqx.Module):
             The latent vectors that transform into the outputs.
         params
             A dictionary of parameters for each output transformation in the model.
+            For TransformSequence outputs, expects either:
+            - A list of parameter dictionaries
+            - A flat dictionary with "{index}:{param}" keys
         names
             A single string or a list of output names to predict. If None, predict all
             outputs (default).
@@ -160,19 +163,22 @@ class LuxModel(eqx.Module):
             # Priors for latent -> data transformation:
             data_priors[output_name] = self.outputs[
                 output_name
-            ].data_transform.get_priors(
+            ].data_transform.get_expanded_priors(
                 latent_size=self.latent_size, data_size=len(data)
             )
             data_params[output_name] = {}
             for param_name, prior in data_priors[output_name].items():
+                # Use new naming scheme: "output_name:param_name"
+                # For TransformSequence, param_name already includes "{index}:{param}"
+                numpyro_name = f"{output_name}:{param_name}"
                 data_params[output_name][param_name] = numpyro.sample(
-                    f"{output_name}:{param_name}", prior
+                    numpyro_name, prior
                 )
 
             # Priors and parameters for transformation of the errors:
             err_priors[output_name] = self.outputs[
                 output_name
-            ].err_transform.get_priors(
+            ].err_transform.get_expanded_priors(
                 latent_size=self.latent_size, data_size=len(data)
             )
             err_params[output_name] = {}
@@ -347,14 +353,23 @@ class LuxModel(eqx.Module):
         handled_params = set()
         for name, output in self.outputs.items():
             unpacked[name] = {}
-            for k in output.data_transform.param_priors:
+
+            # data priors
+            data_priors = output.data_transform.get_expanded_priors(
+                latent_size=self.latent_size, data_size=len(params)
+            )
+            for k in data_priors:
                 numpyro_name = f"{name}:{k}"
                 if numpyro_name not in params and skip_missing:
                     continue
                 unpacked[name][k] = params[numpyro_name]
                 handled_params.add(numpyro_name)
 
-            for k in output.err_transform.param_priors:
+            # err_transform param_priors
+            err_priors = output.err_transform.get_expanded_priors(
+                latent_size=self.latent_size, data_size=len(params)
+            )
+            for k in err_priors:
                 numpyro_name = f"{name}:err:{k}"
                 if numpyro_name not in params and skip_missing:
                     continue
@@ -390,11 +405,23 @@ class LuxModel(eqx.Module):
         """
         packed: dict[str, jax.Array] = {}
         for name, output in self.outputs.items():
-            for k in output.data_transform.param_priors:
+            # For data transform
+            names = (
+                output.data_transform._param_names
+                if isinstance(output.data_transform, AbstractSingleTransform)
+                else output.data_transform.names_flat
+            )
+            for k in names:
                 numpyro_name = f"{name}:{k}"
                 packed[numpyro_name] = params[name][k]
 
-            for k in output.err_transform.param_priors:
+            # Repeat for err
+            err_names = (
+                output.err_transform._param_names
+                if isinstance(output.err_transform, AbstractSingleTransform)
+                else output.err_transform.names_flat
+            )
+            for k in err_names:
                 numpyro_name = f"{name}:err:{k}"
                 packed[numpyro_name] = params[name][k]
 
