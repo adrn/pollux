@@ -145,10 +145,52 @@ class LuxModel(eqx.Module):
             err_transform = NoOpTransform()
         self.outputs[name] = LuxOutput(data_transform, err_transform)
 
+    def _extract_transform_pars(
+        self, pars: dict[str, Any], transform_type: str = "data"
+    ) -> dict[str, Any]:
+        """Extract data or error transform parameters from nested parameter structure.
+
+        This method handles the unpacking of parameters from the nested structure
+        returned by `unpack_numpyro_pars` or `optimize`. It detects whether the
+        parameters are already in the expected format or need to be extracted.
+
+        Parameters
+        ----------
+        pars
+            A dictionary of parameters that may be in one of two formats:
+            1. Already extracted: {"output_name": {...} or [...], ...}
+            2. Nested format: {"output_name": {"data": ..., "err": ...}, ...}
+        transform_type
+            Either "data" or "err" to specify which transform parameters to extract.
+
+        Returns
+        -------
+        dict
+            A dictionary mapping output names to their transform parameters.
+        """
+        extracted_pars = {}
+
+        for output_name in self.outputs:
+            if output_name not in pars:
+                continue
+
+            par_value = pars[output_name]
+
+            # Check if this is already in the extracted format (dict or list/tuple)
+            # vs. the nested format with "data" and "err" keys
+            if isinstance(par_value, dict) and transform_type in par_value:
+                # Nested format: extract the specified transform type
+                extracted_pars[output_name] = par_value[transform_type]
+            else:
+                # Already extracted format: use as-is
+                extracted_pars[output_name] = par_value
+
+        return extracted_pars
+
     def predict_outputs(
         self,
         latents: BatchedLatentsT,
-        data_pars: dict[str, Any],
+        pars: dict[str, Any],
         names: list[str] | str | None = None,
     ) -> BatchedOutputT | dict[str, BatchedOutputT]:
         """Predict output values for given latent vectors and parameters.
@@ -157,9 +199,12 @@ class LuxModel(eqx.Module):
         ----------
         latents
             The latent vectors that transform into the outputs.
-        data_pars
-            A dictionary of parameters for the data component of each output
-            transformation in the model. For TransformSequence outputs, expects either:
+        pars
+            A dictionary of parameters for each output transformation in the model.
+            Can be in either format:
+            1. Direct format: {"output_name": {...} or [...], ...}
+            2. Nested format: {"output_name": {"data": ..., "err": ...}, ...}
+            For TransformSequence outputs, expects either:
             - A list of parameter dictionaries
             - A flat dictionary with "{index}:{param}" keys
         names
@@ -184,6 +229,9 @@ class LuxModel(eqx.Module):
             names = list(self.outputs.keys())
         elif isinstance(names, str):
             names = [names]
+
+        # Extract data parameters, handling both nested and direct formats
+        data_pars = self._extract_transform_pars(pars, transform_type="data")
 
         results = {}
         for name in names:
