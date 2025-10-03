@@ -59,12 +59,12 @@ def test_infer_distance():
     )
     model.register_output("label", trans)
 
-    params = {"flux": {"A": truth["B"]}, "label": [{"A": truth["A"]}, {"b": true_dm}]}
-    test_out = model.predict_outputs(truth["latents"], params)
+    pars = {"flux": {"A": truth["B"]}, "label": [{"A": truth["A"]}, {"b": true_dm}]}
+    test_out = model.predict_outputs(truth["latents"], pars)
     assert jnp.allclose(test_out["flux"], truth["flux"], atol=1e-5)
     assert jnp.allclose(test_out["label"], truth["label"] + true_dm, atol=1e-5)
 
-    opt_params, res = model.optimize(
+    opt_pars, res = model.optimize(
         all_data,
         num_steps=10000,
         rng_key=jax.random.PRNGKey(0),
@@ -72,6 +72,6 @@ def test_infer_distance():
     )
     res.losses.block_until_ready()
 
-    d_dm = opt_params["label"]["data"][1]["b"] - true_dm
+    d_dm = opt_pars["label"]["data"][1]["b"] - true_dm
     assert jnp.isclose(jnp.mean(d_dm), 0.0, atol=1e-1)
     assert jnp.isclose(jnp.std(d_dm), 1.0, atol=1e-1)

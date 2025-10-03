@@ -25,8 +25,8 @@ class LuxOutput(eqx.Module):
     data_transform: AbstractSingleTransform | TransformSequence
     err_transform: AbstractSingleTransform | TransformSequence
 
-    def unpack_params(
-        self, packed_params: dict[str, Any], skip_missing: bool = False
+    def unpack_pars(
+        self, packed_pars: dict[str, Any], skip_missing: bool = False
     ) -> tuple[
         dict[str, Any] | tuple[dict[str, Any], ...],
         dict[str, Any] | tuple[dict[str, Any], ...],
@@ -35,7 +35,7 @@ class LuxOutput(eqx.Module):
 
         Parameters
         ----------
-        packed_params
+        packed_pars
             Dictionary of packed parameters with "err:" prefixed keys for error
             transform parameters.
         skip_missing
@@ -44,31 +44,29 @@ class LuxOutput(eqx.Module):
         Returns
         -------
         tuple
-            A tuple of (data_params, err_params) where each element is either a
+            A tuple of (data_pars, err_pars) where each element is either a
             dict (for single transforms) or a tuple of dicts (for transform sequences).
         """
-        packed_data_params: UnpackedParamsT = {}
-        packed_err_params: UnpackedParamsT = {}
-        for name, value in packed_params.items():
+        packed_data_pars: UnpackedParamsT = {}
+        packed_err_pars: UnpackedParamsT = {}
+        for name, value in packed_pars.items():
             if name.startswith("err:"):
-                packed_err_params[name[4:]] = value
+                packed_err_pars[name[4:]] = value
             else:
-                packed_data_params[name] = value
+                packed_data_pars[name] = value
 
-        return self.data_transform.unpack_params(
-            packed_data_params, skip_missing=skip_missing
-        ), self.err_transform.unpack_params(
-            packed_err_params, skip_missing=skip_missing
-        )
+        return self.data_transform.unpack_pars(
+            packed_data_pars, skip_missing=skip_missing
+        ), self.err_transform.unpack_pars(packed_err_pars, skip_missing=skip_missing)
 
-    def pack_params(
-        self, unpacked_params: dict[str, Any], skip_missing: bool = False
+    def pack_pars(
+        self, unpacked_pars: dict[str, Any], skip_missing: bool = False
     ) -> PackedParamsT:
         """Pack data and error parameters for this output.
 
         Parameters
         ----------
-        unpacked_params
+        unpacked_pars
             Dictionary with "data" and "err" keys containing the unpacked parameters
             for the data and error transforms respectively.
         skip_missing
@@ -83,17 +81,15 @@ class LuxOutput(eqx.Module):
         packed: dict[str, jax.Array] = {}
 
         # Pack data transform parameters
-        data_params = unpacked_params.get("data", {})
-        packed_data = self.data_transform.pack_params(
-            data_params, skip_missing=skip_missing
+        data_pars = unpacked_pars.get("data", {})
+        packed_data = self.data_transform.pack_pars(
+            data_pars, skip_missing=skip_missing
         )
         packed.update(packed_data)
 
         # Pack error transform parameters with "err:" prefix
-        err_params = unpacked_params.get("err", {})
-        packed_err = self.err_transform.pack_params(
-            err_params, skip_missing=skip_missing
-        )
+        err_pars = unpacked_pars.get("err", {})
+        packed_err = self.err_transform.pack_pars(err_pars, skip_missing=skip_missing)
         for key, value in packed_err.items():
             packed[f"err:{key}"] = value
 
@@ -148,7 +144,7 @@ class LuxModel(eqx.Module):
     def predict_outputs(
         self,
         latents: BatchedLatentsT,
-        data_params: dict[str, Any],
+        data_pars: dict[str, Any],
         names: list[str] | str | None = None,
     ) -> BatchedOutputT | dict[str, BatchedOutputT]:
         """Predict output values for given latent vectors and parameters.
@@ -157,7 +153,7 @@ class LuxModel(eqx.Module):
         ----------
         latents
             The latent vectors that transform into the outputs.
-        data_params
+        data_pars
             A dictionary of parameters for the data component of each output
             transformation in the model. For TransformSequence outputs, expects either:
             - A list of parameter dictionaries
@@ -187,13 +183,13 @@ class LuxModel(eqx.Module):
 
         results = {}
         for name in names:
-            if isinstance(data_params[name], dict):
+            if isinstance(data_pars[name], dict):
                 results[name] = self.outputs[name].data_transform.apply(
-                    latents, **data_params[name]
+                    latents, **data_pars[name]
                 )
             else:
                 results[name] = self.outputs[name].data_transform.apply(
-                    latents, *data_params[name]
+                    latents, *data_pars[name]
                 )
 
         return results
@@ -229,8 +225,8 @@ class LuxModel(eqx.Module):
 
         data_priors: dict[str, Mapping[str, Any]] = {}
         err_priors: dict[str, Mapping[str, Any]] = {}
-        data_params: dict[str, dict[str, jax.Array]] = {}
-        err_params: dict[str, dict[str, jax.Array]] = {}
+        data_pars: dict[str, dict[str, jax.Array]] = {}
+        err_pars: dict[str, dict[str, jax.Array]] = {}
         for output_name in output_names:
             # Priors for latent -> data transformation:
             data_priors[output_name] = self.outputs[
@@ -238,14 +234,12 @@ class LuxModel(eqx.Module):
             ].data_transform.get_expanded_priors(
                 latent_size=self.latent_size, data_size=len(data)
             )
-            data_params[output_name] = {}
+            data_pars[output_name] = {}
             for param_name, prior in data_priors[output_name].items():
                 # Use new naming scheme: "output_name:param_name"
                 # For TransformSequence, param_name already includes "{index}:{param}"
                 numpyro_name = f"{output_name}:{param_name}"
-                data_params[output_name][param_name] = numpyro.sample(
-                    numpyro_name, prior
-                )
+                data_pars[output_name][param_name] = numpyro.sample(numpyro_name, prior)
 
             # Priors and parameters for transformation of the errors:
             err_priors[output_name] = self.outputs[
@@ -253,13 +247,13 @@ class LuxModel(eqx.Module):
             ].err_transform.get_expanded_priors(
                 latent_size=self.latent_size, data_size=len(data)
             )
-            err_params[output_name] = {}
+            err_pars[output_name] = {}
             for param_name, prior in err_priors[output_name].items():
-                err_params[output_name][param_name] = numpyro.sample(
+                err_pars[output_name][param_name] = numpyro.sample(
                     f"{output_name}:err:{param_name}", prior
                 )
 
-        outputs = self.predict_outputs(latents, data_params, names=output_names)
+        outputs = self.predict_outputs(latents, data_pars, names=output_names)
         for output_name in output_names:
             pred = outputs[output_name]
 
@@ -268,7 +262,7 @@ class LuxModel(eqx.Module):
             # TODO: This interface could be made more general to support, e.g.,
             # covariance matrices
             err = self.outputs[output_name].err_transform.apply(
-                data[output_name].err, **err_params[output_name]
+                data[output_name].err, **err_pars[output_name]
             )
             numpyro.sample(
                 f"obs:{output_name}",
@@ -277,15 +271,15 @@ class LuxModel(eqx.Module):
             )
 
         for output_name in output_names:
-            data_params[output_name].update(err_params.get(output_name, {}))
+            data_pars[output_name].update(err_pars.get(output_name, {}))
 
-        return data_params
+        return data_pars
 
     def default_numpyro_model(
         self,
         data: PolluxData,
         latents_prior: dist.Distribution | None | bool = None,
-        fixed_params: PackedParamsT | None = None,
+        fixed_pars: PackedParamsT | None = None,
         names: list[str] | None = None,
         custom_model: Callable[[BatchedLatentsT, dict[str, Any], PolluxData], None]
         | None = None,
@@ -303,13 +297,13 @@ class LuxModel(eqx.Module):
         latents_prior
             The prior distribution for the latent vectors. If not specified, use a unit
             Gaussian. If False, use an improper uniform prior.
-        fixed_params
+        fixed_pars
             A dictionary of fixed parameters to condition on. If None, all parameters
             will be sampled.
         names
             A list of output names to include in the model. If None, include all outputs.
         custom_model
-            Optional callable that takes latents, params, and data and adds custom
+            Optional callable that takes latents, pars, and data and adds custom
             modeling components.
         """
         n_data = len(data)
@@ -336,17 +330,17 @@ class LuxModel(eqx.Module):
             _latents_prior = _latents_prior.expand((self.latent_size,))
 
         # Use condition handler to fix parameters if specified
-        with numpyro.handlers.condition(data=fixed_params or {}):
+        with numpyro.handlers.condition(data=fixed_pars or {}):
             latents = numpyro.sample(
                 "latents",
                 _latents_prior,
                 sample_shape=(n_data,),
             )
-            params = self.setup_numpyro(latents, data, names=names)
+            pars = self.setup_numpyro(latents, data, names=names)
 
         # Call the custom model function if provided
         if custom_model is not None:
-            custom_model(latents, params, data)
+            custom_model(latents, pars, data)
 
     def optimize(
         self,
@@ -357,7 +351,7 @@ class LuxModel(eqx.Module):
         latents_prior: dist.Distribution | None | bool = None,
         custom_model: Callable[[BatchedLatentsT, dict[str, Any], PolluxData], None]
         | None = None,
-        fixed_params: UnpackedParamsT | None = None,
+        fixed_pars: UnpackedParamsT | None = None,
         names: list[str] | None = None,
         svi_run_kwargs: dict[str, Any] | None = None,
     ) -> tuple[UnpackedParamsT, Any]:
@@ -371,20 +365,20 @@ class LuxModel(eqx.Module):
         # Default to using Adam optimizer:
         optimizer = optimizer or numpyro.optim.Adam()
 
-        partial_params: dict[str, Any] = {}
-        if fixed_params is not None:
-            packed_fixed_params = self.pack_numpyro_params(fixed_params)
-            partial_params["fixed_params"] = packed_fixed_params
+        partial_pars: dict[str, Any] = {}
+        if fixed_pars is not None:
+            packed_fixed_pars = self.pack_numpyro_pars(fixed_pars)
+            partial_pars["fixed_pars"] = packed_fixed_pars
 
         if names is not None:
-            partial_params["names"] = names
+            partial_pars["names"] = names
 
-        partial_params["latents_prior"] = latents_prior
-        partial_params["custom_model"] = custom_model
+        partial_pars["latents_prior"] = latents_prior
+        partial_pars["custom_model"] = custom_model
 
         model: Any
-        if partial_params:
-            model = partial(self.default_numpyro_model, **partial_params)
+        if partial_pars:
+            model = partial(self.default_numpyro_model, **partial_pars)
         else:
             model = self.default_numpyro_model
 
@@ -397,17 +391,17 @@ class LuxModel(eqx.Module):
         guide = AutoDelta(model)
         svi = SVI(model, guide, optimizer, Trace_ELBO())
         svi_results = svi.run(svi_key, num_steps, data, **svi_run_kwargs)
-        packed_MAP_params = guide.sample_posterior(sample_key, svi_results.params)
+        packed_MAP_pars = guide.sample_posterior(sample_key, svi_results.pars)
 
-        unpacked_params = self.unpack_numpyro_params(
-            packed_MAP_params,
-            skip_missing=bool(fixed_params is not None or names is not None),
+        unpacked_pars = self.unpack_numpyro_pars(
+            packed_MAP_pars,
+            skip_missing=bool(fixed_pars is not None or names is not None),
         )
-        # TODO: should the params get their own object?
-        return unpacked_params, svi_results
+        # TODO: should the pars get their own object?
+        return unpacked_pars, svi_results
 
-    def unpack_numpyro_params(
-        self, params: PackedParamsT, skip_missing: bool = False
+    def unpack_numpyro_pars(
+        self, pars: PackedParamsT, skip_missing: bool = False
     ) -> dict[str, Any]:
         """Unpack numpyro parameters into separate data and error parameter structures.
 
@@ -420,11 +414,11 @@ class LuxModel(eqx.Module):
 
         Parameters
         ----------
-        params
+        pars
             A dictionary of numpyro parameters. The keys should be in the format
             "output_name:param_name" or "output_name:err:param_name".
         skip_missing
-            If True, skip parameters that are missing from the params dict.
+            If True, skip parameters that are missing from the pars dict.
 
         Returns
         -------
@@ -439,15 +433,15 @@ class LuxModel(eqx.Module):
 
             Example structure:
             {
-                "flux": {"data": {...} or (...), "err": {}},  # err empty if no error params
+                "flux": {"data": {...} or (...), "err": {}},  # err empty if no error pars
                 "label": {"data": {...}, "err": {...}},
                 "latents": array
             }
         """
-        unpacked_params: dict[str, Any] = {}
+        unpacked_pars: dict[str, Any] = {}
 
-        params_by_output: dict[str, dict[str, Any]] = defaultdict(dict)
-        for name, value in params.items():
+        pars_by_output: dict[str, dict[str, Any]] = defaultdict(dict)
+        for name, value in pars.items():
             if ":" in name:  # name associated with an output, like "flux:p1"
                 output_name, *therest = name.split(":")
 
@@ -458,33 +452,33 @@ class LuxModel(eqx.Module):
                     )
                     raise ValueError(msg)
 
-                params_by_output[output_name][":".join(therest)] = value
+                pars_by_output[output_name][":".join(therest)] = value
 
             else:  # names not associated with outputs, like "latents", get passed thru
-                unpacked_params[name] = value
+                unpacked_pars[name] = value
 
-        for output, pars in params_by_output.items():
-            data_params, err_params = self.outputs[output].unpack_params(
-                pars, skip_missing=skip_missing
+        for output, _pars in pars_by_output.items():
+            data_pars, err_pars = self.outputs[output].unpack_pars(
+                _pars, skip_missing=skip_missing
             )
-            unpacked_params[output] = {"data": data_params, "err": err_params}
+            unpacked_pars[output] = {"data": data_pars, "err": err_pars}
 
-        return unpacked_params
+        return unpacked_pars
 
-    def pack_numpyro_params(
+    def pack_numpyro_pars(
         self,
-        params: dict[str, Any],  # TODO: update Any to real types
+        pars: dict[str, Any],  # TODO: update Any to real types
         skip_missing: bool = False,
     ) -> PackedParamsT:
         """Pack parameters into a flat dictionary keyed on numpyro names.
 
-        This method is the inverse of `unpack_numpyro_params`. It takes a nested
+        This method is the inverse of `unpack_numpyro_pars`. It takes a nested
         dictionary of parameters and flattens it into a dictionary keyed on numpyro
         parameter names.
 
         Parameters
         ----------
-        params
+        pars
             A nested dictionary with keys as output names. Each output name should
             be a key with a dict value containing "data" and optionally "err" keys.
             The "err" key can be omitted if there are no error parameters for that output.
@@ -509,15 +503,15 @@ class LuxModel(eqx.Module):
         packed: dict[str, jax.Array] = {}
 
         for output_name, output in self.outputs.items():
-            if output_name not in params and not skip_missing:
+            if output_name not in pars and not skip_missing:
                 msg = f"Missing parameters for output {output_name}"
                 raise ValueError(msg)
 
-            output_params = params.get(output_name, {})
-            tmp = output.pack_params(
+            output_pars = pars.get(output_name, {})
+            tmp = output.pack_pars(
                 {
-                    "data": output_params.get("data", {}),
-                    "err": output_params.get("err", {}),
+                    "data": output_pars.get("data", {}),
+                    "err": output_pars.get("err", {}),
                 },
                 skip_missing=skip_missing,
             )
@@ -526,8 +520,8 @@ class LuxModel(eqx.Module):
                 packed[f"{output_name}:{key}"] = value
 
         # Handle non-output parameters (like latents)
-        for name in params:
+        for name in pars:
             if name not in self.outputs:
-                packed[name] = params[name]
+                packed[name] = pars[name]
 
         return packed

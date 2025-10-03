@@ -52,7 +52,7 @@ def test_infer_error_intrinsic_scatter():
     )
     model.register_output("label", plx.models.LinearTransform(output_size=n_labels))
 
-    opt_params, res = model.optimize(
+    opt_pars, res = model.optimize(
         all_data,
         num_steps=50_000,
         rng_key=jax.random.PRNGKey(0),
@@ -61,5 +61,5 @@ def test_infer_error_intrinsic_scatter():
     res.losses.block_until_ready()
 
     assert np.isclose(
-        np.mean(opt_params["flux"]["err"]["s"]), np.mean(data["flux_err"]), atol=0.05
+        np.mean(opt_pars["flux"]["err"]["s"]), np.mean(data["flux_err"]), atol=0.05
     )

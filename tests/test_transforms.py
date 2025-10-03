@@ -113,17 +113,17 @@ def test_transform_sequence_priors():
     tmp += b
 
     # Test new parameter format with list of dicts
-    params = {"mags": [{"A": A}, {"b": b}]}
+    pars = {"mags": [{"A": A}, {"b": b}]}
 
     model = plx.LuxModel(latent_size=n_latents)
     model.register_output("mags", trans)
-    out = model.predict_outputs(latents, params)
+    out = model.predict_outputs(latents, pars)
 
     assert np.allclose(out["mags"], tmp)
 
     # Test new flat parameter format
-    params_flat = {"mags": {"0:A": A, "1:b": b}}
-    out_flat = model.predict_outputs(latents, params_flat)
+    pars_flat = {"mags": {"0:A": A, "1:b": b}}
+    out_flat = model.predict_outputs(latents, pars_flat)
     assert np.allclose(out_flat["mags"], tmp)
 
 
@@ -253,8 +253,8 @@ def test_function_transform_in_sequence():
     assert np.allclose(result_flat, expected)
 
 
-def test_transform_sequence_pack_unpack_params():
-    """Test the pack_params and unpack_params methods for parameter conversion.
+def test_transform_sequence_pack_unpack_pars():
+    """Test the pack_pars and unpack_pars methods for parameter conversion.
 
     Tests basic functionality of packing nested parameter lists into flat dictionaries
     and vice versa. Verifies round-trip conversion (pack → unpack → original structure)
@@ -282,12 +282,12 @@ def test_transform_sequence_pack_unpack_params():
     b = rng.random((n_out, 1))
 
     # Test packing: nested list -> flat dict
-    nested_params = [
+    nested_pars = [
         {"A": A},
         {"b": b},
     ]
 
-    packed = trans_seq.pack_params(nested_params)
+    packed = trans_seq.pack_pars(nested_pars)
     expected_packed = {"0:A": A, "1:b": b}
 
     assert set(packed.keys()) == set(expected_packed.keys())
@@ -295,8 +295,8 @@ def test_transform_sequence_pack_unpack_params():
     assert np.allclose(packed["1:b"], expected_packed["1:b"])
 
     # Test unpacking: flat dict -> nested list
-    flat_params = {"0:A": A, "1:b": b}
-    unpacked = trans_seq.unpack_params(flat_params)
+    flat_pars = {"0:A": A, "1:b": b}
+    unpacked = trans_seq.unpack_pars(flat_pars)
 
     assert len(unpacked) == 2
     assert set(unpacked[0].keys()) == {"A"}
@@ -305,15 +305,15 @@ def test_transform_sequence_pack_unpack_params():
     assert np.allclose(unpacked[1]["b"], b)
 
     # Test round-trip: pack -> unpack should return original
-    round_trip = trans_seq.unpack_params(trans_seq.pack_params(nested_params))
-    assert len(round_trip) == len(nested_params)
-    for orig, restored in zip(nested_params, round_trip):
+    round_trip = trans_seq.unpack_pars(trans_seq.pack_pars(nested_pars))
+    assert len(round_trip) == len(nested_pars)
+    for orig, restored in zip(nested_pars, round_trip):
         assert set(orig.keys()) == set(restored.keys())
         for key in orig:
             assert np.allclose(orig[key], restored[key])
 
 
-def test_transform_sequence_unpack_with_missing_params():
+def test_transform_sequence_unpack_with_missing_pars():
     """Test unpacking parameters when some parameters are missing.
 
     Tests behavior when only some transforms have parameters provided.
@@ -337,15 +337,15 @@ def test_transform_sequence_unpack_with_missing_params():
     )
 
     # Only provide parameters for first transform
-    flat_params = {"0:A": rng.random((n_out, n_latents))}
-    unpacked = trans_seq.unpack_params(flat_params, skip_missing=True)
+    flat_pars = {"0:A": rng.random((n_out, n_latents))}
+    unpacked = trans_seq.unpack_pars(flat_pars, skip_missing=True)
 
     assert len(unpacked) == 2
     assert "A" in unpacked[0]
     assert len(unpacked[1]) == 0  # Second transform should have empty dict
 
 
-def test_transform_sequence_unpack_with_extra_params():
+def test_transform_sequence_unpack_with_extra_pars():
     """Test unpacking parameters with extra parameters that don't match any transform.
 
     Tests robustness when invalid parameter names are provided, including parameters
@@ -365,13 +365,13 @@ def test_transform_sequence_unpack_with_extra_params():
     trans_seq = TransformSequence(transforms=(LinearTransform(output_size=n_out),))
 
     # Include valid parameter and some invalid ones
-    flat_params = {
+    flat_pars = {
         "0:A": rng.random((n_out, n_latents)),
         "5:invalid": rng.random((2, 2)),  # Invalid transform index
         "not_indexed": rng.random((3, 3)),  # No index format
     }
 
-    unpacked = trans_seq.unpack_params(flat_params)
+    unpacked = trans_seq.unpack_pars(flat_pars)
 
     # Should only unpack valid parameters
     assert len(unpacked) == 1
@@ -403,12 +403,12 @@ def test_transform_sequence_pack_empty_dicts():
     )
 
     # First transform has parameters, second is empty
-    nested_params = [
+    nested_pars = [
         {"A": rng.random((n_out, 4))},
         {},  # Empty dict for second transform
     ]
 
-    packed = trans_seq.pack_params(nested_params)
+    packed = trans_seq.pack_pars(nested_pars)
 
     # Should only have parameters from first transform
     assert set(packed.keys()) == {"0:A"}
@@ -458,18 +458,18 @@ def test_transform_sequence_three_transforms_pack_unpack():
     scale = rng.random((1,))
     b = rng.random((n_out, 1))
 
-    nested_params = [
+    nested_pars = [
         {"A": A},
         {"scale": scale},
         {"b": b},
     ]
 
     # Test pack -> unpack round trip
-    packed = trans_seq.pack_params(nested_params)
+    packed = trans_seq.pack_pars(nested_pars)
     expected_keys = {"0:A", "1:scale", "2:b"}
     assert set(packed.keys()) == expected_keys
 
-    unpacked = trans_seq.unpack_params(packed)
+    unpacked = trans_seq.unpack_pars(packed)
     assert len(unpacked) == 3
     assert np.allclose(unpacked[0]["A"], A)
     assert np.allclose(unpacked[1]["scale"], scale)
