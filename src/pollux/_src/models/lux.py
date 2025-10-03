@@ -395,7 +395,7 @@ class LuxModel(eqx.Module):
         guide = AutoDelta(model)
         svi = SVI(model, guide, optimizer, Trace_ELBO())
         svi_results = svi.run(svi_key, num_steps, data, **svi_run_kwargs)
-        packed_MAP_pars = guide.sample_posterior(sample_key, svi_results.pars)
+        packed_MAP_pars = guide.sample_posterior(sample_key, svi_results.params)
 
         unpacked_pars = self.unpack_numpyro_pars(
             packed_MAP_pars,
