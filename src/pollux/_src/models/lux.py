@@ -1,3 +1,4 @@
+from collections import defaultdict
 from collections.abc import Callable, Mapping
 from functools import partial
 from typing import Any
@@ -24,8 +25,79 @@ class LuxOutput(eqx.Module):
     data_transform: AbstractSingleTransform | TransformSequence
     err_transform: AbstractSingleTransform | TransformSequence
 
+    def unpack_params(
+        self, packed_params: dict[str, Any], skip_missing: bool = False
+    ) -> tuple[
+        dict[str, Any] | tuple[dict[str, Any], ...],
+        dict[str, Any] | tuple[dict[str, Any], ...],
+    ]:
+        """Unpack parameters for this output's data and error transforms.
 
-# err_transform.apply(data[output_name].err, **err_params[output_name])
+        Parameters
+        ----------
+        packed_params
+            Dictionary of packed parameters with "err:" prefixed keys for error
+            transform parameters.
+        skip_missing
+            If True, skip missing parameters instead of raising an error.
+
+        Returns
+        -------
+        tuple
+            A tuple of (data_params, err_params) where each element is either a
+            dict (for single transforms) or a tuple of dicts (for transform sequences).
+        """
+        packed_data_params: UnpackedParamsT = {}
+        packed_err_params: UnpackedParamsT = {}
+        for name, value in packed_params.items():
+            if name.startswith("err:"):
+                packed_err_params[name[4:]] = value
+            else:
+                packed_data_params[name] = value
+
+        return self.data_transform.unpack_params(
+            packed_data_params, skip_missing=skip_missing
+        ), self.err_transform.unpack_params(
+            packed_err_params, skip_missing=skip_missing
+        )
+
+    def pack_params(
+        self, unpacked_params: dict[str, Any], skip_missing: bool = False
+    ) -> PackedParamsT:
+        """Pack data and error parameters for this output.
+
+        Parameters
+        ----------
+        unpacked_params
+            Dictionary with "data" and "err" keys containing the unpacked parameters
+            for the data and error transforms respectively.
+        skip_missing
+            If True, skip missing parameters instead of raising an error.
+
+        Returns
+        -------
+        dict
+            Flat dictionary with parameter names that include any necessary prefixes
+            (e.g., "err:" for error parameters, "0:" for TransformSequence indices).
+        """
+        packed: dict[str, jax.Array] = {}
+
+        # Pack data transform parameters
+        data_params = unpacked_params.get("data", {})
+        packed_data = self.data_transform.pack_params(
+            data_params, skip_missing=skip_missing
+        )
+        packed.update(packed_data)
+
+        # Pack error transform parameters with "err:" prefix
+        err_params = unpacked_params.get("err", {})
+        packed_err = self.err_transform.pack_params(
+            err_params, skip_missing=skip_missing
+        )
+        for key, value in packed_err.items():
+            packed[f"err:{key}"] = value
+
+        return packed
 
 
 class LuxModel(eqx.Module):
@@ -76,7 +148,7 @@ class LuxModel(eqx.Module):
     def predict_outputs(
         self,
         latents: BatchedLatentsT,
-        params: dict[str, Any],
+        data_params: dict[str, Any],
         names: list[str] | str | None = None,
     ) -> BatchedOutputT | dict[str, BatchedOutputT]:
         """Predict output values for given latent vectors and parameters.
@@ -85,9 +157,9 @@ class LuxModel(eqx.Module):
         ----------
         latents
             The latent vectors that transform into the outputs.
-        params
-            A dictionary of parameters for each output transformation in the model.
-            For TransformSequence outputs, expects either:
+        data_params
+            A dictionary of parameters for the data component of each output
+            transformation in the model. For TransformSequence outputs, expects either:
             - A list of parameter dictionaries
             - A flat dictionary with "{index}:{param}" keys
         names
@@ -115,13 +187,13 @@ class LuxModel(eqx.Module):
 
         results = {}
         for name in names:
-            if isinstance(params[name], dict):
+            if isinstance(data_params[name], dict):
                 results[name] = self.outputs[name].data_transform.apply(
-                    latents, **params[name]
+                    latents, **data_params[name]
                 )
             else:
                 results[name] = self.outputs[name].data_transform.apply(
-                    latents, *params[name]
+                    latents, *data_params[name]
                 )
 
         return results
@@ -193,6 +265,8 @@ class LuxModel(eqx.Module):
 
             # TODO NOTE: failure mode where .err is None and the err_transform doesn't
             # add a modeled intrinsic scatter. Detect this and raise an error?
+            # TODO: This interface could be made more general to support, e.g.,
+            # covariance matrices
             err = self.outputs[output_name].err_transform.apply(
                 data[output_name].err, **err_params[output_name]
             )
@@ -323,106 +397,137 @@ class LuxModel(eqx.Module):
         guide = AutoDelta(model)
         svi = SVI(model, guide, optimizer, Trace_ELBO())
         svi_results = svi.run(svi_key, num_steps, data, **svi_run_kwargs)
-        unpacked_MAP_params = guide.sample_posterior(sample_key, svi_results.params)
-        return self.unpack_numpyro_params(
-            unpacked_MAP_params, skip_missing=True
-        ), svi_results
+        packed_MAP_params = guide.sample_posterior(sample_key, svi_results.params)
+
+        unpacked_params = self.unpack_numpyro_params(
+            packed_MAP_params,
+            skip_missing=bool(fixed_params is not None or names is not None),
+        )
+        # TODO: should the params get their own object?
+        return unpacked_params, svi_results
 
     def unpack_numpyro_params(
         self, params: PackedParamsT, skip_missing: bool = False
-    ) -> UnpackedParamsT:
-        """Unpack numpyro parameters into a nested structure.
+    ) -> dict[str, Any]:
+        """Unpack numpyro parameters into separate data and error parameter structures.
 
         numpyro parameters use names like "output_name:param_name" to make the numpyro
-        internal names unique. However, this method unpacks these into a nested
-        dictionary keyed on [output_name][param_name].
+        internal names unique. This method unpacks these into two nested dictionaries:
+        one for data transform parameters and one for error transform parameters.
+
+        For TransformSequence outputs, data parameters are further unpacked from the
+        flattened "{index}:{param}" format into a tuple of parameter dictionaries.
 
         Parameters
         ----------
         params
             A dictionary of numpyro parameters. The keys should be in the format
-            "output_name:param_name".
+            "output_name:param_name" or "output_name:err:param_name".
+        skip_missing
+            If True, skip parameters that are missing from the params dict.
 
         Returns
         -------
         dict
-            A nested dictionary of parameters, where the top level keys are the output
-            names.
+            A nested dictionary with keys as output names. Each output name is a key with
+            a dict value containing "data" and "err" keys:
+            - For single transforms, "data" values are parameter dictionaries
+            - For TransformSequence, "data" values are tuples of parameter dictionaries
+            - "err" values follow the same structure as "data" for the error transforms
+            - "err" will be an empty dict {} if there are no error parameters
+            - Non-output parameters (like "latents") are passed through at the top level
+
+            Example structure:
+            {
+                "flux": {"data": {...} or (...), "err": {}},  # err empty if no error params
+                "label": {"data": {...}, "err": {...}},
+                "latents": array
+            }
         """
-        unpacked: dict[str, Any | dict[str, Any]] = {}
-        handled_params = set()
-        for name, output in self.outputs.items():
-            unpacked[name] = {}
+        unpacked_params: dict[str, Any] = {}
 
-            # data priors
-            data_priors = output.data_transform.get_expanded_priors(
-                latent_size=self.latent_size, data_size=len(params)
+        params_by_output: dict[str, dict[str, Any]] = defaultdict(dict)
+        for name, value in params.items():
+            if ":" in name:  # name associated with an output, like "flux:p1"
+                output_name, *therest = name.split(":")
+
+                if output_name not in self.outputs:
+                    msg = (
+                        f"Invalid output name {output_name} - expected one of: "
+                        f"{list(self.outputs.keys())}"
+                    )
+                    raise ValueError(msg)
+
+                params_by_output[output_name][":".join(therest)] = value
+
+            else:  # names not associated with outputs, like "latents", get passed thru
+                unpacked_params[name] = value
+
+        for output, pars in params_by_output.items():
+            data_params, err_params = self.outputs[output].unpack_params(
+                pars, skip_missing=skip_missing
             )
-            for k in data_priors:
-                numpyro_name = f"{name}:{k}"
-                if numpyro_name not in params and skip_missing:
-                    continue
-                unpacked[name][k] = params[numpyro_name]
-                handled_params.add(numpyro_name)
+            unpacked_params[output] = {"data": data_params, "err": err_params}
 
-            # err_transform param_priors
-            err_priors = output.err_transform.get_expanded_priors(
-                latent_size=self.latent_size, data_size=len(params)
-            )
-            for k in err_priors:
-                numpyro_name = f"{name}:err:{k}"
-                if numpyro_name not in params and skip_missing:
-                    continue
-                unpacked[name][k] = params[numpyro_name]
-                handled_params.add(numpyro_name)
+        return unpacked_params
 
-        for name in set(params.keys()) - handled_params:
-            unpacked[name] = params[name]
-
-        return unpacked
-
-    def pack_numpyro_params(self, params: UnpackedParamsT) -> PackedParamsT:
+    def pack_numpyro_params(
+        self,
+        params: dict[str, Any],  # TODO: update Any to real types
+        skip_missing: bool = False,
+    ) -> PackedParamsT:
         """Pack parameters into a flat dictionary keyed on numpyro names.
 
         This method is the inverse of `unpack_numpyro_params`. It takes a nested
-        dictionary of parameters and flattens it into a dictionary of numpyro
-        parameters. For example, it takes a nested dictionary keyed like
-        [output_name][param_name] and flattens it into a dictionary keyed like
-        "output_name:param_name".
+        dictionary of parameters and flattens it into a dictionary keyed on numpyro
+        parameter names.
 
         Parameters
         ----------
         params
-            A nested dictionary of parameters, where the top level keys are the output
-            names.
+            A nested dictionary with keys as output names. Each output name should
+            be a key with a dict value containing "data" and optionally "err" keys.
+            The "err" key can be omitted if there are no error parameters for that output.
+            For TransformSequence outputs, "data" values should be tuples/lists of
+            parameter dictionaries. Non-output parameters (like "latents") can exist at
+            the top level.
+
+            Example structure:
+            {
+                "flux": {"data": {...} or (...)},  # err key optional
+                "label": {"data": {...}, "err": {...}},  # err key included
+                "latents": array
+            }
 
         Returns
         -------
         dict
             A dictionary of numpyro parameters. The keys are in the format
-            "output_name:param_name
-
+            "output_name:param_name" for data parameters and "output_name:err:param_name"
+            for error parameters.
         """
         packed: dict[str, jax.Array] = {}
-        for name, output in self.outputs.items():
-            # For data transform
-            names = (
-                output.data_transform._param_names
-                if isinstance(output.data_transform, AbstractSingleTransform)
-                else output.data_transform.names_flat
-            )
-            for k in names:
-                numpyro_name = f"{name}:{k}"
-                packed[numpyro_name] = params[name][k]
 
-            # Repeat for err
-            err_names = (
-                output.err_transform._param_names
-                if isinstance(output.err_transform, AbstractSingleTransform)
-                else output.err_transform.names_flat
+        for output_name, output in self.outputs.items():
+            if output_name not in params and not skip_missing:
+                msg = f"Missing parameters for output {output_name}"
+                raise ValueError(msg)
+
+            output_params = params.get(output_name, {})
+            tmp = output.pack_params(
+                {
+                    "data": output_params.get("data", {}),
+                    "err": output_params.get("err", {}),
+                },
+                skip_missing=skip_missing,
             )
-            for k in err_names:
-                numpyro_name = f"{name}:err:{k}"
-                packed[numpyro_name] = params[name][k]
+            # Add output name prefix to all parameter keys
+            for key, value in tmp.items():
+                packed[f"{output_name}:{key}"] = value
+
+        # Handle non-output parameters (like latents)
+        for name in params:
+            if name not in self.outputs:
+                packed[name] = params[name]
 
         return packed

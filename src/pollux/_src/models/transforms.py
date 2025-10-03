@@ -171,6 +171,26 @@ class AbstractSingleTransform(AbstractTransform):
                 priors[name] = prior
         return ImmutableMap(**priors)
 
+    def unpack_params(
+        self, flat_params: dict[str, Any], skip_missing: bool = False
+    ) -> dict[str, Any]:  # TODO: fix Any types
+        """For compatibility with TransformSequence."""
+        for param_name in self._param_names:
+            if param_name not in flat_params and not skip_missing:
+                msg = f"Missing value in transform: {param_name}"
+                raise ValueError(msg)
+        return flat_params
+
+    def pack_params(
+        self, nested_params: dict[str, Any], skip_missing: bool = False
+    ) -> dict[str, Any]:  # TODO: fix Any types
+        """For compatibility with TransformSequence."""
+        for param_name in self._param_names:
+            if param_name not in nested_params and not skip_missing:
+                msg = f"Missing value in transform: {param_name}"
+                raise ValueError(msg)
+        return nested_params
+
 
 class TransformSequence(AbstractTransform):
     """A sequence of transforms applied in order.
@@ -267,8 +287,73 @@ class TransformSequence(AbstractTransform):
             output = transform.apply(output, **transform_params)
         return output
 
-    # TODO: do we need to add new classmethods that pack or unpack parameter names from
-    # the {index}:{param} format to nested tuples and vice versa?
+    def unpack_params(
+        self, flat_params: dict[str, Any], skip_missing: bool = False
+    ) -> tuple[dict[str, Any], ...]:
+        """Convert flat parameter names to nested tuple structure.
+
+        Takes parameters with names like "0:A", "1:p1" and converts them to
+        a list of parameter dictionaries: [{"A": value}, {"p1": value}]
+
+        Parameters
+        ----------
+        flat_params
+            Dictionary with parameter names in format "{transform_index}:{param_name}"
+
+        Returns
+        -------
+        list
+            List of parameter dictionaries, one per transform in the sequence
+        """
+        nested_params: list[dict[str, Any]] = [{} for _ in self.transforms]
+
+        for param_name in self.names_flat:
+            param_value = flat_params.get(param_name)
+
+            if param_value is None and not skip_missing:
+                msg = f"Missing value in transform: {param_name}"
+                raise ValueError(msg)
+
+            if ":" in param_name:
+                idx_str, actual_param_name = param_name.split(":", 1)
+                transform_idx = int(idx_str)
+                if 0 <= transform_idx < len(self.transforms):
+                    nested_params[transform_idx][actual_param_name] = param_value
+
+        return tuple(nested_params)
+
+    def pack_params(
+        self, nested_params: list[dict[str, Any]], skip_missing: bool = False
+    ) -> dict[str, Any]:
+        """Convert nested parameter structure to flat naming scheme.
+
+        Takes a list of parameter dictionaries and converts them to flat
+        parameter names like "0:A", "1:p1".
+
+        Parameters
+        ----------
+        nested_params
+            List of parameter dictionaries, one per transform in the sequence
+        skip_missing
+            If True, skip missing parameters instead of raising an error.
+            Currently unused but kept for API consistency.
+
+        Returns
+        -------
+        dict
+            Dictionary with parameter names in format "{transform_index}:{param_name}"
+        """
+        # TODO: skip_missing is not used here...?
+        _ = skip_missing
+
+        flat_params = {}
+
+        for i, transform_params in enumerate(nested_params):
+            for param_name, param_value in transform_params.items():
+                flat_name = f"{i}:{param_name}"
+                flat_params[flat_name] = param_value
+
+        return flat_params
 
     @property
     def names_nested(self) -> tuple[tuple[str, ...], ...]:
