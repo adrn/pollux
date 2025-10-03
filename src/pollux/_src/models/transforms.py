@@ -203,29 +203,31 @@ class TransformSequence(AbstractTransform):
 
     transforms: tuple[AbstractSingleTransform, ...]
 
-    # Here, these are collected directly from the component transforms
-    param_priors: ParamPriorsTupleT = eqx.field(init=False, repr=False)
-    param_shapes: ParamShapesTupleT = eqx.field(init=False, repr=False)
-
     def __init__(self, transforms: tuple[AbstractSingleTransform, ...]):
         """Initialize a sequence of transforms."""
         if not transforms:
             msg = "At least one transform required"
             raise ModelValidationError(msg)
 
-        # Store parameter information as tuples (reusing existing names)
-        self.param_priors = tuple(
-            getattr(transform, "param_priors", ImmutableMap())
-            for transform in transforms
-        )
-        self.param_shapes = tuple(
-            getattr(transform, "param_shapes", ImmutableMap())
-            for transform in transforms
-        )
-
         # Set output size to the final transform's output size
         self.output_size = transforms[-1].output_size
         self.transforms = transforms
+
+    @property
+    def param_priors(self) -> ParamPriorsTupleT:
+        """Collect parameter priors from all transforms in the sequence."""
+        return tuple(
+            getattr(transform, "param_priors", ImmutableMap())
+            for transform in self.transforms
+        )
+
+    @property
+    def param_shapes(self) -> ParamShapesTupleT:
+        """Collect parameter shapes from all transforms in the sequence."""
+        return tuple(
+            getattr(transform, "param_shapes", ImmutableMap())
+            for transform in self.transforms
+        )
 
     def apply(
         self, latents: BatchedLatentsT, *args: dict[str, Any], **kwargs: Any
