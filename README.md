@@ -1,7 +1,7 @@
-# Pollux
+<img src="https://pollux-astro.readthedocs.io/en/latest/_static/Pollux-logo.png" alt="Pollux logo" width="200"/>
 
-JAX implementations of data-driven models for stellar spectroscopy, like _Lux_ and the
-_Cannon_.
+Pollux contains JAX implementations of data-driven models for stellar spectroscopy, like
+_Lux_ and the _Cannon_.
 
 <!-- [![Documentation Status][rtd-badge]][rtd-link] -->
 
@@ -23,5 +23,4 @@ _Cannon_.
 [pypi-version]:             https://img.shields.io/pypi/v/pollux
 [rtd-badge]:                https://readthedocs.org/projects/pollux/badge/?version=latest
 [rtd-link]:                 https://pollux.readthedocs.io/en/latest/?badge=latest
-
 <!-- prettier-ignore-end -->
