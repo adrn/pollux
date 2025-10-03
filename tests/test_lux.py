@@ -135,17 +135,17 @@ class TestLuxModelParameterPackUnpack:
         """
         # Create test parameters using output-centric structure (err key optional)
         A = rng.random((model_config["n_flux"], model_config["n_latents"]))
-        params = {"flux": {"data": {"A": A}}}
+        pars = {"flux": {"data": {"A": A}}}
 
         # Test packing
-        packed = single_transform_model.pack_numpyro_params(params)
+        packed = single_transform_model.pack_numpyro_pars(pars)
         expected_packed = {"flux:A": A}
 
         assert set(packed.keys()) == set(expected_packed.keys())
         assert np.allclose(packed["flux:A"], expected_packed["flux:A"])
 
         # Test unpacking
-        unpacked = single_transform_model.unpack_numpyro_params(packed)
+        unpacked = single_transform_model.unpack_numpyro_pars(packed)
 
         assert set(unpacked.keys()) == {"flux"}
         assert set(unpacked["flux"].keys()) == {"data", "err"}
@@ -162,21 +162,21 @@ class TestLuxModelParameterPackUnpack:
         """
         # Create test parameters WITHOUT the "err" key
         A = rng.random((model_config["n_flux"], model_config["n_latents"]))
-        params_without_err = {"flux": {"data": {"A": A}}}
+        pars_without_err = {"flux": {"data": {"A": A}}}
 
         # Test packing - should work without "err" key
-        packed = single_transform_model.pack_numpyro_params(params_without_err)
+        packed = single_transform_model.pack_numpyro_pars(pars_without_err)
         expected_packed = {"flux:A": A}
 
         assert set(packed.keys()) == set(expected_packed.keys())
         assert np.allclose(packed["flux:A"], expected_packed["flux:A"])
 
         # Unpacking should still include "err" key (even if empty)
-        unpacked = single_transform_model.unpack_numpyro_params(packed)
+        unpacked = single_transform_model.unpack_numpyro_pars(packed)
         assert "err" in unpacked["flux"]
         assert unpacked["flux"]["err"] == {}
 
-    def test_single_transform_with_error_params(
+    def test_single_transform_with_error_pars(
         self, single_transform_with_err_model, model_config, rng
     ):
         """Test pack/unpack with single transform that has error transform parameters.
@@ -191,10 +191,10 @@ class TestLuxModelParameterPackUnpack:
         # Create test parameters using output-centric structure
         A = rng.random((model_config["n_flux"], model_config["n_latents"]))
         b = rng.random((model_config["n_flux"], 1))
-        params = {"flux": {"data": {"A": A}, "err": {"b": b}}}
+        pars = {"flux": {"data": {"A": A}, "err": {"b": b}}}
 
         # Test packing
-        packed = single_transform_with_err_model.pack_numpyro_params(params)
+        packed = single_transform_with_err_model.pack_numpyro_pars(pars)
         expected_keys = {"flux:A", "flux:err:b"}
 
         assert set(packed.keys()) == expected_keys
@@ -202,7 +202,7 @@ class TestLuxModelParameterPackUnpack:
         assert np.allclose(packed["flux:err:b"], b)
 
         # Test unpacking
-        unpacked = single_transform_with_err_model.unpack_numpyro_params(packed)
+        unpacked = single_transform_with_err_model.unpack_numpyro_pars(packed)
 
         assert set(unpacked.keys()) == {"flux"}
         assert set(unpacked["flux"].keys()) == {"data", "err"}
@@ -226,10 +226,10 @@ class TestLuxModelParameterPackUnpack:
         # Create test parameters using output-centric structure (err key optional)
         A = rng.random((model_config["n_flux"], model_config["n_latents"]))
         b = rng.random((model_config["n_flux"], 1))
-        params = {"flux": {"data": [{"A": A}, {"b": b}]}}
+        pars = {"flux": {"data": [{"A": A}, {"b": b}]}}
 
         # Test packing
-        packed = transform_sequence_model.pack_numpyro_params(params)
+        packed = transform_sequence_model.pack_numpyro_pars(pars)
         expected_keys = {"flux:0:A", "flux:1:b"}
 
         assert set(packed.keys()) == expected_keys
@@ -237,7 +237,7 @@ class TestLuxModelParameterPackUnpack:
         assert np.allclose(packed["flux:1:b"], b)
 
         # Test unpacking
-        unpacked = transform_sequence_model.unpack_numpyro_params(packed)
+        unpacked = transform_sequence_model.unpack_numpyro_pars(packed)
 
         assert set(unpacked.keys()) == {"flux"}
         assert set(unpacked["flux"].keys()) == {"data", "err"}
@@ -251,7 +251,7 @@ class TestLuxModelParameterPackUnpack:
 
         assert unpacked["flux"]["err"] == {}
 
-    def test_transform_sequence_with_error_params(
+    def test_transform_sequence_with_error_pars(
         self, transform_sequence_with_err_model, model_config, rng
     ):
         """Test pack/unpack with both TransformSequence and error transform parameters.
@@ -268,10 +268,10 @@ class TestLuxModelParameterPackUnpack:
         b = rng.random((model_config["n_flux"], 1))
         scale = rng.random((1,))
 
-        params = {"flux": {"data": [{"A": A}, {"b": b}], "err": {"scale": scale}}}
+        pars = {"flux": {"data": [{"A": A}, {"b": b}], "err": {"scale": scale}}}
 
         # Test packing
-        packed = transform_sequence_with_err_model.pack_numpyro_params(params)
+        packed = transform_sequence_with_err_model.pack_numpyro_pars(pars)
         expected_keys = {"flux:0:A", "flux:1:b", "flux:err:scale"}
 
         assert set(packed.keys()) == expected_keys
@@ -280,7 +280,7 @@ class TestLuxModelParameterPackUnpack:
         assert np.allclose(packed["flux:err:scale"], scale)
 
         # Test unpacking
-        unpacked = transform_sequence_with_err_model.unpack_numpyro_params(packed)
+        unpacked = transform_sequence_with_err_model.unpack_numpyro_pars(packed)
 
         # Check structure and data parameters (list structure)
         assert set(unpacked.keys()) == {"flux"}
@@ -309,13 +309,13 @@ class TestLuxModelParameterPackUnpack:
         b_flux = rng.random((model_config["n_flux"], 1))
         A_label = rng.random((model_config["n_labels"], model_config["n_latents"]))
 
-        params = {
+        pars = {
             "flux": {"data": [{"A": A_flux}, {"b": b_flux}]},
             "label": {"data": {"A": A_label}},
         }
 
         # Test packing
-        packed = multi_output_model.pack_numpyro_params(params)
+        packed = multi_output_model.pack_numpyro_pars(pars)
         expected_keys = {"flux:0:A", "flux:1:b", "label:A"}
 
         assert set(packed.keys()) == expected_keys
@@ -324,7 +324,7 @@ class TestLuxModelParameterPackUnpack:
         assert np.allclose(packed["label:A"], A_label)
 
         # Test unpacking
-        unpacked = multi_output_model.unpack_numpyro_params(packed)
+        unpacked = multi_output_model.unpack_numpyro_pars(packed)
 
         # Check flux (TransformSequence - list structure)
         assert isinstance(unpacked["flux"]["data"], list | tuple)
@@ -359,7 +359,7 @@ class TestLuxModelParameterPackUnpack:
         b = rng.random((model_config["n_flux"], 1))
         err_b = rng.random((1,))  # Note: different parameter name but could conflict
 
-        orig_params = {
+        orig_pars = {
             "flux": {
                 "data": [{"A": A}, {"b": b}],
                 "err": {"scale": err_b},
@@ -367,9 +367,9 @@ class TestLuxModelParameterPackUnpack:
         }
 
         # Round trip: pack → unpack → pack
-        packed = transform_sequence_with_err_model.pack_numpyro_params(orig_params)
-        unpacked = transform_sequence_with_err_model.unpack_numpyro_params(packed)
-        repacked = transform_sequence_with_err_model.pack_numpyro_params(unpacked)
+        packed = transform_sequence_with_err_model.pack_numpyro_pars(orig_pars)
+        unpacked = transform_sequence_with_err_model.unpack_numpyro_pars(packed)
+        repacked = transform_sequence_with_err_model.pack_numpyro_pars(unpacked)
 
         # Verify perfect round-trip conversion
         assert set(packed.keys()) == set(repacked.keys())
@@ -379,12 +379,12 @@ class TestLuxModelParameterPackUnpack:
     def test_missing_parameters_handling(
         self, single_transform_model, model_config, rng
     ):
-        """Test graceful handling of missing parameters with skip_missing flag.
+        """Test graceful handling of missing parameters with ignore_missing flag.
 
         This test validates the robustness of the unpacking system when dealing with
         incomplete parameter sets:
-        - With skip_missing=True: missing parameters are gracefully ignored
-        - With skip_missing=False: missing parameters raise clear KeyError exceptions
+        - With ignore_missing=True: missing parameters are gracefully ignored
+        - With ignore_missing=False: missing parameters raise clear KeyError exceptions
         - Partial parameter sets are handled without corrupting existing data
         - Error messages are informative for debugging missing parameters
 
@@ -397,8 +397,8 @@ class TestLuxModelParameterPackUnpack:
         }
 
         # Should handle complete parameters without issue
-        unpacked = single_transform_model.unpack_numpyro_params(
-            complete_packed, skip_missing=False
+        unpacked = single_transform_model.unpack_numpyro_pars(
+            complete_packed, ignore_missing=False
         )
 
         assert "flux" in unpacked
@@ -406,10 +406,10 @@ class TestLuxModelParameterPackUnpack:
         assert "A" in unpacked["flux"]["data"]
         assert unpacked["flux"]["err"] == {}
 
-        # Test with truly empty parameters - this should work with skip_missing
+        # Test with truly empty parameters - this should work with ignore_missing
         empty_packed = {}
-        unpacked_skipped = single_transform_model.unpack_numpyro_params(
-            empty_packed, skip_missing=True
+        unpacked_skipped = single_transform_model.unpack_numpyro_pars(
+            empty_packed, ignore_missing=True
         )
-        # With skip_missing and no parameters, we get an empty dict (no outputs created)
+        # With ignore_missing and no parameters, we get an empty dict (no outputs created)
         assert unpacked_skipped == {}

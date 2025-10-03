@@ -80,7 +80,7 @@ class AbstractTransform(eqx.Module):
     # param_shapes: ParamShapesT | ParamShapesTupleT
 
     @abc.abstractmethod
-    def apply(self, latents: BatchedLatentsT, **params: Any) -> BatchedOutputT:
+    def apply(self, latents: BatchedLatentsT, **pars: Any) -> BatchedOutputT:
         """Apply the transform to input latent vectors.
 
         Takes a batch of latent vectors and transforms them using the provided
@@ -130,18 +130,18 @@ class AbstractSingleTransform(AbstractTransform):
             else self.transform
         )
 
-    def apply(self, latents: BatchedLatentsT, **params: Any) -> BatchedOutputT:
+    def apply(self, latents: BatchedLatentsT, **pars: Any) -> BatchedOutputT:
         """Apply the transform to input latent vectors.
 
         Extracts the required parameters from the kwargs and applies the transform
         function to the latents, handling vectorization automatically.
         """
         try:
-            arg_params = tuple(params[p] for p in self._param_names)
+            arg_pars = tuple(pars[p] for p in self._param_names)
         except KeyError as e:
             msg = f"Missing parameters: {self._param_names}"
             raise RuntimeError(msg) from e
-        return self._transform(latents, *arg_params)
+        return self._transform(latents, *arg_pars)
 
     def get_expanded_priors(
         self, latent_size: int, data_size: int | None = None
@@ -171,25 +171,25 @@ class AbstractSingleTransform(AbstractTransform):
                 priors[name] = prior
         return ImmutableMap(**priors)
 
-    def unpack_params(
-        self, flat_params: dict[str, Any], skip_missing: bool = False
+    def unpack_pars(
+        self, flat_pars: dict[str, Any], ignore_missing: bool = False
     ) -> dict[str, Any]:  # TODO: fix Any types
         """For compatibility with TransformSequence."""
         for param_name in self._param_names:
-            if param_name not in flat_params and not skip_missing:
+            if param_name not in flat_pars and not ignore_missing:
                 msg = f"Missing value in transform: {param_name}"
                 raise ValueError(msg)
-        return flat_params
+        return flat_pars
 
-    def pack_params(
-        self, nested_params: dict[str, Any], skip_missing: bool = False
+    def pack_pars(
+        self, nested_pars: dict[str, Any], ignore_missing: bool = False
     ) -> dict[str, Any]:  # TODO: fix Any types
         """For compatibility with TransformSequence."""
         for param_name in self._param_names:
-            if param_name not in nested_params and not skip_missing:
+            if param_name not in nested_pars and not ignore_missing:
                 msg = f"Missing value in transform: {param_name}"
                 raise ValueError(msg)
-        return nested_params
+        return nested_pars
 
 
 class TransformSequence(AbstractTransform):
@@ -262,12 +262,12 @@ class TransformSequence(AbstractTransform):
                 raise ValueError(msg)
 
             output = latents
-            for transform, transform_params in zip(self.transforms, args):
-                output = transform.apply(output, **transform_params)
+            for transform, transform_pars in zip(self.transforms, args):
+                output = transform.apply(output, **transform_pars)
             return output
 
         # Handle flat format with "{index}:{param}" naming
-        transform_params_list: list[dict[str, Any]] = [{} for _ in self.transforms]
+        transform_pars_list: list[dict[str, Any]] = [{} for _ in self.transforms]
 
         for param_name, param_value in kwargs.items():
             if ":" in param_name:
@@ -277,7 +277,7 @@ class TransformSequence(AbstractTransform):
                 if not 0 <= transform_idx < len(self.transforms):
                     msg = f"Invalid transform index: {transform_idx}"
                     raise ValueError(msg)
-                transform_params_list[transform_idx][actual_param_name] = param_value
+                transform_pars_list[transform_idx][actual_param_name] = param_value
 
             else:
                 # Handle any other parameter format as needed
@@ -285,12 +285,12 @@ class TransformSequence(AbstractTransform):
                 raise ValueError(msg)
 
         output = latents
-        for transform, transform_params in zip(self.transforms, transform_params_list):
-            output = transform.apply(output, **transform_params)
+        for transform, transform_pars in zip(self.transforms, transform_pars_list):
+            output = transform.apply(output, **transform_pars)
         return output
 
-    def unpack_params(
-        self, flat_params: dict[str, Any], skip_missing: bool = False
+    def unpack_pars(
+        self, flat_pars: dict[str, Any], ignore_missing: bool = False
     ) -> tuple[dict[str, Any], ...]:
         """Convert flat parameter names to nested tuple structure.
 
@@ -299,7 +299,7 @@ class TransformSequence(AbstractTransform):
 
         Parameters
         ----------
-        flat_params
+        flat_pars
             Dictionary with parameter names in format "{transform_index}:{param_name}"
 
         Returns
@@ -307,28 +307,28 @@ class TransformSequence(AbstractTransform):
         list
             List of parameter dictionaries, one per transform in the sequence
         """
-        nested_params: list[dict[str, Any]] = [{} for _ in self.transforms]
+        nested_pars: list[dict[str, Any]] = [{} for _ in self.transforms]
 
         for param_name in self.names_flat:
-            param_value = flat_params.get(param_name)
+            param_value = flat_pars.get(param_name)
 
             if param_value is None:
-                if not skip_missing:
+                if not ignore_missing:
                     msg = f"Missing value in transform: {param_name}"
                     raise ValueError(msg)
-                # Skip missing parameters when skip_missing=True
+                # Skip missing parameters when ignore_missing=True
                 continue
 
             if ":" in param_name:
                 idx_str, actual_param_name = param_name.split(":", 1)
                 transform_idx = int(idx_str)
                 if 0 <= transform_idx < len(self.transforms):
-                    nested_params[transform_idx][actual_param_name] = param_value
+                    nested_pars[transform_idx][actual_param_name] = param_value
 
-        return tuple(nested_params)
+        return tuple(nested_pars)
 
-    def pack_params(
-        self, nested_params: list[dict[str, Any]], skip_missing: bool = False
+    def pack_pars(
+        self, nested_pars: list[dict[str, Any]], ignore_missing: bool = False
     ) -> dict[str, Any]:
         """Convert nested parameter structure to flat naming scheme.
 
@@ -337,9 +337,9 @@ class TransformSequence(AbstractTransform):
 
         Parameters
         ----------
-        nested_params
+        nested_pars
             List of parameter dictionaries, one per transform in the sequence
-        skip_missing
+        ignore_missing
             If True, skip missing parameters instead of raising an error.
             Currently unused but kept for API consistency.
 
@@ -348,17 +348,17 @@ class TransformSequence(AbstractTransform):
         dict
             Dictionary with parameter names in format "{transform_index}:{param_name}"
         """
-        # TODO: skip_missing is not used here...?
-        _ = skip_missing
+        # TODO: ignore_missing is not used here...?
+        _ = ignore_missing
 
-        flat_params = {}
+        flat_pars = {}
 
-        for i, transform_params in enumerate(nested_params):
-            for param_name, param_value in transform_params.items():
+        for i, transform_pars in enumerate(nested_pars):
+            for param_name, param_value in transform_pars.items():
                 flat_name = f"{i}:{param_name}"
-                flat_params[flat_name] = param_value
+                flat_pars[flat_name] = param_value
 
-        return flat_params
+        return flat_pars
 
     @property
     def names_nested(self) -> tuple[tuple[str, ...], ...]:
