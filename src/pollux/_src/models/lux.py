@@ -284,7 +284,7 @@ class LuxModel(eqx.Module):
     def default_numpyro_model(
         self,
         data: PolluxData,
-        latent_prior: dist.Distribution | None | bool = None,
+        latents_prior: dist.Distribution | None | bool = None,
         fixed_params: PackedParamsT | None = None,
         names: list[str] | None = None,
         custom_model: Callable[[BatchedLatentsT, dict[str, Any], PolluxData], None]
@@ -300,7 +300,7 @@ class LuxModel(eqx.Module):
         ----------
         data
             A dictionary of observed data.
-        latent_prior
+        latents_prior
             The prior distribution for the latent vectors. If not specified, use a unit
             Gaussian. If False, use an improper uniform prior.
         fixed_params
@@ -314,32 +314,32 @@ class LuxModel(eqx.Module):
         """
         n_data = len(data)
 
-        if latent_prior is None:
-            _latent_prior = dist.Normal()
+        if latents_prior is None:
+            _latents_prior = dist.Normal()
 
-        elif latent_prior is False:
-            _latent_prior = dist.ImproperUniform(
+        elif latents_prior is False:
+            _latents_prior = dist.ImproperUniform(
                 dist.constraints.real,
                 (),
                 event_shape=(),
                 sample_shape=(n_data,),
             )
 
-        elif not isinstance(latent_prior, dist.Distribution):
-            msg = "latent_prior must be a numpyro distribution instance"
+        elif not isinstance(latents_prior, dist.Distribution):
+            msg = "latents_prior must be a numpyro distribution instance"
             raise TypeError(msg)
 
         else:
-            _latent_prior = latent_prior
+            _latents_prior = latents_prior
 
-        if _latent_prior.batch_shape != (self.latent_size,):
-            _latent_prior = _latent_prior.expand((self.latent_size,))
+        if _latents_prior.batch_shape != (self.latent_size,):
+            _latents_prior = _latents_prior.expand((self.latent_size,))
 
         # Use condition handler to fix parameters if specified
         with numpyro.handlers.condition(data=fixed_params or {}):
             latents = numpyro.sample(
                 "latents",
-                _latent_prior,
+                _latents_prior,
                 sample_shape=(n_data,),
             )
             params = self.setup_numpyro(latents, data, names=names)
@@ -354,7 +354,7 @@ class LuxModel(eqx.Module):
         num_steps: int,
         rng_key: jax.Array,
         optimizer: OptimizerT | None = None,
-        latent_prior: dist.Distribution | None | bool = None,
+        latents_prior: dist.Distribution | None | bool = None,
         custom_model: Callable[[BatchedLatentsT, dict[str, Any], PolluxData], None]
         | None = None,
         fixed_params: UnpackedParamsT | None = None,
@@ -379,7 +379,7 @@ class LuxModel(eqx.Module):
         if names is not None:
             partial_params["names"] = names
 
-        partial_params["latent_prior"] = latent_prior
+        partial_params["latents_prior"] = latents_prior
         partial_params["custom_model"] = custom_model
 
         model: Any
