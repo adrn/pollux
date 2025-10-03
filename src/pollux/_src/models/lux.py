@@ -26,7 +26,7 @@ class LuxOutput(eqx.Module):
     err_transform: AbstractSingleTransform | TransformSequence
 
     def unpack_pars(
-        self, packed_pars: dict[str, Any], skip_missing: bool = False
+        self, packed_pars: dict[str, Any], ignore_missing: bool = False
     ) -> tuple[
         dict[str, Any] | tuple[dict[str, Any], ...],
         dict[str, Any] | tuple[dict[str, Any], ...],
@@ -38,7 +38,7 @@ class LuxOutput(eqx.Module):
         packed_pars
             Dictionary of packed parameters with "err:" prefixed keys for error
             transform parameters.
-        skip_missing
+        ignore_missing
             If True, skip missing parameters instead of raising an error.
 
         Returns
@@ -56,11 +56,13 @@ class LuxOutput(eqx.Module):
                 packed_data_pars[name] = value
 
         return self.data_transform.unpack_pars(
-            packed_data_pars, skip_missing=skip_missing
-        ), self.err_transform.unpack_pars(packed_err_pars, skip_missing=skip_missing)
+            packed_data_pars, ignore_missing=ignore_missing
+        ), self.err_transform.unpack_pars(
+            packed_err_pars, ignore_missing=ignore_missing
+        )
 
     def pack_pars(
-        self, unpacked_pars: dict[str, Any], skip_missing: bool = False
+        self, unpacked_pars: dict[str, Any], ignore_missing: bool = False
     ) -> PackedParamsT:
         """Pack data and error parameters for this output.
 
@@ -69,7 +71,7 @@ class LuxOutput(eqx.Module):
         unpacked_pars
             Dictionary with "data" and "err" keys containing the unpacked parameters
             for the data and error transforms respectively.
-        skip_missing
+        ignore_missing
             If True, skip missing parameters instead of raising an error.
 
         Returns
@@ -83,13 +85,15 @@ class LuxOutput(eqx.Module):
         # Pack data transform parameters
         data_pars = unpacked_pars.get("data", {})
         packed_data = self.data_transform.pack_pars(
-            data_pars, skip_missing=skip_missing
+            data_pars, ignore_missing=ignore_missing
         )
         packed.update(packed_data)
 
         # Pack error transform parameters with "err:" prefix
         err_pars = unpacked_pars.get("err", {})
-        packed_err = self.err_transform.pack_pars(err_pars, skip_missing=skip_missing)
+        packed_err = self.err_transform.pack_pars(
+            err_pars, ignore_missing=ignore_missing
+        )
         for key, value in packed_err.items():
             packed[f"err:{key}"] = value
 
@@ -395,13 +399,13 @@ class LuxModel(eqx.Module):
 
         unpacked_pars = self.unpack_numpyro_pars(
             packed_MAP_pars,
-            skip_missing=bool(fixed_pars is not None or names is not None),
+            ignore_missing=bool(fixed_pars is not None or names is not None),
         )
         # TODO: should the pars get their own object?
         return unpacked_pars, svi_results
 
     def unpack_numpyro_pars(
-        self, pars: PackedParamsT, skip_missing: bool = False
+        self, pars: PackedParamsT, ignore_missing: bool = False
     ) -> dict[str, Any]:
         """Unpack numpyro parameters into separate data and error parameter structures.
 
@@ -417,7 +421,7 @@ class LuxModel(eqx.Module):
         pars
             A dictionary of numpyro parameters. The keys should be in the format
             "output_name:param_name" or "output_name:err:param_name".
-        skip_missing
+        ignore_missing
             If True, skip parameters that are missing from the pars dict.
 
         Returns
@@ -459,7 +463,7 @@ class LuxModel(eqx.Module):
 
         for output, _pars in pars_by_output.items():
             data_pars, err_pars = self.outputs[output].unpack_pars(
-                _pars, skip_missing=skip_missing
+                _pars, ignore_missing=ignore_missing
             )
             unpacked_pars[output] = {"data": data_pars, "err": err_pars}
 
@@ -468,7 +472,7 @@ class LuxModel(eqx.Module):
     def pack_numpyro_pars(
         self,
         pars: dict[str, Any],  # TODO: update Any to real types
-        skip_missing: bool = False,
+        ignore_missing: bool = False,
     ) -> PackedParamsT:
         """Pack parameters into a flat dictionary keyed on numpyro names.
 
@@ -503,7 +507,7 @@ class LuxModel(eqx.Module):
         packed: dict[str, jax.Array] = {}
 
         for output_name, output in self.outputs.items():
-            if output_name not in pars and not skip_missing:
+            if output_name not in pars and not ignore_missing:
                 msg = f"Missing parameters for output {output_name}"
                 raise ValueError(msg)
 
@@ -513,7 +517,7 @@ class LuxModel(eqx.Module):
                     "data": output_pars.get("data", {}),
                     "err": output_pars.get("err", {}),
                 },
-                skip_missing=skip_missing,
+                ignore_missing=ignore_missing,
             )
             # Add output name prefix to all parameter keys
             for key, value in tmp.items():

@@ -379,12 +379,12 @@ class TestLuxModelParameterPackUnpack:
     def test_missing_parameters_handling(
         self, single_transform_model, model_config, rng
     ):
-        """Test graceful handling of missing parameters with skip_missing flag.
+        """Test graceful handling of missing parameters with ignore_missing flag.
 
         This test validates the robustness of the unpacking system when dealing with
         incomplete parameter sets:
-        - With skip_missing=True: missing parameters are gracefully ignored
-        - With skip_missing=False: missing parameters raise clear KeyError exceptions
+        - With ignore_missing=True: missing parameters are gracefully ignored
+        - With ignore_missing=False: missing parameters raise clear KeyError exceptions
         - Partial parameter sets are handled without corrupting existing data
         - Error messages are informative for debugging missing parameters
 
@@ -398,7 +398,7 @@ class TestLuxModelParameterPackUnpack:
 
         # Should handle complete parameters without issue
         unpacked = single_transform_model.unpack_numpyro_pars(
-            complete_packed, skip_missing=False
+            complete_packed, ignore_missing=False
         )
 
         assert "flux" in unpacked
@@ -406,10 +406,10 @@ class TestLuxModelParameterPackUnpack:
         assert "A" in unpacked["flux"]["data"]
         assert unpacked["flux"]["err"] == {}
 
-        # Test with truly empty parameters - this should work with skip_missing
+        # Test with truly empty parameters - this should work with ignore_missing
         empty_packed = {}
         unpacked_skipped = single_transform_model.unpack_numpyro_pars(
-            empty_packed, skip_missing=True
+            empty_packed, ignore_missing=True
         )
-        # With skip_missing and no parameters, we get an empty dict (no outputs created)
+        # With ignore_missing and no parameters, we get an empty dict (no outputs created)
         assert unpacked_skipped == {}

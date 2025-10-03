@@ -338,7 +338,7 @@ def test_transform_sequence_unpack_with_missing_pars():
 
     # Only provide parameters for first transform
     flat_pars = {"0:A": rng.random((n_out, n_latents))}
-    unpacked = trans_seq.unpack_pars(flat_pars, skip_missing=True)
+    unpacked = trans_seq.unpack_pars(flat_pars, ignore_missing=True)
 
     assert len(unpacked) == 2
     assert "A" in unpacked[0]
