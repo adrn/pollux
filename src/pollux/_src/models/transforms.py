@@ -3,6 +3,7 @@ TODO: fix the docstrings and typing?
 """
 
 __all__ = [
+    "AbstractSingleTransform",
     "AbstractTransform",
     "AffineTransform",
     "FunctionTransform",
@@ -57,7 +58,11 @@ class ShapeSpec:
 
 
 ParamPriorsT: TypeAlias = ImmutableMap[str, dist.Distribution]
-ParamShapesT: TypeAlias = ImmutableMap[str, ShapeSpec]
+ParamShapesT: TypeAlias = ImmutableMap[str, ShapeSpec | tuple[int, ...]]
+
+# Tuples of parameters for TransformSequence
+ParamPriorsTupleT: TypeAlias = tuple[ParamPriorsT, ...]
+ParamShapesTupleT: TypeAlias = tuple[ParamShapesT, ...]
 
 
 class AbstractTransform(eqx.Module):
@@ -68,8 +73,11 @@ class AbstractTransform(eqx.Module):
     """
 
     output_size: int
-    param_priors: ParamPriorsT = eqx.field(converter=ImmutableMap)
-    param_shapes: ParamShapesT = eqx.field(converter=ImmutableMap)
+
+    # TODO: param_priors and param_shapes must be defined on any abstract subclass, but
+    # there is no way to define an abstract class property
+    # param_priors: ParamPriorsT | ParamPriorsTupleT
+    # param_shapes: ParamShapesT | ParamShapesTupleT
 
     @abc.abstractmethod
     def apply(self, latents: BatchedLatentsT, **params: Any) -> BatchedOutputT:
@@ -81,7 +89,7 @@ class AbstractTransform(eqx.Module):
         raise NotImplementedError
 
     @abc.abstractmethod
-    def get_priors(
+    def get_expanded_priors(
         self, latent_size: int, data_size: int | None = None
     ) -> ParamPriorsT:
         """Get expanded parameter priors.
@@ -92,13 +100,16 @@ class AbstractTransform(eqx.Module):
         raise NotImplementedError
 
 
-class AbstractAtomicTransform(AbstractTransform):
+class AbstractSingleTransform(AbstractTransform):
     """Base class providing common functionality for atomic transforms.
 
-    Atomic transforms apply a single operation to convert latent vectors to outputs.
+    "Single" transforms apply a single operation to convert latent vectors to outputs.
     """
 
+    param_priors: ParamPriorsT = eqx.field(converter=ImmutableMap)
+    param_shapes: ParamShapesT = eqx.field(converter=ImmutableMap)
     transform: TransformFuncT
+
     _param_names: tuple[str, ...] = eqx.field(init=False, repr=False)
     _transform: TransformFuncT = eqx.field(init=False, repr=False)
     vmap: bool = True
@@ -132,7 +143,7 @@ class AbstractAtomicTransform(AbstractTransform):
             raise RuntimeError(msg) from e
         return self._transform(latents, *arg_params)
 
-    def get_priors(
+    def get_expanded_priors(
         self, latent_size: int, data_size: int | None = None
     ) -> ParamPriorsT:
         """Get expanded parameter priors.
@@ -143,17 +154,42 @@ class AbstractAtomicTransform(AbstractTransform):
         priors = {}
         for name, prior in self.param_priors.items():
             if name in self.param_shapes:
-                shape = self.param_shapes[name].resolve(
-                    {
-                        "output_size": self.output_size,
-                        "latent_size": latent_size,
-                        "data_size": data_size,
-                    }
+                shapespec = self.param_shapes[name]
+                shape = (
+                    shapespec.resolve(
+                        {
+                            "output_size": self.output_size,
+                            "latent_size": latent_size,
+                            "data_size": data_size,
+                        }
+                    )
+                    if isinstance(shapespec, ShapeSpec)
+                    else shapespec
                 )
                 priors[name] = prior.expand(shape)
             else:
                 priors[name] = prior
         return ImmutableMap(**priors)
+
+    def unpack_params(
+        self, flat_params: dict[str, Any], skip_missing: bool = False
+    ) -> dict[str, Any]:  # TODO: fix Any types
+        """For compatibility with TransformSequence."""
+        for param_name in self._param_names:
+            if param_name not in flat_params and not skip_missing:
+                msg = f"Missing value in transform: {param_name}"
+                raise ValueError(msg)
+        return flat_params
+
+    def pack_params(
+        self, nested_params: dict[str, Any], skip_missing: bool = False
+    ) -> dict[str, Any]:  # TODO: fix Any types
+        """For compatibility with TransformSequence."""
+        for param_name in self._param_names:
+            if param_name not in nested_params and not skip_missing:
+                msg = f"Missing value in transform: {param_name}"
+                raise ValueError(msg)
+        return nested_params
 
 
 class TransformSequence(AbstractTransform):
@@ -161,87 +197,201 @@ class TransformSequence(AbstractTransform):
 
     Composes multiple transforms together, where the output of each transform
     becomes the input to the next transform in the sequence.
+
+    Parameters are stored as tuples of dictionaries, one element per transform.
     """
 
-    transforms: tuple[AbstractTransform, ...]
+    transforms: tuple[AbstractSingleTransform, ...]
 
-    def __init__(self, transforms: tuple[AbstractTransform, ...]):
-        """Initialize a sequence of transforms.
-
-        Combines the parameter priors and shapes from all transforms in the sequence,
-        prefixing them with indices to maintain uniqueness.
-        """
+    def __init__(self, transforms: tuple[AbstractSingleTransform, ...]):
+        """Initialize a sequence of transforms."""
         if not transforms:
             msg = "At least one transform required"
             raise ModelValidationError(msg)
 
-        super().__init__(
-            output_size=transforms[-1].output_size,
-            param_priors=self._combine_priors(transforms),
-            param_shapes=self._combine_shapes(transforms),
-        )
+        # Set output size to the final transform's output size
+        self.output_size = transforms[-1].output_size
         self.transforms = transforms
 
-    @staticmethod
-    def _combine_priors(transforms: tuple[AbstractTransform, ...]) -> ParamPriorsT:
-        """Combine parameter priors from multiple transforms."""
-        return ImmutableMap(
-            **{
-                f"t{i}_{name}": prior
-                for i, transform in enumerate(transforms)
-                for name, prior in transform.param_priors.items()
-            }
+    @property
+    def param_priors(self) -> ParamPriorsTupleT:
+        """Collect parameter priors from all transforms in the sequence."""
+        return tuple(
+            getattr(transform, "param_priors", ImmutableMap())
+            for transform in self.transforms
         )
 
-    @staticmethod
-    def _combine_shapes(transforms: tuple[AbstractTransform, ...]) -> ParamShapesT:
-        """Combine parameter shapes from multiple transforms."""
-        return ImmutableMap(
-            **{
-                f"t{i}_{name}": shape
-                for i, transform in enumerate(transforms)
-                for name, shape in transform.param_shapes.items()
-            }
+    @property
+    def param_shapes(self) -> ParamShapesTupleT:
+        """Collect parameter shapes from all transforms in the sequence."""
+        return tuple(
+            getattr(transform, "param_shapes", ImmutableMap())
+            for transform in self.transforms
         )
 
-    def apply(self, latents: BatchedLatentsT, **params: Any) -> BatchedOutputT:
+    def apply(
+        self, latents: BatchedLatentsT, *args: dict[str, Any], **kwargs: Any
+    ) -> BatchedOutputT:
         """Apply the sequence of transforms to input latent vectors.
 
-        Passes the input through each transform in sequence, routing the appropriate
-        parameters to each transform based on the prefixed parameter names.
+        Parameters can be provided in two ways:
+        1. As positional arguments: One dictionary per transform in sequence order
+        2. As keyword arguments: Using "{transform_index}:{param}" naming scheme, so a
+           parameter named "A" in transform 0 of the sequence would be "0:A".
+
+        Parameters
+        ----------
+        latents
+            Input latent vectors
+        *args
+            Parameter dictionaries, one per transform in the sequence
+        **kwargs
+            Flat parameters using the new naming scheme "{transform_index}:{param_name}"
         """
+        # Check if using positional parameter dictionaries
+        if args:
+            if len(args) != len(self.transforms):
+                msg = (
+                    f"Expected {len(self.transforms)} parameter dictionaries, "
+                    f"got {len(args)}"
+                )
+                raise ValueError(msg)
+
+            if kwargs:
+                msg = "Cannot mix positional parameter dicts with keyword parameters"
+                raise ValueError(msg)
+
+            output = latents
+            for transform, transform_params in zip(self.transforms, args):
+                output = transform.apply(output, **transform_params)
+            return output
+
+        # Handle flat format with "{index}:{param}" naming
+        transform_params_list: list[dict[str, Any]] = [{} for _ in self.transforms]
+
+        for param_name, param_value in kwargs.items():
+            if ":" in param_name:
+                # New format: "0:A", "1:p1", etc.
+                idx_str, actual_param_name = param_name.split(":", 1)
+                transform_idx = int(idx_str)
+                if not 0 <= transform_idx < len(self.transforms):
+                    msg = f"Invalid transform index: {transform_idx}"
+                    raise ValueError(msg)
+                transform_params_list[transform_idx][actual_param_name] = param_value
+
+            else:
+                # Handle any other parameter format as needed
+                msg = f"Unsupported parameter name format: {param_name}"
+                raise ValueError(msg)
+
         output = latents
-        for i, transform in enumerate(self.transforms):
-            transform_params = {
-                name.split("_")[1]: params[f"t{i}_{name.split('_')[1]}"]
-                for name in params
-                if name.startswith(f"t{i}_")
-            }
+        for transform, transform_params in zip(self.transforms, transform_params_list):
             output = transform.apply(output, **transform_params)
         return output
 
-    def get_priors(
+    def unpack_params(
+        self, flat_params: dict[str, Any], skip_missing: bool = False
+    ) -> tuple[dict[str, Any], ...]:
+        """Convert flat parameter names to nested tuple structure.
+
+        Takes parameters with names like "0:A", "1:p1" and converts them to
+        a list of parameter dictionaries: [{"A": value}, {"p1": value}]
+
+        Parameters
+        ----------
+        flat_params
+            Dictionary with parameter names in format "{transform_index}:{param_name}"
+
+        Returns
+        -------
+        list
+            List of parameter dictionaries, one per transform in the sequence
+        """
+        nested_params: list[dict[str, Any]] = [{} for _ in self.transforms]
+
+        for param_name in self.names_flat:
+            param_value = flat_params.get(param_name)
+
+            if param_value is None:
+                if not skip_missing:
+                    msg = f"Missing value in transform: {param_name}"
+                    raise ValueError(msg)
+                # Skip missing parameters when skip_missing=True
+                continue
+
+            if ":" in param_name:
+                idx_str, actual_param_name = param_name.split(":", 1)
+                transform_idx = int(idx_str)
+                if 0 <= transform_idx < len(self.transforms):
+                    nested_params[transform_idx][actual_param_name] = param_value
+
+        return tuple(nested_params)
+
+    def pack_params(
+        self, nested_params: list[dict[str, Any]], skip_missing: bool = False
+    ) -> dict[str, Any]:
+        """Convert nested parameter structure to flat naming scheme.
+
+        Takes a list of parameter dictionaries and converts them to flat
+        parameter names like "0:A", "1:p1".
+
+        Parameters
+        ----------
+        nested_params
+            List of parameter dictionaries, one per transform in the sequence
+        skip_missing
+            If True, skip missing parameters instead of raising an error.
+            Currently unused but kept for API consistency.
+
+        Returns
+        -------
+        dict
+            Dictionary with parameter names in format "{transform_index}:{param_name}"
+        """
+        # TODO: skip_missing is not used here...?
+        _ = skip_missing
+
+        flat_params = {}
+
+        for i, transform_params in enumerate(nested_params):
+            for param_name, param_value in transform_params.items():
+                flat_name = f"{i}:{param_name}"
+                flat_params[flat_name] = param_value
+
+        return flat_params
+
+    @property
+    def names_nested(self) -> tuple[tuple[str, ...], ...]:
+        return tuple(t._param_names for t in self.transforms)
+
+    @property
+    def names_flat(self) -> tuple[str, ...]:
+        return tuple(
+            f"{i}:{name}" for i, names in enumerate(self.names_nested) for name in names
+        )
+
+    def get_expanded_priors(
         self, latent_size: int, data_size: int | None = None
     ) -> ParamPriorsT:
-        """Get expanded parameter priors.
+        """Get expanded parameter priors using flat naming scheme.
 
-        Expands the parameter prior distributions to the concrete shapes needed
-        for the transform, based on latent size and optional data size.
+        Returns flattened parameter priors with index-based naming for
+        compatibility with the AbstractTransform interface.
+        Parameter names will be in the format: "{transform_index}:{param_name}"
         """
+
         priors = {}
-        for (name, prior), trans in zip(self.param_priors.items(), self.transforms):
-            shape = self.param_shapes[name].resolve(
-                {
-                    "output_size": trans.output_size,
-                    "latent_size": latent_size,
-                    "data_size": data_size,
-                }
+        for i, transform in enumerate(self.transforms):
+            transform_priors = transform.get_expanded_priors(
+                latent_size=latent_size, data_size=data_size
             )
-            priors[name] = prior.expand(shape)
+            for param_name, prior in transform_priors.items():
+                flat_name = f"{i}:{param_name}"
+                priors[flat_name] = prior
         return ImmutableMap(**priors)
 
 
-class FunctionTransform(AbstractAtomicTransform):
+class FunctionTransform(AbstractSingleTransform):
     """Function transformation using a user-defined function.
 
     This transform allows for arbitrary transformations defined by the user.
@@ -260,7 +410,7 @@ def _noop_transform(z: LatentsT) -> OutputT:
     return z
 
 
-class NoOpTransform(AbstractAtomicTransform):
+class NoOpTransform(AbstractSingleTransform):
     """No-op transformation."""
 
     output_size: int = 0
@@ -280,7 +430,7 @@ def _linear_transform(z: LatentsT, A: LinearT) -> OutputT:
     return A @ z
 
 
-class LinearTransform(AbstractAtomicTransform):
+class LinearTransform(AbstractSingleTransform):
     """Linear transformation from latent to output space.
 
     Implements the transformation: y = A @ z, where A is a matrix and z is a latent
@@ -308,7 +458,7 @@ def _offset_transform(z: LatentsT, b: OutputT) -> OutputT:
     return z + b
 
 
-class OffsetTransform(AbstractAtomicTransform):
+class OffsetTransform(AbstractSingleTransform):
     """Offset transformation that adds a bias vector to inputs.
 
     Implements the transformation: y = z + b, where b is a bias vector.
@@ -333,7 +483,7 @@ def _affine_transform(z: LatentsT, A: LinearT, b: OutputT) -> OutputT:
     return A @ z + b
 
 
-class AffineTransform(AbstractAtomicTransform):
+class AffineTransform(AbstractSingleTransform):
     """Affine transformation combining linear transform and offset.
 
     Implements the transformation: y = A @ z + b, where A is a matrix,
@@ -364,7 +514,7 @@ def _quadratic_transform(z: LatentsT, Q: QuadT, A: LinearT, b: OutputT) -> Outpu
     return jnp.einsum("i,oij,j->o", z, Q, z) + A @ z + b
 
 
-class QuadraticTransform(AbstractAtomicTransform):
+class QuadraticTransform(AbstractSingleTransform):
     """Quadratic transformation of latent vectors.
 
     Implements the transformation: y = z^T Q z + A @ z + b, where Q is a tensor,
@@ -390,7 +540,7 @@ class QuadraticTransform(AbstractAtomicTransform):
 # ----
 
 # TODO: implement a Gaussian Process transform using the tinygp library. The user should specify the kernel, and parameter priors for the kernel.
-# class GaussianProcessTransform(AtomicTransformMixin, AbstractTransform):
+# class GaussianProcessTransform(SingleTransformMixin, AbstractTransform):
 #     transform: TransformFuncT = ...
 
 
@@ -400,7 +550,7 @@ class QuadraticTransform(AbstractAtomicTransform):
 # # need to be a class factory so that the user can specify the layer shapes and
 # # activation functions and the class is constructed from that. Also, make it work with
 # # numpyro.
-# class MLPTransform(AtomicTransformMixin, AbstractTransform):
+# class MLPTransform(SingleTransformMixin, AbstractTransform):
 #     transform: TransformFuncT = eqx.field(
 #         default=lambda z, A, b: A @ z + b, init=False, repr=False
 #     )

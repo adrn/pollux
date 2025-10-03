@@ -61,5 +61,5 @@ def test_infer_error_intrinsic_scatter():
     res.losses.block_until_ready()
 
     assert np.isclose(
-        np.mean(opt_params["flux"]["s"]), np.mean(data["flux_err"]), atol=0.05
+        np.mean(opt_params["flux"]["err"]["s"]), np.mean(data["flux_err"]), atol=0.05
     )
