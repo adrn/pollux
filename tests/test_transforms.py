@@ -338,7 +338,7 @@ def test_transform_sequence_unpack_with_missing_params():
 
     # Only provide parameters for first transform
     flat_params = {"0:A": rng.random((n_out, n_latents))}
-    unpacked = trans_seq.unpack_params(flat_params)
+    unpacked = trans_seq.unpack_params(flat_params, skip_missing=True)
 
     assert len(unpacked) == 2
     assert "A" in unpacked[0]

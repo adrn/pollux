@@ -310,9 +310,12 @@ class TransformSequence(AbstractTransform):
         for param_name in self.names_flat:
             param_value = flat_params.get(param_name)
 
-            if param_value is None and not skip_missing:
-                msg = f"Missing value in transform: {param_name}"
-                raise ValueError(msg)
+            if param_value is None:
+                if not skip_missing:
+                    msg = f"Missing value in transform: {param_name}"
+                    raise ValueError(msg)
+                # Skip missing parameters when skip_missing=True
+                continue
 
             if ":" in param_name:
                 idx_str, actual_param_name = param_name.split(":", 1)
