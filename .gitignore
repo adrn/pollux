@@ -156,3 +156,12 @@ Thumbs.db
 # Common editor files
 *~
 *.swp
+
+
+#data files
+*.csv
+*.vot
+*.pkl
+*.xml
+*.txt
+*.fits
