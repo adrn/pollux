@@ -8,6 +8,7 @@ from pollux.models.transforms import (
     FunctionTransform,
     LinearTransform,
     OffsetTransform,
+    PolyFeatureTransform,
     TransformSequence,
 )
 
@@ -491,3 +492,167 @@ def test_parameter_name_with_colon_raises():
             param_priors={"bad:param": dist.Normal(0.0, 1.0)},
             param_shapes={"bad:param": (4,)},
         )
+
+
+def test_poly_feature_transform_basic():
+    """Test basic polynomial feature expansion."""
+    # Test with 2 inputs, degree 2, with bias
+    trans = PolyFeatureTransform(degree=2, include_bias=True)
+
+    # Input: 2 samples, 2 features
+    x = jnp.array([[1.0, 2.0], [3.0, 4.0]])
+    result = trans.apply(x)
+
+    # Expected features for degree=2 with bias:
+    # [1, x1, x2, x1^2, x1*x2, x2^2]
+    # For [1, 2]: [1, 1, 2, 1, 2, 4]
+    # For [3, 4]: [1, 3, 4, 9, 12, 16]
+    expected = jnp.array(
+        [[1.0, 1.0, 2.0, 1.0, 2.0, 4.0], [1.0, 3.0, 4.0, 9.0, 12.0, 16.0]]
+    )
+
+    assert result.shape == (2, 6)
+    assert np.allclose(result, expected)
+
+
+def test_poly_feature_transform_no_bias():
+    """Test polynomial feature expansion without bias."""
+    trans = PolyFeatureTransform(degree=2, include_bias=False)
+
+    x = jnp.array([[1.0, 2.0], [3.0, 4.0]])
+    result = trans.apply(x)
+
+    # Expected features without bias: [x1, x2, x1^2, x1*x2, x2^2]
+    expected = jnp.array([[1.0, 2.0, 1.0, 2.0, 4.0], [3.0, 4.0, 9.0, 12.0, 16.0]])
+
+    assert result.shape == (2, 5)
+    assert np.allclose(result, expected)
+
+
+def test_poly_feature_transform_degree_1():
+    """Test polynomial feature expansion with degree 1 (just linear features)."""
+    trans = PolyFeatureTransform(degree=1, include_bias=True)
+
+    x = jnp.array([[1.0, 2.0, 3.0]])
+    result = trans.apply(x)
+
+    # Expected: [1, x1, x2, x3]
+    expected = jnp.array([[1.0, 1.0, 2.0, 3.0]])
+
+    assert result.shape == (1, 4)
+    assert np.allclose(result, expected)
+
+
+def test_poly_feature_transform_get_output_size():
+    """Test the output size computation."""
+    trans = PolyFeatureTransform(degree=2, include_bias=True)
+
+    # For 2 inputs with degree 2: C(2+2, 2) = C(4, 2) = 6
+    assert trans.get_output_size(2) == 6
+
+    # For 3 inputs with degree 2: C(3+2, 2) = C(5, 2) = 10
+    assert trans.get_output_size(3) == 10
+
+    # For 2 inputs with degree 3: C(2+3, 3) = C(5, 3) = 10
+    trans_deg3 = PolyFeatureTransform(degree=3, include_bias=True)
+    assert trans_deg3.get_output_size(2) == 10
+
+
+def test_poly_feature_transform_no_learnable_params():
+    """Test that PolyFeatureTransform has no learnable parameters."""
+    trans = PolyFeatureTransform(degree=2)
+
+    # param_priors should be empty
+    assert len(trans.param_priors) == 0
+
+    # get_expanded_priors should return empty
+    priors = trans.get_expanded_priors(latent_size=8, data_size=100)
+    assert len(priors) == 0
+
+
+def test_poly_feature_transform_in_sequence():
+    """Test PolyFeatureTransform in a TransformSequence (Cannon-style)."""
+    n_stars = 32
+    n_labels = 3
+    n_flux = 16
+    rng = np.random.default_rng(42)
+
+    # Create Cannon-style transform: polynomial features -> linear
+    cannon_trans = TransformSequence(
+        transforms=(
+            PolyFeatureTransform(degree=2, include_bias=True),
+            LinearTransform(output_size=n_flux),
+        )
+    )
+
+    # Generate mock labels
+    labels = jnp.array(rng.random((n_stars, n_labels)))
+
+    # Compute expected number of polynomial features
+    n_poly_features = PolyFeatureTransform(degree=2).get_output_size(n_labels)
+    assert n_poly_features == 10  # C(3+2, 2) = 10
+
+    # Create coefficient matrix
+    A = rng.random((n_flux, n_poly_features))
+
+    # Apply transform with flat parameter format
+    result = cannon_trans.apply(labels, **{"0:": {}, "1:A": A})
+
+    # Actually the 0th transform has no params, so we should use simpler format
+    # Let me try with the dict-based approach
+    result = cannon_trans.apply(labels, {}, {"A": A})
+
+    assert result.shape == (n_stars, n_flux)
+
+    # Verify computation manually
+    poly_features = PolyFeatureTransform(degree=2, include_bias=True).apply(labels)
+    expected = (
+        poly_features @ A.T
+    )  # (n_stars, n_poly_features) @ (n_poly_features, n_flux).T
+    assert np.allclose(result, expected)
+
+
+def test_poly_feature_transform_with_lux_model():
+    """Test PolyFeatureTransform integration with LuxModel."""
+
+    n_stars = 16
+    n_labels = 3
+    n_flux = 8
+    rng = np.random.default_rng(123)
+
+    # Create model with Cannon-style transform
+    model = plx.LuxModel(latent_size=n_labels)
+
+    cannon_trans = TransformSequence(
+        transforms=(
+            PolyFeatureTransform(degree=2, include_bias=True),
+            LinearTransform(output_size=n_flux),
+        )
+    )
+    model.register_output("flux", cannon_trans)
+
+    # Generate synthetic data
+    labels = jnp.array(rng.random((n_stars, n_labels)))
+    n_poly_features = PolyFeatureTransform(degree=2).get_output_size(n_labels)
+    A = rng.random((n_flux, n_poly_features))
+
+    # Compute true flux
+    poly_features = PolyFeatureTransform(degree=2, include_bias=True).apply(labels)
+    true_flux = poly_features @ A.T
+
+    # Create data
+    flux_data = plx.data.OutputData(data=true_flux, err=0.01 * np.ones_like(true_flux))
+    all_data = plx.data.PolluxData(flux=flux_data)
+
+    # Get priors
+    priors = cannon_trans.get_expanded_priors(latent_size=n_labels, data_size=n_stars)
+
+    # First transform (PolyFeatureTransform) has no priors
+    # Second transform (LinearTransform) has "1:A" prior
+    assert "1:A" in priors
+    assert priors["1:A"].batch_shape == (n_flux, n_poly_features)
+
+    # Test predict_outputs
+    pars = {"flux": {"data": [{}, {"A": A}]}}
+    result = model.predict_outputs(labels, pars)
+    assert np.allclose(result["flux"], true_flux)

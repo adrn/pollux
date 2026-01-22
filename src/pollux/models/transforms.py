@@ -10,6 +10,7 @@ __all__ = [
     "LinearTransform",
     "NoOpTransform",
     "OffsetTransform",
+    "PolyFeatureTransform",
     "QuadraticTransform",
     "TransformSequence",
 ]
@@ -17,6 +18,8 @@ __all__ = [
 import abc
 import inspect
 from dataclasses import dataclass
+from itertools import combinations_with_replacement
+from math import comb
 from typing import Any, TypeAlias
 
 import equinox as eqx
@@ -403,16 +406,30 @@ class TransformSequence(AbstractTransform):
         Returns flattened parameter priors with index-based naming for
         compatibility with the AbstractTransform interface.
         Parameter names will be in the format: "{transform_index}:{param_name}"
-        """
 
+        Note: For transform sequences, each transform's "latent_size" is the
+        output size of the previous transform (or the model's latent_size for
+        the first transform).
+        """
         priors = {}
+        current_size = latent_size
+
         for i, transform in enumerate(self.transforms):
             transform_priors = transform.get_expanded_priors(
-                latent_size=latent_size, data_size=data_size
+                latent_size=current_size, data_size=data_size
             )
             for param_name, prior in transform_priors.items():
                 flat_name = f"{i}:{param_name}"
                 priors[flat_name] = prior
+
+            # Update current_size for the next transform
+            # Check if transform has get_output_size method (like PolyFeatureTransform)
+            get_output_size = getattr(transform, "get_output_size", None)
+            if callable(get_output_size):
+                current_size = get_output_size(current_size)
+            else:
+                current_size = transform.output_size
+
         return ImmutableMap(**priors)
 
 
@@ -442,6 +459,193 @@ class NoOpTransform(AbstractSingleTransform):
     transform: TransformFuncT = _noop_transform
     param_priors: ParamPriorsT = ImmutableMap()
     param_shapes: ParamShapesT = ImmutableMap()
+
+
+# ----
+
+
+def _compute_n_poly_features(n_inputs: int, degree: int, include_bias: bool) -> int:
+    """Compute the number of polynomial features.
+
+    For n inputs with degree d, the number of features is C(n+d, d) - 1 (if no bias)
+    or C(n+d, d) (if bias included).
+
+    Parameters
+    ----------
+    n_inputs
+        Number of input features.
+    degree
+        Maximum polynomial degree.
+    include_bias
+        Whether to include a bias term (constant 1).
+
+    Returns
+    -------
+    int
+        Number of polynomial features.
+    """
+    # Total monomials of degree <= d with n variables is C(n+d, d)
+    n_features = comb(n_inputs + degree, degree)
+    if not include_bias:
+        n_features -= 1  # Remove the constant term
+    return n_features
+
+
+def polynomial_features(
+    x: BatchedLatentsT, degree: int = 2, include_bias: bool = True
+) -> BatchedOutputT:
+    """Expand input into polynomial features.
+
+    Generates all polynomial combinations of features up to the specified degree.
+    For inputs [x1, x2] with degree=2 and include_bias=True, produces:
+    [1, x1, x2, x1^2, x1*x2, x2^2]
+
+    Parameters
+    ----------
+    x
+        Input array of shape (n_samples, n_features).
+    degree
+        Maximum polynomial degree. Default is 2.
+    include_bias
+        Whether to include a bias column of ones. Default is True.
+
+    Returns
+    -------
+    array
+        Polynomial features of shape (n_samples, n_poly_features).
+
+    Examples
+    --------
+    >>> import jax.numpy as jnp
+    >>> x = jnp.array([[1.0, 2.0], [3.0, 4.0]])
+    >>> polynomial_features(x, degree=2, include_bias=True)
+    Array([[ 1.,  1.,  2.,  1.,  2.,  4.],
+           [ 1.,  3.,  4.,  9., 12., 16.]], dtype=float32)
+    """
+    n_samples, n_features = x.shape
+
+    # Generate all monomials: for each degree d, generate all combinations
+    # of d indices (with replacement) from 0 to n_features-1
+    columns = []
+
+    for d in range(degree + 1):
+        if d == 0:
+            if include_bias:
+                columns.append(jnp.ones((n_samples, 1), dtype=x.dtype))
+        else:
+            for indices in combinations_with_replacement(range(n_features), d):
+                # Compute the product of features at these indices
+                col = jnp.ones(n_samples, dtype=x.dtype)
+                for idx in indices:
+                    col = col * x[:, idx]
+                columns.append(col[:, None])
+
+    return jnp.concatenate(columns, axis=1)
+
+
+def _poly_feature_transform(z: LatentsT, degree: int, include_bias: bool) -> OutputT:
+    """Transform function for polynomial features (single sample)."""
+    # This will be called via vmap, so z is shape (n_features,)
+    # We need to add a batch dimension, apply, and remove it
+    return polynomial_features(z[None, :], degree, include_bias)[0]
+
+
+class PolyFeatureTransform(AbstractTransform):
+    """Polynomial feature expansion transform.
+
+    Expands input features into polynomial combinations up to the specified degree.
+    This transform has NO learnable parameters - it's a deterministic feature expansion.
+
+    This is useful for implementing The Cannon model, where labels are expanded into
+    polynomial features before a linear transformation to predict spectra.
+
+    Parameters
+    ----------
+    degree
+        Maximum polynomial degree. Default is 2.
+    include_bias
+        Whether to include a bias term (constant 1). Default is True.
+
+    Examples
+    --------
+    >>> import jax.numpy as jnp
+    >>> from pollux.models.transforms import PolyFeatureTransform, LinearTransform
+    >>> from pollux.models.transforms import TransformSequence
+
+    Create a Cannon-style transform (polynomial features -> linear):
+
+    >>> cannon = TransformSequence((
+    ...     PolyFeatureTransform(degree=2),
+    ...     LinearTransform(output_size=128),
+    ... ))
+
+    The polynomial transform expands 3 labels into 10 features (with bias):
+    - degree 0: 1 (bias)
+    - degree 1: x1, x2, x3
+    - degree 2: x1^2, x1*x2, x1*x3, x2^2, x2*x3, x3^2
+    """
+
+    degree: int = 2
+    include_bias: bool = True
+
+    # No learnable parameters
+    param_priors: ParamPriorsT = ImmutableMap()
+    param_shapes: ParamShapesT = ImmutableMap()
+
+    # output_size is computed dynamically based on input size
+    # We set a placeholder that will be overridden in apply()
+    output_size: int = eqx.field(default=0)
+
+    def apply(self, latents: BatchedLatentsT, **_pars: Any) -> BatchedOutputT:
+        """Apply polynomial feature expansion.
+
+        Parameters
+        ----------
+        latents
+            Input array of shape (n_samples, n_features).
+        **_pars
+            Ignored (no learnable parameters).
+
+        Returns
+        -------
+        array
+            Polynomial features of shape (n_samples, n_poly_features).
+        """
+        return polynomial_features(latents, self.degree, self.include_bias)
+
+    def get_expanded_priors(
+        self, latent_size: int, data_size: int | None = None
+    ) -> ParamPriorsT:
+        """Return empty priors (no learnable parameters)."""
+        del latent_size, data_size  # Unused - no learnable parameters
+        return ImmutableMap()
+
+    def get_output_size(self, input_size: int) -> int:
+        """Compute output size given input size.
+
+        Parameters
+        ----------
+        input_size
+            Number of input features.
+
+        Returns
+        -------
+        int
+            Number of polynomial features.
+        """
+        return _compute_n_poly_features(input_size, self.degree, self.include_bias)
+
+    def unpack_pars(
+        self, _flat_pars: dict[str, Any], _ignore_missing: bool = False
+    ) -> dict[str, Any]:
+        """For compatibility with TransformSequence (returns empty dict)."""
+        return {}
+
+    def pack_pars(
+        self, _nested_pars: dict[str, Any], _ignore_missing: bool = False
+    ) -> dict[str, Any]:
+        """For compatibility with TransformSequence (returns empty dict)."""
+        return {}
 
 
 # ----
