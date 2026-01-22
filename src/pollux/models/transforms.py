@@ -132,6 +132,22 @@ class AbstractSingleTransform(AbstractTransform):
                 )
                 raise ValueError(msg)
 
+        # Also validate param_priors and param_shapes keys
+        for param_name in self.param_priors:
+            if ":" in param_name:
+                msg = (
+                    f"Parameter prior name '{param_name}' contains ':' which is "
+                    "reserved for internal parameter naming. Please rename this parameter."
+                )
+                raise ValueError(msg)
+        for param_name in self.param_shapes:
+            if ":" in param_name:
+                msg = (
+                    f"Parameter shape name '{param_name}' contains ':' which is "
+                    "reserved for internal parameter naming. Please rename this parameter."
+                )
+                raise ValueError(msg)
+
         # Set up vmap'd transform
         self._transform = (
             jax.vmap(self.transform, in_axes=(0, *([None] * len(self._param_names))))

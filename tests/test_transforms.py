@@ -474,3 +474,20 @@ def test_transform_sequence_three_transforms_pack_unpack():
     assert np.allclose(unpacked[0]["A"], A)
     assert np.allclose(unpacked[1]["scale"], scale)
     assert np.allclose(unpacked[2]["b"], b)
+
+
+def test_parameter_name_with_colon_raises():
+    """Test that parameter names containing colons are rejected."""
+
+    # Define a custom transform function with a parameter name containing a colon
+    def bad_transform(x, bad_param):
+        return x + bad_param
+
+    # This should raise because of the colon in param_priors key
+    with pytest.raises(ValueError, match="contains ':'"):
+        FunctionTransform(
+            output_size=4,
+            transform=bad_transform,
+            param_priors={"bad:param": dist.Normal(0.0, 1.0)},
+            param_shapes={"bad:param": (4,)},
+        )
