@@ -1,3 +1,4 @@
+import equinox as eqx
 import jax.numpy as jnp
 import numpy as np
 import numpyro.distributions as dist
@@ -5,6 +6,7 @@ import pytest
 
 import pollux as plx
 from pollux.models.transforms import (
+    EquinoxNNTransform,
     FunctionTransform,
     LinearTransform,
     OffsetTransform,
@@ -642,7 +644,7 @@ def test_poly_feature_transform_with_lux_model():
 
     # Create data
     flux_data = plx.data.OutputData(data=true_flux, err=0.01 * np.ones_like(true_flux))
-    all_data = plx.data.PolluxData(flux=flux_data)
+    plx.data.PolluxData(flux=flux_data)
 
     # Get priors
     priors = cannon_trans.get_expanded_priors(latent_size=n_labels, data_size=n_stars)
@@ -656,3 +658,238 @@ def test_poly_feature_transform_with_lux_model():
     pars = {"flux": {"data": [{}, {"A": A}]}}
     result = model.predict_outputs(labels, pars)
     assert np.allclose(result["flux"], true_flux)
+
+
+# ---- EquinoxNNTransform Tests ----
+
+
+def test_equinox_nn_transform_basic():
+    """Test basic EquinoxNNTransform functionality."""
+    n_in = 4
+    n_out = 8
+    n_samples = 16
+
+    # Create a simple MLP factory
+    def mlp_factory(in_size, out_size, key):
+        return eqx.nn.MLP(
+            in_size=in_size,
+            out_size=out_size,
+            width_size=16,
+            depth=1,
+            key=key,
+        )
+
+    nn_trans = EquinoxNNTransform(
+        output_size=n_out,
+        nn_factory=mlp_factory,
+        weight_prior=dist.Normal(0.0, 1.0),
+        bias_prior=dist.Normal(0.0, 0.1),
+    )
+
+    # Get expanded priors
+    priors = nn_trans.get_expanded_priors(latent_size=n_in)
+
+    # Check that we have priors for all parameters
+    assert len(priors) > 0
+
+    # Check that weight and bias priors exist
+    weight_paths = [p for p in priors if "weight" in p]
+    bias_paths = [p for p in priors if "bias" in p]
+    assert len(weight_paths) > 0
+    assert len(bias_paths) > 0
+
+    # Sample parameters from priors
+    rng = np.random.default_rng(42)
+    params = {
+        path: rng.normal(size=prior.batch_shape) for path, prior in priors.items()
+    }
+
+    # Apply transform
+    latents = jnp.array(rng.random((n_samples, n_in)))
+    result = nn_trans.apply(latents, **params)
+
+    assert result.shape == (n_samples, n_out)
+
+
+def test_equinox_nn_transform_param_paths():
+    """Test that parameter paths are correctly generated."""
+    n_in = 4
+    n_out = 8
+
+    def mlp_factory(in_size, out_size, key):
+        return eqx.nn.MLP(
+            in_size=in_size,
+            out_size=out_size,
+            width_size=16,
+            depth=2,  # 2 hidden layers
+            key=key,
+        )
+
+    nn_trans = EquinoxNNTransform(
+        output_size=n_out,
+        nn_factory=mlp_factory,
+    )
+
+    priors = nn_trans.get_expanded_priors(latent_size=n_in)
+
+    # For depth=2 MLP, we expect:
+    # - layers.0.weight, layers.0.bias (input -> hidden1)
+    # - layers.1.weight, layers.1.bias (hidden1 -> hidden2)
+    # - layers.2.weight, layers.2.bias (hidden2 -> output)
+    expected_paths = {
+        "layers.0.weight",
+        "layers.0.bias",
+        "layers.1.weight",
+        "layers.1.bias",
+        "layers.2.weight",
+        "layers.2.bias",
+    }
+
+    assert set(priors.keys()) == expected_paths
+
+
+def test_equinox_nn_transform_prior_shapes():
+    """Test that prior shapes are correct."""
+    n_in = 4
+    n_out = 8
+    width = 16
+
+    def mlp_factory(in_size, out_size, key):
+        return eqx.nn.MLP(
+            in_size=in_size,
+            out_size=out_size,
+            width_size=width,
+            depth=1,
+            key=key,
+        )
+
+    nn_trans = EquinoxNNTransform(
+        output_size=n_out,
+        nn_factory=mlp_factory,
+    )
+
+    priors = nn_trans.get_expanded_priors(latent_size=n_in)
+
+    # Check shapes
+    # layers.0: input (4) -> hidden (16)
+    assert priors["layers.0.weight"].batch_shape == (width, n_in)
+    assert priors["layers.0.bias"].batch_shape == (width,)
+
+    # layers.1: hidden (16) -> output (8)
+    assert priors["layers.1.weight"].batch_shape == (n_out, width)
+    assert priors["layers.1.bias"].batch_shape == (n_out,)
+
+
+def test_equinox_nn_transform_custom_priors():
+    """Test that custom priors are applied correctly."""
+    n_in = 4
+    n_out = 8
+
+    def mlp_factory(in_size, out_size, key):
+        return eqx.nn.MLP(
+            in_size=in_size,
+            out_size=out_size,
+            width_size=16,
+            depth=1,
+            key=key,
+        )
+
+    # Use distinctive priors
+    weight_prior = dist.Normal(0.0, 0.5)
+    bias_prior = dist.Normal(1.0, 0.1)
+
+    nn_trans = EquinoxNNTransform(
+        output_size=n_out,
+        nn_factory=mlp_factory,
+        weight_prior=weight_prior,
+        bias_prior=bias_prior,
+    )
+
+    priors = nn_trans.get_expanded_priors(latent_size=n_in)
+
+    # Check that weight priors have correct parameters
+    for path, prior in priors.items():
+        if "weight" in path:
+            assert prior.base_dist.loc == 0.0
+            assert prior.base_dist.scale == 0.5
+        elif "bias" in path:
+            assert prior.base_dist.loc == 1.0
+            assert prior.base_dist.scale == 0.1
+
+
+def test_equinox_nn_transform_deterministic():
+    """Test that apply produces deterministic output for same params."""
+    n_in = 4
+    n_out = 8
+    n_samples = 16
+    rng = np.random.default_rng(42)
+
+    def mlp_factory(in_size, out_size, key):
+        return eqx.nn.MLP(
+            in_size=in_size,
+            out_size=out_size,
+            width_size=16,
+            depth=1,
+            key=key,
+        )
+
+    nn_trans = EquinoxNNTransform(
+        output_size=n_out,
+        nn_factory=mlp_factory,
+    )
+
+    priors = nn_trans.get_expanded_priors(latent_size=n_in)
+    params = {
+        path: jnp.array(rng.normal(size=prior.batch_shape))
+        for path, prior in priors.items()
+    }
+    latents = jnp.array(rng.random((n_samples, n_in)))
+
+    # Apply twice with same params
+    result1 = nn_trans.apply(latents, **params)
+    result2 = nn_trans.apply(latents, **params)
+
+    assert np.allclose(result1, result2)
+
+
+def test_equinox_nn_transform_with_lux_model():
+    """Test EquinoxNNTransform integration with LuxModel."""
+    n_stars = 16
+    n_latents = 4
+    n_flux = 8
+    rng = np.random.default_rng(123)
+
+    def mlp_factory(in_size, out_size, key):
+        return eqx.nn.MLP(
+            in_size=in_size,
+            out_size=out_size,
+            width_size=16,
+            depth=1,
+            key=key,
+        )
+
+    # Create model with NN transform
+    model = plx.LuxModel(latent_size=n_latents)
+    nn_trans = EquinoxNNTransform(
+        output_size=n_flux,
+        nn_factory=mlp_factory,
+        weight_prior=dist.Normal(0.0, 0.1),
+        bias_prior=dist.Normal(0.0, 0.01),
+    )
+    model.register_output("flux", nn_trans)
+
+    # Generate latents
+    latents = jnp.array(rng.random((n_stars, n_latents)))
+
+    # Get priors and sample parameters
+    priors = nn_trans.get_expanded_priors(latent_size=n_latents, data_size=n_stars)
+    params = {
+        path: jnp.array(rng.normal(size=prior.batch_shape) * 0.1)
+        for path, prior in priors.items()
+    }
+
+    # Test predict_outputs
+    pars = {"flux": {"data": params}}
+    result = model.predict_outputs(latents, pars)
+
+    assert result["flux"].shape == (n_stars, n_flux)

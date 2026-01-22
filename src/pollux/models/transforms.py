@@ -6,6 +6,7 @@ __all__ = [
     "AbstractSingleTransform",
     "AbstractTransform",
     "AffineTransform",
+    "EquinoxNNTransform",
     "FunctionTransform",
     "LinearTransform",
     "NoOpTransform",
@@ -768,21 +769,341 @@ class QuadraticTransform(AbstractSingleTransform):
 
 # ----
 
+
+def _get_param_paths(
+    module: eqx.Module, prefix: str = "", separator: str = "."
+) -> tuple[str, ...]:
+    """Generate unique string paths for all array parameters in an Equinox module.
+
+    Traverses the PyTree structure of an Equinox module and generates a unique
+    path string for each array leaf. This is used to create flat parameter names
+    for numpyro sampling.
+
+    Parameters
+    ----------
+    module
+        An Equinox module to extract parameter paths from.
+    prefix
+        Prefix to prepend to all paths (used for recursion).
+    separator
+        Separator to use between path components. Default is ".".
+
+    Returns
+    -------
+    tuple[str, ...]
+        A tuple of parameter path strings, one for each array in the module.
+
+    Examples
+    --------
+    >>> import equinox as eqx
+    >>> import jax
+    >>> key = jax.random.PRNGKey(0)
+    >>> mlp = eqx.nn.MLP(in_size=4, out_size=8, width_size=16, depth=2, key=key)
+    >>> paths = _get_param_paths(mlp)
+    >>> print(paths[:4])  # First few paths
+    ('layers.0.weight', 'layers.0.bias', 'layers.1.weight', 'layers.1.bias')
+    """
+    paths = []
+
+    # Get the fields of the module
+    items = module.__dict__.items() if hasattr(module, "__dict__") else []
+
+    for name, value in items:
+        # Skip private attributes
+        if name.startswith("_"):
+            continue
+
+        current_path = f"{prefix}{separator}{name}" if prefix else name
+
+        if eqx.is_array(value):
+            paths.append(current_path)
+        elif isinstance(value, eqx.Module):
+            # Recursively process nested modules
+            paths.extend(_get_param_paths(value, current_path, separator))
+        elif isinstance(value, (list, tuple)):
+            # Handle lists/tuples of modules (like layers in MLP)
+            for i, item in enumerate(value):
+                item_path = f"{current_path}{separator}{i}"
+                if eqx.is_array(item):
+                    paths.append(item_path)
+                elif isinstance(item, eqx.Module):
+                    paths.extend(_get_param_paths(item, item_path, separator))
+
+    return tuple(paths)
+
+
+def _get_flat_params(module: eqx.Module) -> list[jax.Array]:
+    """Extract all array parameters from an Equinox module in a flat list.
+
+    Parameters
+    ----------
+    module
+        An Equinox module to extract parameters from.
+
+    Returns
+    -------
+    list[jax.Array]
+        A list of all array parameters in the module, in the same order as
+        _get_param_paths returns their paths.
+    """
+    params = []
+
+    items = module.__dict__.items() if hasattr(module, "__dict__") else []
+
+    for name, value in items:
+        if name.startswith("_"):
+            continue
+
+        if eqx.is_array(value):
+            params.append(value)
+        elif isinstance(value, eqx.Module):
+            params.extend(_get_flat_params(value))
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                if eqx.is_array(item):
+                    params.append(item)
+                elif isinstance(item, eqx.Module):
+                    params.extend(_get_flat_params(item))
+
+    return params
+
+
+def _set_param_by_path(
+    module: eqx.Module, path: str, value: jax.Array, separator: str = "."
+) -> eqx.Module:
+    """Set a parameter in an Equinox module by its path string.
+
+    Parameters
+    ----------
+    module
+        The Equinox module to modify.
+    path
+        The path to the parameter (e.g., "layers.0.weight").
+    value
+        The new value for the parameter.
+    separator
+        The separator used in the path. Default is ".".
+
+    Returns
+    -------
+    eqx.Module
+        A new module with the parameter updated.
+    """
+    parts = path.split(separator)
+
+    def update_nested(obj: Any, parts: list[str], val: jax.Array) -> Any:
+        if not parts:
+            return val
+
+        key = parts[0]
+        remaining = parts[1:]
+
+        if isinstance(obj, eqx.Module):
+            # Get current value
+            if hasattr(obj, key):
+                current = getattr(obj, key)
+                new_val = update_nested(current, remaining, val)
+                return eqx.tree_at(lambda m: getattr(m, key), obj, new_val)
+            msg = f"Module has no attribute '{key}'"
+            raise AttributeError(msg)
+        if isinstance(obj, (list, tuple)):
+            idx = int(key)
+            current = obj[idx]
+            new_val = update_nested(current, remaining, val)
+            if isinstance(obj, tuple):
+                return (*obj[:idx], new_val, *obj[idx + 1 :])
+            new_list = list(obj)
+            new_list[idx] = new_val
+            return new_list
+        msg = f"Cannot traverse into type {type(obj)}"
+        raise TypeError(msg)
+
+    return update_nested(module, parts, value)
+
+
+class EquinoxNNTransform(AbstractTransform):
+    """Neural network transform using an Equinox module.
+
+    This transform wraps an Equinox neural network module and exposes its parameters
+    for Bayesian inference via numpyro. The network structure is defined by a factory
+    function that creates the network given input size, output size, and a random key.
+
+    Parameters
+    ----------
+    output_size
+        The output dimension of the transform.
+    nn_factory
+        A callable that creates an Equinox module. It should have the signature:
+        ``nn_factory(in_size: int, out_size: int, key: jax.Array) -> eqx.Module``
+    weight_prior
+        Prior distribution for weight parameters. Default is Normal(0, 1).
+    bias_prior
+        Prior distribution for bias parameters. Default is Normal(0, 1).
+
+    Examples
+    --------
+    >>> import jax
+    >>> import equinox as eqx
+    >>> import numpyro.distributions as dist
+    >>> from pollux.models.transforms import EquinoxNNTransform
+
+    Create a simple MLP transform:
+
+    >>> nn_trans = EquinoxNNTransform(
+    ...     output_size=128,
+    ...     nn_factory=lambda in_size, out_size, key: eqx.nn.MLP(
+    ...         in_size=in_size,
+    ...         out_size=out_size,
+    ...         width_size=64,
+    ...         depth=2,
+    ...         key=key,
+    ...     ),
+    ...     weight_prior=dist.Normal(0, 0.1),
+    ...     bias_prior=dist.Normal(0, 0.01),
+    ... )
+
+    Use with LuxModel:
+
+    >>> import pollux as plx
+    >>> model = plx.LuxModel(latent_size=8)
+    >>> model.register_output("flux", nn_trans)
+    """
+
+    output_size: int
+    nn_factory: Any  # Callable[[int, int, jax.Array], eqx.Module]
+    weight_prior: dist.Distribution = eqx.field(
+        default_factory=lambda: dist.Normal(0.0, 1.0)
+    )
+    bias_prior: dist.Distribution = eqx.field(
+        default_factory=lambda: dist.Normal(0.0, 1.0)
+    )
+
+    # No static param_priors or param_shapes - these are computed dynamically
+    param_priors: ParamPriorsT = eqx.field(default_factory=lambda: ImmutableMap())
+    param_shapes: ParamShapesT = eqx.field(default_factory=lambda: ImmutableMap())
+
+    # Internal state - computed in get_expanded_priors
+    _param_paths: tuple[str, ...] = eqx.field(default=(), repr=False)
+    _template_nn: Any = eqx.field(default=None, repr=False)  # eqx.Module
+
+    def get_expanded_priors(
+        self, latent_size: int, data_size: int | None = None
+    ) -> ParamPriorsT:
+        """Create one prior per neural network parameter.
+
+        Parameters
+        ----------
+        latent_size
+            The input size to the neural network.
+        data_size
+            Not used for NN transforms (included for interface compatibility).
+
+        Returns
+        -------
+        ParamPriorsT
+            Dictionary mapping parameter paths to expanded prior distributions.
+        """
+        del data_size  # Unused
+
+        # Create a template NN to get the PyTree structure
+        key = jax.random.PRNGKey(0)  # Just for structure, not actual init
+        template_nn = self.nn_factory(latent_size, self.output_size, key)
+
+        # Store template and paths for use in apply()
+        # Note: We use object.__setattr__ because eqx.Module is frozen
+        object.__setattr__(self, "_template_nn", template_nn)
+        object.__setattr__(self, "_param_paths", _get_param_paths(template_nn))
+
+        # Get flat parameters to determine shapes
+        flat_params = _get_flat_params(template_nn)
+
+        # Create expanded priors for each parameter
+        priors = {}
+        for path, param in zip(self._param_paths, flat_params):
+            # Validate that path doesn't contain ":"
+            if ":" in path:
+                msg = (
+                    f"Neural network parameter path '{path}' contains ':' which is "
+                    "reserved for internal parameter naming. This may cause issues."
+                )
+                raise ValueError(msg)
+
+            # Choose prior based on parameter name
+            if "weight" in path.lower():
+                prior = self.weight_prior
+            elif "bias" in path.lower():
+                prior = self.bias_prior
+            else:
+                # Default to weight prior for unknown parameters
+                prior = self.weight_prior
+
+            priors[path] = prior.expand(param.shape)
+
+        return ImmutableMap(**priors)
+
+    def apply(self, latents: BatchedLatentsT, **params: Any) -> BatchedOutputT:
+        """Apply the neural network transform.
+
+        Parameters
+        ----------
+        latents
+            Input latent vectors of shape (n_samples, latent_size).
+        **params
+            Neural network parameters, keyed by their path names.
+
+        Returns
+        -------
+        array
+            Output of shape (n_samples, output_size).
+        """
+        if self._template_nn is None:
+            msg = (
+                "EquinoxNNTransform.get_expanded_priors() must be called before apply()"
+            )
+            raise RuntimeError(msg)
+
+        # Reconstruct the NN with the provided parameters
+        nn: eqx.Module = self._template_nn
+        for path in self._param_paths:
+            if path in params:
+                nn = _set_param_by_path(nn, path, params[path])
+
+        # Apply NN to each latent vector using vmap
+        # The nn is an eqx.Module which is callable via __call__
+        def forward(x: jax.Array) -> jax.Array:
+            return nn(x)  # type: ignore[operator]
+
+        return jax.vmap(forward)(latents)
+
+    def unpack_pars(
+        self, flat_pars: dict[str, Any], ignore_missing: bool = False
+    ) -> dict[str, Any]:
+        """Unpack flat parameters (for compatibility with TransformSequence)."""
+        result = {}
+        for path in self._param_paths:
+            if path in flat_pars:
+                result[path] = flat_pars[path]
+            elif not ignore_missing:
+                msg = f"Missing NN parameter: {path}"
+                raise ValueError(msg)
+        return result
+
+    def pack_pars(
+        self, nested_pars: dict[str, Any], ignore_missing: bool = False
+    ) -> dict[str, Any]:
+        """Pack parameters to flat format (for compatibility with TransformSequence)."""
+        result = {}
+        for path in self._param_paths:
+            if path in nested_pars:
+                result[path] = nested_pars[path]
+            elif not ignore_missing:
+                msg = f"Missing NN parameter: {path}"
+                raise ValueError(msg)
+        return result
+
+
+# ----
+
 # TODO: implement a Gaussian Process transform using the tinygp library. The user should specify the kernel, and parameter priors for the kernel.
 # class GaussianProcessTransform(SingleTransformMixin, AbstractTransform):
 #     transform: TransformFuncT = ...
-
-
-# # TODO: implement a simple multi-layer perceptron transform with flax. The user should
-# # construct a MLP instance so that the parameter priors work for all layer parameters,
-# # and there is a way of executing the forward pass with the correct shapes. This might
-# # need to be a class factory so that the user can specify the layer shapes and
-# # activation functions and the class is constructed from that. Also, make it work with
-# # numpyro.
-# class MLPTransform(SingleTransformMixin, AbstractTransform):
-#     transform: TransformFuncT = eqx.field(
-#         default=lambda z, A, b: A @ z + b, init=False, repr=False
-#     )
-#     param_priors: TransformParamsT = eqx.field(
-#         default_factory=_get_default_affine_priors,
-#     )

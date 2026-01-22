@@ -38,7 +38,7 @@ dependencies = [
   "dataclassish"
 ]
 
-[project.optional-dependencies]
+[dependency-groups]
 test = [
   "pytest >=6",
   "pytest-cov >=3",
@@ -63,10 +63,13 @@ docs = [
   "sphinxext-rediraffe>=0.2.7",
 ]
 dev = [
+  {include-group = "test"},
+  "hatch",
   "ipykernel",
-  "nox",
+  "ipywidgets",
   "pre-commit",
-  "pollux[test,docs]"
+  "twine",
+  "ruff",
 ]
 
 [project.urls]

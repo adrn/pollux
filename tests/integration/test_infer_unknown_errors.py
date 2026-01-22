@@ -18,7 +18,7 @@ def test_infer_error_intrinsic_scatter():
     n_latents = 16
     n_flux = 128
     rng = np.random.default_rng(123)
-    data, truth = make_simulated_linear_data(
+    data, _truth = make_simulated_linear_data(
         n_stars=n_stars,
         n_latents=n_latents,
         n_labels=n_labels,
