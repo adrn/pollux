@@ -1,3 +1,4 @@
+import warnings
 from collections import defaultdict
 from collections.abc import Callable, Mapping
 from functools import partial
@@ -115,6 +116,27 @@ class LuxModel(eqx.Module):
     latent_size : int
         The size of the latent vector representation for each object (i.e. the embedded
         dimensionality).
+
+    Notes
+    -----
+    **Parameter Format**
+
+    The :meth:`optimize` method returns parameters in a nested format::
+
+        {
+            "output_name": {
+                "data": {"A": array, ...},  # Transform parameters
+                "err": {"s": array, ...}    # Error transform parameters
+            },
+            "latents": array  # Per-object latent vectors
+        }
+
+    This same format should be used when passing parameters to :meth:`predict_outputs`.
+
+    **Naming Restrictions**
+
+    Output names and transform parameter names cannot contain colons (``':'``) as they
+    are reserved for internal parameter naming in numpyro.
     """
 
     latent_size: int
@@ -133,11 +155,18 @@ class LuxModel(eqx.Module):
         name
             The name of the output. If you intend to use this model with numpyro and
             specified data, this name should correspond to the name of data passed in
-            via a `pollux.data.PolluxData` object.
+            via a `pollux.data.PolluxData` object. The name cannot contain colons (':')
+            as they are reserved for internal parameter naming.
         data_transform
             A specification of the transformation function that takes a latent vector
             representation in and predicts the output values.
         """
+        if ":" in name:
+            msg = (
+                f"Output name '{name}' contains ':' which is reserved for internal "
+                "parameter naming. Please use a different name."
+            )
+            raise ValueError(msg)
         if name in self.outputs:
             msg = f"Output with name {name} already exists"
             raise ValueError(msg)
@@ -187,6 +216,63 @@ class LuxModel(eqx.Module):
 
         return extracted_pars
 
+    def _validate_pars_format(
+        self, pars: dict[str, Any], context: str = "parameters"
+    ) -> bool:
+        """Validate that parameters are in the expected nested format.
+
+        The expected format is::
+
+            {
+                "output_name": {
+                    "data": {...} or [...],  # Transform parameters
+                    "err": {...}             # Error transform parameters (optional)
+                },
+                "latents": array            # Optional, not used by transforms
+            }
+
+        Parameters
+        ----------
+        pars
+            The parameters dictionary to validate.
+        context
+            A string describing the context (for error messages).
+
+        Returns
+        -------
+        bool
+            True if format is valid (nested), False if it appears to be direct format.
+
+        Raises
+        ------
+        TypeError
+            If the format is clearly invalid (not a dict where expected).
+        """
+        for output_name in self.outputs:
+            if output_name not in pars:
+                continue
+
+            output_pars = pars[output_name]
+
+            # Check if it's a dict
+            if not isinstance(output_pars, dict):
+                msg = (
+                    f"Expected dict for {context} '{output_name}', "
+                    f"got {type(output_pars).__name__}"
+                )
+                raise TypeError(msg)
+
+            # Check if it has "data" or "err" keys (nested format)
+            # vs direct parameter keys (deprecated format)
+            has_data_key = "data" in output_pars
+            has_err_key = "err" in output_pars
+
+            if not has_data_key and not has_err_key:
+                # This looks like direct format - return False to indicate
+                return False
+
+        return True
+
     def predict_outputs(
         self,
         latents: BatchedLatentsT,
@@ -198,24 +284,38 @@ class LuxModel(eqx.Module):
         Parameters
         ----------
         latents
-            The latent vectors that transform into the outputs.
+            The latent vectors that transform into the outputs. Shape should be
+            ``(n_objects, latent_size)``.
         pars
             A dictionary of parameters for each output transformation in the model.
-            Can be in either format:
-            1. Direct format: {"output_name": {...} or [...], ...}
-            2. Nested format: {"output_name": {"data": ..., "err": ...}, ...}
-            For TransformSequence outputs, expects either:
-            - A list of parameter dictionaries
-            - A flat dictionary with "{index}:{param}" keys
+            Should be in the nested format returned by :meth:`optimize`::
+
+                {
+                    "output_name": {
+                        "data": {...} or [...],  # Transform parameters
+                        "err": {...}             # Error transform parameters
+                    },
+                    "latents": array  # Optional, not used here
+                }
+
+            For single transforms, ``"data"`` is a dict: ``{"A": array, "b": array}``
+
+            For :class:`TransformSequence`, ``"data"`` is a tuple of dicts:
+            ``({"A": array}, {"b": array})``
+
+            .. deprecated::
+                Passing parameters in direct format (without the ``"data"``/``"err"``
+                wrapper) is deprecated and will be removed in a future version.
+
         names
-            A single string or a list of output names to predict. If None, predict all
-            outputs (default).
+            A single string or a list of output names to predict. If ``None``, predict
+            all outputs (default).
 
         Returns
         -------
         dict
             A dictionary of predicted output values, where the keys are the output
-            names.
+            names and values are arrays of shape ``(n_objects, output_size)``.
         """
 
         if latents.shape[-1] != self.latent_size:
@@ -229,6 +329,18 @@ class LuxModel(eqx.Module):
             names = list(self.outputs.keys())
         elif isinstance(names, str):
             names = [names]
+
+        # Check parameter format and warn if using deprecated direct format
+        is_nested_format = self._validate_pars_format(pars, context="predict_outputs")
+        if not is_nested_format:
+            warnings.warn(
+                "Passing parameters in direct format (e.g., {'flux': {'A': ...}}) is "
+                "deprecated. Please use the nested format returned by optimize(): "
+                "{'flux': {'data': {'A': ...}, 'err': {...}}}. "
+                "Direct format support will be removed in a future version.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
 
         # Extract data parameters, handling both nested and direct formats
         data_pars = self._extract_transform_pars(pars, transform_type="data")
@@ -305,7 +417,9 @@ class LuxModel(eqx.Module):
                     f"{output_name}:err:{param_name}", prior
                 )
 
-        outputs = self.predict_outputs(latents, data_pars, names=output_names)
+        # Wrap data_pars in nested format for predict_outputs
+        nested_pars = {k: {"data": v} for k, v in data_pars.items()}
+        outputs = self.predict_outputs(latents, nested_pars, names=output_names)
         for output_name in output_names:
             pred = outputs[output_name]
 

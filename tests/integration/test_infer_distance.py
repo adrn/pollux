@@ -59,7 +59,10 @@ def test_infer_distance():
     )
     model.register_output("label", trans)
 
-    pars = {"flux": {"A": truth["B"]}, "label": [{"A": truth["A"]}, {"b": true_dm}]}
+    pars = {
+        "flux": {"data": {"A": truth["B"]}},
+        "label": {"data": [{"A": truth["A"]}, {"b": true_dm}]},
+    }
     test_out = model.predict_outputs(truth["latents"], pars)
     assert jnp.allclose(test_out["flux"], truth["flux"], atol=1e-5)
     assert jnp.allclose(test_out["label"], truth["label"] + true_dm, atol=1e-5)

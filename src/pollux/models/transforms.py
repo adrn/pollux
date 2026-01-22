@@ -123,6 +123,15 @@ class AbstractSingleTransform(AbstractTransform):
         sig = inspect.signature(self.transform)
         self._param_names = tuple(sig.parameters.keys())[1:]  # skip first (latents)
 
+        # Validate that parameter names don't contain colons (reserved for internal use)
+        for param_name in self._param_names:
+            if ":" in param_name:
+                msg = (
+                    f"Transform parameter name '{param_name}' contains ':' which is "
+                    "reserved for internal parameter naming. Please rename this parameter."
+                )
+                raise ValueError(msg)
+
         # Set up vmap'd transform
         self._transform = (
             jax.vmap(self.transform, in_axes=(0, *([None] * len(self._param_names))))

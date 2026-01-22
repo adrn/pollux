@@ -413,3 +413,43 @@ class TestLuxModelParameterPackUnpack:
         )
         # With ignore_missing and no parameters, we get an empty dict (no outputs created)
         assert unpacked_skipped == {}
+
+
+class TestLuxModelValidation:
+    """Tests for input validation and deprecation warnings."""
+
+    def test_output_name_with_colon_raises(self):
+        """Output names containing colons should raise ValueError."""
+        model = plx.LuxModel(latent_size=4)
+        with pytest.raises(ValueError, match="contains ':'"):
+            model.register_output("flux:invalid", LinearTransform(output_size=8))
+
+    def test_direct_format_deprecation_warning(self, rng, model_config):
+        """Using direct parameter format should raise DeprecationWarning."""
+        model = plx.LuxModel(latent_size=model_config["n_latents"])
+        model.register_output(
+            "flux", LinearTransform(output_size=model_config["n_flux"])
+        )
+
+        latents = rng.random((model_config["n_stars"], model_config["n_latents"]))
+        A = rng.random((model_config["n_flux"], model_config["n_latents"]))
+
+        # Direct format (deprecated) - should warn
+        direct_pars = {"flux": {"A": A}}
+        with pytest.warns(DeprecationWarning, match="direct format"):
+            model.predict_outputs(latents, direct_pars)
+
+    def test_nested_format_no_warning(self, rng, model_config):
+        """Using nested parameter format should not raise any warnings."""
+        model = plx.LuxModel(latent_size=model_config["n_latents"])
+        model.register_output(
+            "flux", LinearTransform(output_size=model_config["n_flux"])
+        )
+
+        latents = rng.random((model_config["n_stars"], model_config["n_latents"]))
+        A = rng.random((model_config["n_flux"], model_config["n_latents"]))
+
+        # Nested format (correct) - should not warn
+        nested_pars = {"flux": {"data": {"A": A}}}
+        # If this raises a warning, pytest will fail due to filterwarnings=error
+        model.predict_outputs(latents, nested_pars)

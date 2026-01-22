@@ -112,8 +112,8 @@ def test_transform_sequence_priors():
     tmp = np.array([A @ latents[i] for i in range(n_stars)])
     tmp += b
 
-    # Test new parameter format with list of dicts
-    pars = {"mags": [{"A": A}, {"b": b}]}
+    # Test nested parameter format with list of dicts
+    pars = {"mags": {"data": [{"A": A}, {"b": b}]}}
 
     model = plx.LuxModel(latent_size=n_latents)
     model.register_output("mags", trans)
@@ -121,8 +121,8 @@ def test_transform_sequence_priors():
 
     assert np.allclose(out["mags"], tmp)
 
-    # Test new flat parameter format
-    pars_flat = {"mags": {"0:A": A, "1:b": b}}
+    # Test nested parameter format with flat dict
+    pars_flat = {"mags": {"data": {"0:A": A, "1:b": b}}}
     out_flat = model.predict_outputs(latents, pars_flat)
     assert np.allclose(out_flat["mags"], tmp)
 
