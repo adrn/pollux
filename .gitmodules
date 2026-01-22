@@ -1,0 +1,3 @@
+[submodule ".github/instructions"]
+	path = .github/instructions
+	url = git@github.com:adrn/instructions.git
