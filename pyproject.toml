@@ -171,7 +171,8 @@ ignore = [
   "PLR09",    # Too many <...>
   "PLR2004",  # Magic value used in comparison
   "ISC001",   # Conflicts with formatter
-  "B905"      # zip() without explicit strict
+  "B905",      # zip() without explicit strict
+
 ]
 # isort.required-imports = []
 # Uncomment if using a _compat.typing backport
