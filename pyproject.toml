@@ -64,6 +64,7 @@ docs = [
 ]
 dev = [
   {include-group = "test"},
+  {include-group = "docs"},
   "hatch",
   "ipykernel",
   "ipywidgets",
