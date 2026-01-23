@@ -6,6 +6,7 @@ import pytest
 
 import pollux as plx
 from pollux.models.transforms import (
+    AdditiveOffsetTransform,
     EquinoxNNTransform,
     FunctionTransform,
     LinearTransform,
@@ -893,3 +894,188 @@ def test_equinox_nn_transform_with_lux_model():
     result = model.predict_outputs(latents, pars)
 
     assert result["flux"].shape == (n_stars, n_flux)
+
+
+# --- AdditiveOffsetTransform tests ---
+
+
+def test_additive_offset_transform_basic():
+    """Test basic AdditiveOffsetTransform functionality."""
+    n_stars = 32
+    n_latents = 8
+    n_output = 4
+    rng = np.random.default_rng(42)
+
+    # Create transform with LinearTransform as base
+    base_trans = LinearTransform(output_size=n_output)
+    offset_trans = AdditiveOffsetTransform(
+        base_transform=base_trans,
+        offset_prior=dist.Normal(10.0, 2.0),
+    )
+
+    # Check output_size is inherited
+    assert offset_trans.output_size == n_output
+
+    # Generate data
+    latents = jnp.array(rng.random((n_stars, n_latents)))
+    A = jnp.array(rng.random((n_output, n_latents)))
+    offset = jnp.array(rng.normal(10.0, 2.0, size=(n_stars,)))
+
+    # Apply transform with "base:" prefix for base params
+    result = offset_trans.apply(latents, **{"base:A": A, "offset": offset})
+
+    # Verify shape
+    assert result.shape == (n_stars, n_output)
+
+    # Verify computation: base_output + offset[:, None]
+    base_output = base_trans.apply(latents, A=A)
+    expected = base_output + offset[:, None]
+    assert np.allclose(result, expected)
+
+
+def test_additive_offset_transform_priors():
+    """Test that AdditiveOffsetTransform generates correct priors."""
+    n_latents = 8
+    n_output = 4
+    n_stars = 100
+
+    base_trans = LinearTransform(output_size=n_output)
+    offset_trans = AdditiveOffsetTransform(
+        base_transform=base_trans,
+        offset_prior=dist.Normal(11.0, 3.0),
+    )
+
+    # Get expanded priors
+    priors = offset_trans.get_expanded_priors(latent_size=n_latents, data_size=n_stars)
+
+    # Should have base:A and offset
+    assert "base:A" in priors
+    assert "offset" in priors
+
+    # Check shapes
+    assert priors["base:A"].batch_shape == (n_output, n_latents)
+    assert priors["offset"].batch_shape == (n_stars,)
+
+    # Check offset prior parameters (access base distribution)
+    assert priors["offset"].base_dist.loc == 11.0
+    assert priors["offset"].base_dist.scale == 3.0
+
+
+def test_additive_offset_transform_requires_data_size():
+    """Test that AdditiveOffsetTransform raises error without data_size."""
+    base_trans = LinearTransform(output_size=4)
+    offset_trans = AdditiveOffsetTransform(base_transform=base_trans)
+
+    with pytest.raises(ValueError, match="requires data_size"):
+        offset_trans.get_expanded_priors(latent_size=8, data_size=None)
+
+
+def test_additive_offset_transform_pack_unpack():
+    """Test parameter packing and unpacking."""
+    n_output = 4
+    n_latents = 8
+    n_stars = 32
+    rng = np.random.default_rng(42)
+
+    base_trans = LinearTransform(output_size=n_output)
+    offset_trans = AdditiveOffsetTransform(base_transform=base_trans)
+
+    # Create flat parameters
+    A = jnp.array(rng.random((n_output, n_latents)))
+    offset = jnp.array(rng.random((n_stars,)))
+    flat_pars = {"base:A": A, "offset": offset}
+
+    # Unpack
+    nested = offset_trans.unpack_pars(flat_pars)
+    assert "base" in nested
+    assert "offset" in nested
+    assert "A" in nested["base"]
+    assert np.allclose(nested["base"]["A"], A)
+    assert np.allclose(nested["offset"], offset)
+
+    # Pack back
+    repacked = offset_trans.pack_pars(nested)
+    assert "base:A" in repacked
+    assert "offset" in repacked
+    assert np.allclose(repacked["base:A"], A)
+    assert np.allclose(repacked["offset"], offset)
+
+
+def test_additive_offset_transform_different_data_sizes():
+    """Test that offset adapts to different data sizes."""
+    n_latents = 8
+    n_output = 4
+
+    base_trans = LinearTransform(output_size=n_output)
+    offset_trans = AdditiveOffsetTransform(
+        base_transform=base_trans,
+        offset_prior=dist.Normal(11.0, 3.0),
+    )
+
+    # Training size
+    priors_train = offset_trans.get_expanded_priors(
+        latent_size=n_latents, data_size=1000
+    )
+    assert priors_train["offset"].batch_shape == (1000,)
+
+    # Test size (different)
+    priors_test = offset_trans.get_expanded_priors(latent_size=n_latents, data_size=500)
+    assert priors_test["offset"].batch_shape == (500,)
+
+
+def test_additive_offset_transform_with_lux_model():
+    """Test AdditiveOffsetTransform integration with Lux model."""
+
+    n_stars = 32
+    n_latents = 8
+    n_output = 3
+    rng = np.random.default_rng(42)
+
+    # Create model with AdditiveOffsetTransform
+    model = plx.Lux(latent_size=n_latents)
+    offset_trans = AdditiveOffsetTransform(
+        base_transform=LinearTransform(output_size=n_output),
+        offset_prior=dist.Normal(11.0, 3.0),
+    )
+    model.register_output("phot", offset_trans)
+
+    # Generate data
+    latents = jnp.array(rng.random((n_stars, n_latents)))
+    A = jnp.array(rng.random((n_output, n_latents)))
+    offset = jnp.array(rng.normal(11.0, 3.0, size=(n_stars,)))
+
+    # Test predict_outputs
+    pars = {"phot": {"data": {"base:A": A, "offset": offset}}}
+    result = model.predict_outputs(latents, pars)
+
+    assert result["phot"].shape == (n_stars, n_output)
+
+    # Verify computation
+    base_output = jnp.einsum("ij,nj->ni", A, latents)
+    expected = base_output + offset[:, None]
+    assert np.allclose(result["phot"], expected, atol=1e-5)
+
+
+def test_additive_offset_transform_broadcast():
+    """Test that offset broadcasts correctly to all output dimensions."""
+    n_stars = 10
+    n_latents = 4
+    n_output = 5
+    rng = np.random.default_rng(42)
+
+    base_trans = LinearTransform(output_size=n_output)
+    offset_trans = AdditiveOffsetTransform(base_transform=base_trans)
+
+    latents = jnp.array(rng.random((n_stars, n_latents)))
+    A = jnp.array(rng.random((n_output, n_latents)))
+    # Single scalar offset per star
+    offset = jnp.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0])
+
+    result = offset_trans.apply(latents, **{"base:A": A, "offset": offset})
+    base_output = base_trans.apply(latents, A=A)
+
+    # Each row should have the same offset added to all elements
+    for i in range(n_stars):
+        for j in range(n_output):
+            expected_val = base_output[i, j] + offset[i]
+            assert np.isclose(result[i, j], expected_val)

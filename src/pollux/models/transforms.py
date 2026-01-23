@@ -5,6 +5,7 @@ TODO: fix the docstrings and typing?
 __all__ = [
     "AbstractSingleTransform",
     "AbstractTransform",
+    "AdditiveOffsetTransform",
     "AffineTransform",
     "EquinoxNNTransform",
     "FunctionTransform",
@@ -1101,6 +1102,224 @@ class EquinoxNNTransform(AbstractTransform):
             elif not ignore_missing:
                 msg = f"Missing NN parameter: {path}"
                 raise ValueError(msg)
+        return result
+
+
+# ----
+
+
+class AdditiveOffsetTransform(eqx.Module):
+    """Transform that wraps a base transform and adds a per-star scalar offset.
+
+    This transform is useful for modeling per-object nuisance parameters like
+    distance modulus, where each object has its own offset that applies uniformly
+    to all output dimensions. This is a generalization of the :class:`AffineTransform`
+    and :class:`OffsetTransform` class, because here the offset can vary per object
+    instead of per output.
+
+    In other words, unlike :class:`OffsetTransform` which has a fixed offset vector of
+    shape ``(output_size,)``, this transform samples a separate scalar offset for each
+    object in the dataset, with shape ``(data_size,)``. The offset is then broadcast to
+    all output dimensions.
+
+    Parameters
+    ----------
+    base_transform
+        The underlying transform to wrap (e.g., :class:`LinearTransform`).
+    offset_prior
+        Prior distribution for the per-object offset. This will be expanded
+        to shape ``(data_size,)`` during inference.
+
+    Examples
+    --------
+    >>> import jax.numpy as jnp
+    >>> import numpyro.distributions as dist
+    >>> from pollux.models.transforms import AdditiveOffsetTransform, LinearTransform
+
+    Model apparent magnitudes as absolute magnitudes plus distance modulus:
+
+    >>> phot_trans = AdditiveOffsetTransform(
+    ...     base_transform=LinearTransform(output_size=3),  # 3 photometric bands
+    ...     offset_prior=dist.Normal(11.0, 3.0),  # Distance modulus prior
+    ... )
+
+    The offset adapts to the data size automatically:
+
+    >>> import pollux as plx
+    >>> model = plx.Lux(latent_size=8)
+    >>> model.register_output("phot", phot_trans)
+    >>> # During training with 1000 stars, offset has shape (1000,)
+    >>> # During testing with 500 stars, offset has shape (500,)
+
+    Notes
+    -----
+    The per-star offset is broadcast to all output dimensions, meaning the same
+    offset value is added to every element of the output for a given object.
+    This is appropriate for distance modulus (which shifts all magnitudes equally)
+    but may not be appropriate for other use cases.
+    """
+
+    base_transform: AbstractSingleTransform | TransformSequence
+    offset_prior: dist.Distribution = eqx.field(
+        default_factory=lambda: dist.Normal(0.0, 1.0)
+    )
+
+    @property
+    def output_size(self) -> int:
+        """Output size, inherited from the base transform."""
+        return self.base_transform.output_size
+
+    def get_expanded_priors(
+        self, latent_size: int, data_size: int | None = None
+    ) -> ParamPriorsT:
+        """Get expanded parameter priors including the per-star offset.
+
+        Parameters
+        ----------
+        latent_size
+            Size of the latent vector.
+        data_size
+            Number of objects in the dataset. Required for this transform.
+
+        Returns
+        -------
+        ParamPriorsT
+            Dictionary of priors including base transform priors (prefixed with
+            "base:") and the offset prior with shape ``(data_size,)``.
+
+        Raises
+        ------
+        ValueError
+            If ``data_size`` is None.
+        """
+        if data_size is None:
+            msg = (
+                "AdditiveOffsetTransform requires data_size to be specified. "
+                "This should be set automatically during model.optimize()."
+            )
+            raise ValueError(msg)
+
+        # Get base transform priors with "base:" prefix
+        base_priors = self.base_transform.get_expanded_priors(
+            latent_size=latent_size, data_size=data_size
+        )
+
+        priors = {}
+        for name, prior in base_priors.items():
+            priors[f"base:{name}"] = prior
+
+        # Add per-star offset prior
+        priors["offset"] = self.offset_prior.expand((data_size,))
+
+        return ImmutableMap(**priors)
+
+    def apply(self, latents: BatchedLatentsT, **params: Any) -> BatchedOutputT:
+        """Apply the base transform and add the per-star offset.
+
+        Parameters
+        ----------
+        latents
+            Input latent vectors of shape ``(n_samples, latent_size)``.
+        **params
+            Parameters including base transform parameters (prefixed with "base:")
+            and the "offset" parameter of shape ``(n_samples,)``.
+
+        Returns
+        -------
+        array
+            Output of shape ``(n_samples, output_size)``.
+        """
+        # Extract base transform parameters (strip "base:" prefix)
+        base_params = {}
+        for name, value in params.items():
+            if name.startswith("base:"):
+                base_params[name[5:]] = value
+
+        # Apply base transform
+        base_output = self.base_transform.apply(latents, **base_params)
+
+        # Add per-star offset (broadcast to all output dimensions)
+        offset = params.get("offset")
+        if offset is not None:
+            # offset shape: (n_samples,) -> (n_samples, 1) for broadcasting
+            base_output = base_output + offset[:, None]
+
+        return base_output
+
+    def unpack_pars(
+        self, flat_pars: dict[str, Any], ignore_missing: bool = False
+    ) -> dict[str, Any]:
+        """Unpack flat parameters into nested structure.
+
+        Parameters
+        ----------
+        flat_pars
+            Flat parameter dictionary with "base:..." prefixed keys and "offset".
+        ignore_missing
+            If True, skip missing parameters.
+
+        Returns
+        -------
+        dict
+            Nested parameter dictionary with "base" and "offset" keys.
+        """
+        # Extract base parameters
+        base_flat = {}
+        offset = None
+        for name, value in flat_pars.items():
+            if name.startswith("base:"):
+                base_flat[name[5:]] = value
+            elif name == "offset":
+                offset = value
+
+        # Unpack base transform parameters
+        base_nested = self.base_transform.unpack_pars(
+            base_flat, ignore_missing=ignore_missing
+        )
+
+        result: dict[str, Any] = {"base": base_nested}
+        if offset is not None:
+            result["offset"] = offset
+        elif not ignore_missing:
+            msg = "Missing parameter: offset"
+            raise ValueError(msg)
+
+        return result
+
+    def pack_pars(
+        self, nested_pars: dict[str, Any], ignore_missing: bool = False
+    ) -> dict[str, Any]:
+        """Pack nested parameters into flat structure.
+
+        Parameters
+        ----------
+        nested_pars
+            Nested parameter dictionary with "base" and "offset" keys.
+        ignore_missing
+            If True, skip missing parameters.
+
+        Returns
+        -------
+        dict
+            Flat parameter dictionary with "base:..." prefixed keys and "offset".
+        """
+        result = {}
+
+        # Pack base transform parameters
+        base_nested = nested_pars.get("base", {})
+        base_flat = self.base_transform.pack_pars(
+            base_nested, ignore_missing=ignore_missing
+        )
+        for name, value in base_flat.items():
+            result[f"base:{name}"] = value
+
+        # Add offset
+        if "offset" in nested_pars:
+            result["offset"] = nested_pars["offset"]
+        elif not ignore_missing:
+            msg = "Missing parameter: offset"
+            raise ValueError(msg)
+
         return result
 
 

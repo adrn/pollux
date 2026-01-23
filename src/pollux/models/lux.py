@@ -533,7 +533,9 @@ class Lux(eqx.Module):
 
         partial_pars: dict[str, Any] = {}
         if fixed_pars is not None:
-            packed_fixed_pars = self.pack_numpyro_pars(fixed_pars)
+            # Use ignore_missing=True since fixed_pars typically contains only a subset
+            # of parameters (the ones we want to fix during optimization)
+            packed_fixed_pars = self.pack_numpyro_pars(fixed_pars, ignore_missing=True)
             partial_pars["fixed_pars"] = packed_fixed_pars
 
         if names is not None:
