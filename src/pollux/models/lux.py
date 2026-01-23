@@ -695,5 +695,19 @@ class Lux(eqx.Module):
         return packed
 
 
-# Deprecated alias for backwards compatibility
-LuxModel = Lux
+class LuxModel(Lux):
+    """Deprecated alias for Lux class.
+
+    .. deprecated::
+        Use :class:`Lux` instead. ``LuxModel`` will be removed in a future version.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        """Initialize LuxModel with deprecation warning."""
+        warnings.warn(
+            "The `LuxModel` class is deprecated and will be removed in a future "
+            "version. Please use the `Lux` class instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        super().__init__(*args, **kwargs)
