@@ -107,6 +107,26 @@ class AbstractSingleTransform(AbstractTransform):
     """Base class providing common functionality for atomic transforms.
 
     "Single" transforms apply a single operation to convert latent vectors to outputs.
+
+    Parameters
+    ----------
+    output_size
+        Size of the output vector.
+    param_priors
+        Prior distributions for transform parameters.
+    param_shapes
+        Shape specifications for transform parameters.
+    transform
+        The transform function. Should take latents as the first argument,
+        followed by any parameters.
+    vmap
+        Whether to automatically vectorize the transform over the batch dimension.
+        If True (default), the transform function should be written for a single
+        sample (latents shape ``(latent_size,)``), and JAX's ``vmap`` will be applied
+        to handle batches. Parameters are shared across all samples.
+        If False, the transform function must handle batching itself. This is
+        useful when parameters are per-sample (e.g., per-star nuisance parameters)
+        or when the function has custom batching requirements.
     """
 
     param_priors: ParamPriorsT = eqx.field(converter=ImmutableMap)
@@ -434,13 +454,32 @@ class TransformSequence(AbstractTransform):
 
 
 class FunctionTransform(AbstractSingleTransform):
-    """Function transformation using a user-defined function.
+    """Custom transformation using a user-defined function.
 
     This transform allows for arbitrary transformations defined by the user.
+    It is particularly useful for modeling complex relationships or per-sample
+    nuisance parameters.
+
+    Parameters
+    ----------
+    output_size
+        Size of the output vector.
+    transform
+        The transform function. Should take latents as the first argument,
+        followed by any parameters defined in ``param_priors``.
+    param_priors
+        Prior distributions for transform parameters.
+    param_shapes
+        Shape specifications for transform parameters.
+    vmap
+        Whether to automatically vectorize the transform over the batch dimension.
+        Set to False when parameters are per-sample (e.g., per-star continuum
+        corrections) and the function handles batching internally.
 
     Examples
     --------
-    TODO: add in quadrature
+    See the "Inferring Continuum Model Parameters" tutorial for an example of
+    using FunctionTransform with per-star parameters and ``vmap=False``.
     """
 
 
