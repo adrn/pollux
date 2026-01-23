@@ -4,7 +4,7 @@ import pytest
 import pollux as plx
 
 
-@pytest.fixture()
+@pytest.fixture
 def rng():
     return np.random.default_rng(42)
 
