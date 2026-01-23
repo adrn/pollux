@@ -10,8 +10,11 @@ __all__ = [
     "LinearTransform",
     "NoOpTransform",
     "OffsetTransform",
+    "ParamPriorsT",
+    "ParamShapesT",
     "PolyFeatureTransform",
     "QuadraticTransform",
+    "ShapeSpec",
     "TransformSequence",
 ]
 
@@ -42,15 +45,66 @@ from ..typing import (
 
 @dataclass(frozen=True)
 class ShapeSpec:
-    """Represents a shape that may contain named dimensions."""
+    """Specification for parameter shapes using named dimensions.
+
+    ShapeSpec allows you to define parameter shapes that depend on dimensions
+    only known at model construction time (like latent_size). Named dimensions
+    are resolved to concrete integers when the model is built.
+
+    Parameters
+    ----------
+    dims
+        Tuple of dimension names (strings) or concrete sizes (integers).
+
+    Available Named Dimensions
+    --------------------------
+    ``"output_size"``
+        The output dimension of the transform.
+    ``"latent_size"``
+        The latent space dimension (set when registering with a model).
+    ``"data_size"``
+        The number of samples in the batch (useful for per-sample parameters).
+    ``"one"``
+        Always resolves to 1 (useful for bias terms).
+
+    Examples
+    --------
+    Define a weight matrix shape that depends on output and latent dimensions:
+
+    >>> from pollux.models.transforms import ShapeSpec
+    >>> shape = ShapeSpec(("output_size", "latent_size"))
+    >>> shape.resolve({"output_size": 128, "latent_size": 8})
+    (128, 8)
+
+    Define a bias vector shape using the special "one" dimension:
+
+    >>> bias_shape = ShapeSpec(("output_size", "one"))
+    >>> bias_shape.resolve({"output_size": 128})
+    (128, 1)
+
+    Use with FunctionTransform to define custom transforms:
+
+    >>> from xmmutablemap import ImmutableMap
+    >>> import numpyro.distributions as dist
+    >>> param_shapes = ImmutableMap({"A": ShapeSpec(("output_size", "latent_size"))})
+    >>> param_priors = ImmutableMap({"A": dist.Normal(0, 1)})
+
+    """
 
     dims: tuple[str | int, ...]
 
     def resolve(self, dim_sizes: dict[str, int | None]) -> tuple[int, ...]:
         """Convert named dimensions to concrete sizes.
 
-        Uses the provided dimension size mappings to convert any string dimension
-        names to their integer sizes.
+        Parameters
+        ----------
+        dim_sizes
+            Mapping from dimension names to their integer sizes.
+
+        Returns
+        -------
+        tuple[int, ...]
+            The resolved shape as a tuple of integers.
         """
         dim_sizes = dim_sizes.copy()
         dim_sizes["one"] = 1
@@ -60,10 +114,15 @@ class ShapeSpec:
         )
 
 
+#: Type alias for parameter priors: maps parameter names to distributions.
+#: Used with :class:`FunctionTransform` to specify priors for learnable parameters.
 ParamPriorsT: TypeAlias = ImmutableMap[str, dist.Distribution]
+
+#: Type alias for parameter shapes: maps parameter names to shape specifications.
+#: Shapes can be :class:`ShapeSpec` (for named dimensions) or concrete tuples.
 ParamShapesT: TypeAlias = ImmutableMap[str, ShapeSpec | tuple[int, ...]]
 
-# Tuples of parameters for TransformSequence
+# Internal: Tuples of parameters for TransformSequence
 ParamPriorsTupleT: TypeAlias = tuple[ParamPriorsT, ...]
 ParamShapesTupleT: TypeAlias = tuple[ParamShapesT, ...]
 
@@ -468,9 +527,12 @@ class FunctionTransform(AbstractSingleTransform):
         The transform function. Should take latents as the first argument,
         followed by any parameters defined in ``param_priors``.
     param_priors
-        Prior distributions for transform parameters.
+        Prior distributions for transform parameters. Use :data:`ParamPriorsT`
+        (an ``ImmutableMap[str, dist.Distribution]``).
     param_shapes
-        Shape specifications for transform parameters.
+        Shape specifications for transform parameters. Use :data:`ParamShapesT`
+        (an ``ImmutableMap[str, ShapeSpec | tuple[int, ...]]``). Use
+        :class:`ShapeSpec` when shapes depend on ``latent_size`` or ``data_size``.
     vmap
         Whether to automatically vectorize the transform over the batch dimension.
         Set to False when parameters are per-sample (e.g., per-star continuum
@@ -478,7 +540,27 @@ class FunctionTransform(AbstractSingleTransform):
 
     Examples
     --------
-    See the "Inferring Continuum Model Parameters" tutorial for an example of
+    Define a custom linear transform with learnable weights:
+
+    >>> import jax.numpy as jnp
+    >>> import numpyro.distributions as dist
+    >>> from xmmutablemap import ImmutableMap
+    >>> from pollux.models.transforms import FunctionTransform, ShapeSpec
+    >>>
+    >>> def my_transform(z, A):
+    ...     return jnp.dot(A, z)
+    >>>
+    >>> custom = FunctionTransform(
+    ...     output_size=128,
+    ...     transform=my_transform,
+    ...     param_priors=ImmutableMap({"A": dist.Normal(0, 1)}),
+    ...     param_shapes=ImmutableMap({"A": ShapeSpec(("output_size", "latent_size"))}),
+    ... )
+
+    The parameter ``A`` will have shape ``(128, latent_size)`` where ``latent_size``
+    is determined when the transform is registered with a model.
+
+    See also the "Inferring Continuum Model Parameters" tutorial for an example of
     using FunctionTransform with per-star parameters and ``vmap=False``.
     """
 
