@@ -33,7 +33,7 @@ def test_linear_transform():
 
     # Test with prior
     trans_prior = LinearTransform(
-        output_size=n_out, param_priors={"A": dist.Normal(0.0, 1.0)}
+        output_size=n_out, priors={"A": dist.Normal(0.0, 1.0)}
     )
     result_prior = trans_prior.apply(latents, A=A)
     assert np.allclose(result_prior, expected)
@@ -55,7 +55,7 @@ def test_offset_transform():
 
     # Test with prior
     trans_prior = OffsetTransform(
-        output_size=n_stars, vmap=False, param_priors={"b": dist.Normal(0.0, 1.0)}
+        output_size=n_stars, vmap=False, priors={"b": dist.Normal(0.0, 1.0)}
     )
     result_prior = trans_prior.apply(x, b=b)
     assert np.allclose(result_prior, expected)
@@ -99,11 +99,11 @@ def test_transform_sequence_priors():
 
     trans = TransformSequence(
         transforms=(
-            LinearTransform(output_size=8, param_priors={"A": dist.Laplace()}),
+            LinearTransform(output_size=8, priors={"A": dist.Laplace()}),
             OffsetTransform(
                 output_size=n_stars,
                 vmap=False,
-                param_priors={"b": dist.Normal(11.0, 3.0)},
+                priors={"b": dist.Normal(11.0, 3.0)},
             ),
         )
     )
@@ -143,17 +143,17 @@ def test_transform_sequence_new_parameter_structure():
         )
     )
 
-    # Test that param_priors and param_shapes are properly stored as tuples
-    assert len(trans.param_priors) == 2
-    assert len(trans.param_shapes) == 2
+    # Test that priors and shapes are properly stored as tuples
+    assert len(trans.priors) == 2
+    assert len(trans.shapes) == 2
 
     # First transform (LinearTransform) should have 'A' parameter
-    assert "A" in trans.param_priors[0]
-    assert "A" in trans.param_shapes[0]
+    assert "A" in trans.priors[0]
+    assert "A" in trans.shapes[0]
 
     # Second transform (OffsetTransform) should have 'b' parameter
-    assert "b" in trans.param_priors[1]
-    assert "b" in trans.param_shapes[1]
+    assert "b" in trans.priors[1]
+    assert "b" in trans.shapes[1]
 
 
 def test_transform_sequence_parameter_validation():
@@ -225,8 +225,8 @@ def test_function_transform_in_sequence():
     func_trans = FunctionTransform(
         output_size=n_flux,
         transform=custom_transform,
-        param_priors={"p1": dist.Normal(0.0, 1.0), "p2": dist.Normal(0.0, 1.0)},
-        param_shapes={"p1": (n_stars,), "p2": (n_stars,)},
+        priors={"p1": dist.Normal(0.0, 1.0), "p2": dist.Normal(0.0, 1.0)},
+        shapes={"p1": (n_stars,), "p2": (n_stars,)},
         vmap=False,
     )
 
@@ -444,8 +444,8 @@ def test_transform_sequence_three_transforms_pack_unpack():
     func_trans = FunctionTransform(
         output_size=n_out,
         transform=simple_func,
-        param_priors={"scale": dist.Normal(1.0, 0.1)},
-        param_shapes={"scale": (1,)},
+        priors={"scale": dist.Normal(1.0, 0.1)},
+        shapes={"scale": (1,)},
         vmap=False,
     )
 
@@ -487,13 +487,13 @@ def test_parameter_name_with_colon_raises():
     def bad_transform(x, bad_param):
         return x + bad_param
 
-    # This should raise because of the colon in param_priors key
+    # This should raise because of the colon in priors key
     with pytest.raises(ValueError, match="contains ':'"):
         FunctionTransform(
             output_size=4,
             transform=bad_transform,
-            param_priors={"bad:param": dist.Normal(0.0, 1.0)},
-            param_shapes={"bad:param": (4,)},
+            priors={"bad:param": dist.Normal(0.0, 1.0)},
+            shapes={"bad:param": (4,)},
         )
 
 
@@ -565,8 +565,8 @@ def test_poly_feature_transform_no_learnable_params():
     """Test that PolyFeatureTransform has no learnable parameters."""
     trans = PolyFeatureTransform(degree=2)
 
-    # param_priors should be empty
-    assert len(trans.param_priors) == 0
+    # priors should be empty
+    assert len(trans.priors) == 0
 
     # get_expanded_priors should return empty
     priors = trans.get_expanded_priors(latent_size=8, data_size=100)

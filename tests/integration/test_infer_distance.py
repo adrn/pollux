@@ -48,12 +48,12 @@ def test_infer_distance():
     trans = plx.models.TransformSequence(
         transforms=(
             plx.models.LinearTransform(
-                output_size=n_labels, param_priors={"A": dist.Normal()}
+                output_size=n_labels, priors={"A": dist.Normal()}
             ),
             plx.models.OffsetTransform(
                 output_size=n_stars,
                 vmap=False,
-                param_priors={"b": dist.Normal(11.0, 3.0)},
+                priors={"b": dist.Normal(11.0, 3.0)},
             ),
         )
     )

@@ -20,6 +20,7 @@ __all__ = [
 
 import abc
 import inspect
+import warnings
 from dataclasses import dataclass
 from itertools import combinations_with_replacement
 from math import comb
@@ -86,8 +87,8 @@ class ShapeSpec:
 
     >>> from xmmutablemap import ImmutableMap
     >>> import numpyro.distributions as dist
-    >>> param_shapes = ImmutableMap({"A": ShapeSpec(("output_size", "latent_size"))})
-    >>> param_priors = ImmutableMap({"A": dist.Normal(0, 1)})
+    >>> shapes = ImmutableMap({"A": ShapeSpec(("output_size", "latent_size"))})
+    >>> priors = ImmutableMap({"A": dist.Normal(0, 1)})
 
     """
 
@@ -136,10 +137,10 @@ class AbstractTransform(eqx.Module):
 
     output_size: int
 
-    # TODO: param_priors and param_shapes must be defined on any abstract subclass, but
+    # TODO: priors and shapes must be defined on any abstract subclass, but
     # there is no way to define an abstract class property
-    # param_priors: ParamPriorsT | ParamPriorsTupleT
-    # param_shapes: ParamShapesT | ParamShapesTupleT
+    # priors: ParamPriorsT | ParamPriorsTupleT
+    # shapes: ParamShapesT | ParamShapesTupleT
 
     @abc.abstractmethod
     def apply(self, latents: BatchedLatentsT, **pars: Any) -> BatchedOutputT:
@@ -171,9 +172,9 @@ class AbstractSingleTransform(AbstractTransform):
     ----------
     output_size
         Size of the output vector.
-    param_priors
+    priors
         Prior distributions for transform parameters.
-    param_shapes
+    shapes
         Shape specifications for transform parameters.
     transform
         The transform function. Should take latents as the first argument,
@@ -186,15 +187,28 @@ class AbstractSingleTransform(AbstractTransform):
         If False, the transform function must handle batching itself. This is
         useful when parameters are per-sample (e.g., per-star nuisance parameters)
         or when the function has custom batching requirements.
+    param_priors
+        Deprecated. Use ``priors`` instead.
+    param_shapes
+        Deprecated. Use ``shapes`` instead.
     """
 
-    param_priors: ParamPriorsT = eqx.field(converter=ImmutableMap)
-    param_shapes: ParamShapesT = eqx.field(converter=ImmutableMap)
     transform: TransformFuncT
+    priors: ParamPriorsT = eqx.field(default=ImmutableMap(), converter=ImmutableMap)
+    shapes: ParamShapesT = eqx.field(default=ImmutableMap(), converter=ImmutableMap)
 
     _param_names: tuple[str, ...] = eqx.field(init=False, repr=False)
     _transform: TransformFuncT = eqx.field(init=False, repr=False)
     vmap: bool = True
+
+    # TODO(deprecation): Remove param_priors field after deprecation period
+    param_priors: ParamPriorsT | None = eqx.field(
+        default=None, converter=lambda x: ImmutableMap(x) if x is not None else None
+    )
+    # TODO(deprecation): Remove param_shapes field after deprecation period
+    param_shapes: ParamShapesT | None = eqx.field(
+        default=None, converter=lambda x: ImmutableMap(x) if x is not None else None
+    )
 
     def __post_init__(self) -> None:
         """Initialize transform parameters after object creation.
@@ -202,6 +216,30 @@ class AbstractSingleTransform(AbstractTransform):
         Extracts parameter names from the transform function signature and sets up
         vectorized application if requested.
         """
+        # --- BEGIN DEPRECATION BLOCK: param_priors -> priors ---
+        # TODO(deprecation): Remove this block after deprecation period
+        if self.param_priors is not None:
+            warnings.warn(
+                "The 'param_priors' parameter is deprecated. Use 'priors' instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            # Override priors with param_priors (user explicitly provided deprecated arg)
+            object.__setattr__(self, "priors", self.param_priors)
+        # --- END DEPRECATION BLOCK ---
+
+        # --- BEGIN DEPRECATION BLOCK: param_shapes -> shapes ---
+        # TODO(deprecation): Remove this block after deprecation period
+        if self.param_shapes is not None:
+            warnings.warn(
+                "The 'param_shapes' parameter is deprecated. Use 'shapes' instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            # Override shapes with param_shapes (user explicitly provided deprecated arg)
+            object.__setattr__(self, "shapes", self.param_shapes)
+        # --- END DEPRECATION BLOCK ---
+
         sig = inspect.signature(self.transform)
         self._param_names = tuple(sig.parameters.keys())[1:]  # skip first (latents)
 
@@ -214,15 +252,15 @@ class AbstractSingleTransform(AbstractTransform):
                 )
                 raise ValueError(msg)
 
-        # Also validate param_priors and param_shapes keys
-        for param_name in self.param_priors:
+        # Validate priors and shapes keys don't contain colons
+        for param_name in self.priors:
             if ":" in param_name:
                 msg = (
                     f"Parameter prior name '{param_name}' contains ':' which is "
                     "reserved for internal parameter naming. Please rename this parameter."
                 )
                 raise ValueError(msg)
-        for param_name in self.param_shapes:
+        for param_name in self.shapes:
             if ":" in param_name:
                 msg = (
                     f"Parameter shape name '{param_name}' contains ':' which is "
@@ -258,10 +296,10 @@ class AbstractSingleTransform(AbstractTransform):
         Expands the parameter prior distributions to the concrete shapes needed
         for the transform, based on latent size and optional data size.
         """
-        priors = {}
-        for name, prior in self.param_priors.items():
-            if name in self.param_shapes:
-                shapespec = self.param_shapes[name]
+        expanded_priors = {}
+        for name, prior in self.priors.items():
+            if name in self.shapes:
+                shapespec = self.shapes[name]
                 shape = (
                     shapespec.resolve(
                         {
@@ -273,10 +311,10 @@ class AbstractSingleTransform(AbstractTransform):
                     if isinstance(shapespec, ShapeSpec)
                     else shapespec
                 )
-                priors[name] = prior.expand(shape)
+                expanded_priors[name] = prior.expand(shape)
             else:
-                priors[name] = prior
-        return ImmutableMap(**priors)
+                expanded_priors[name] = prior
+        return ImmutableMap(**expanded_priors)
 
     def unpack_pars(
         self, flat_pars: dict[str, Any], ignore_missing: bool = False
@@ -321,20 +359,48 @@ class TransformSequence(AbstractTransform):
         self.transforms = transforms
 
     @property
-    def param_priors(self) -> ParamPriorsTupleT:
+    def priors(self) -> ParamPriorsTupleT:
         """Collect parameter priors from all transforms in the sequence."""
         return tuple(
-            getattr(transform, "param_priors", ImmutableMap())
+            getattr(transform, "priors", ImmutableMap())
             for transform in self.transforms
         )
 
+    # --- BEGIN DEPRECATION BLOCK: param_priors -> priors ---
+    # TODO(deprecation): Remove this property after deprecation period
     @property
-    def param_shapes(self) -> ParamShapesTupleT:
+    def param_priors(self) -> ParamPriorsTupleT:
+        """Deprecated. Use ``priors`` instead."""
+        warnings.warn(
+            "The 'param_priors' property is deprecated. Use 'priors' instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.priors
+
+    # --- END DEPRECATION BLOCK ---
+
+    @property
+    def shapes(self) -> ParamShapesTupleT:
         """Collect parameter shapes from all transforms in the sequence."""
         return tuple(
-            getattr(transform, "param_shapes", ImmutableMap())
+            getattr(transform, "shapes", ImmutableMap())
             for transform in self.transforms
         )
+
+    # --- BEGIN DEPRECATION BLOCK: param_shapes -> shapes ---
+    # TODO(deprecation): Remove this property after deprecation period
+    @property
+    def param_shapes(self) -> ParamShapesTupleT:
+        """Deprecated. Use ``shapes`` instead."""
+        warnings.warn(
+            "The 'param_shapes' property is deprecated. Use 'shapes' instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.shapes
+
+    # --- END DEPRECATION BLOCK ---
 
     def apply(
         self, latents: BatchedLatentsT, *args: dict[str, Any], **kwargs: Any
@@ -525,11 +591,11 @@ class FunctionTransform(AbstractSingleTransform):
         Size of the output vector.
     transform
         The transform function. Should take latents as the first argument,
-        followed by any parameters defined in ``param_priors``.
-    param_priors
+        followed by any parameters defined in ``priors``.
+    priors
         Prior distributions for transform parameters. Use :data:`ParamPriorsT`
         (an ``ImmutableMap[str, dist.Distribution]``).
-    param_shapes
+    shapes
         Shape specifications for transform parameters. Use :data:`ParamShapesT`
         (an ``ImmutableMap[str, ShapeSpec | tuple[int, ...]]``). Use
         :class:`ShapeSpec` when shapes depend on ``latent_size`` or ``data_size``.
@@ -553,8 +619,8 @@ class FunctionTransform(AbstractSingleTransform):
     >>> custom = FunctionTransform(
     ...     output_size=128,
     ...     transform=my_transform,
-    ...     param_priors=ImmutableMap({"A": dist.Normal(0, 1)}),
-    ...     param_shapes=ImmutableMap({"A": ShapeSpec(("output_size", "latent_size"))}),
+    ...     priors=ImmutableMap({"A": dist.Normal(0, 1)}),
+    ...     shapes=ImmutableMap({"A": ShapeSpec(("output_size", "latent_size"))}),
     ... )
 
     The parameter ``A`` will have shape ``(128, latent_size)`` where ``latent_size``
@@ -578,8 +644,8 @@ class NoOpTransform(AbstractSingleTransform):
 
     output_size: int = 0
     transform: TransformFuncT = _noop_transform
-    param_priors: ParamPriorsT = ImmutableMap()
-    param_shapes: ParamShapesT = ImmutableMap()
+    priors: ParamPriorsT = ImmutableMap()
+    shapes: ParamShapesT = ImmutableMap()
 
 
 # ----
@@ -710,12 +776,40 @@ class PolyFeatureTransform(AbstractTransform):
     include_bias: bool = True
 
     # No learnable parameters
-    param_priors: ParamPriorsT = ImmutableMap()
-    param_shapes: ParamShapesT = ImmutableMap()
+    priors: ParamPriorsT = ImmutableMap()
+    shapes: ParamShapesT = ImmutableMap()
 
     # output_size is computed dynamically based on input size
     # We set a placeholder that will be overridden in apply()
     output_size: int = eqx.field(default=0)
+
+    # --- BEGIN DEPRECATION BLOCK: param_priors -> priors ---
+    # TODO(deprecation): Remove this property after deprecation period
+    @property
+    def param_priors(self) -> ParamPriorsT:
+        """Deprecated. Use ``priors`` instead."""
+        warnings.warn(
+            "The 'param_priors' property is deprecated. Use 'priors' instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.priors
+
+    # --- END DEPRECATION BLOCK ---
+
+    # --- BEGIN DEPRECATION BLOCK: param_shapes -> shapes ---
+    # TODO(deprecation): Remove this property after deprecation period
+    @property
+    def param_shapes(self) -> ParamShapesT:
+        """Deprecated. Use ``shapes`` instead."""
+        warnings.warn(
+            "The 'param_shapes' property is deprecated. Use 'shapes' instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.shapes
+
+    # --- END DEPRECATION BLOCK ---
 
     def apply(self, latents: BatchedLatentsT, **_pars: Any) -> BatchedOutputT:
         """Apply polynomial feature expansion.
@@ -788,11 +882,11 @@ class LinearTransform(AbstractSingleTransform):
     """
 
     transform: TransformFuncT = _linear_transform
-    param_priors: ParamPriorsT = eqx.field(
+    priors: ParamPriorsT = eqx.field(
         default=ImmutableMap({"A": dist.Normal(0, 1)}),
         converter=ImmutableMap,
     )
-    param_shapes: ParamShapesT = ImmutableMap(
+    shapes: ParamShapesT = ImmutableMap(
         {"A": ShapeSpec(("output_size", "latent_size"))}
     )
 
@@ -815,11 +909,11 @@ class OffsetTransform(AbstractSingleTransform):
     """
 
     transform: TransformFuncT = _offset_transform
-    param_priors: ParamPriorsT = eqx.field(
+    priors: ParamPriorsT = eqx.field(
         default=ImmutableMap({"b": dist.Normal(0, 1)}),
         converter=ImmutableMap,
     )
-    param_shapes: ParamShapesT = ImmutableMap({"b": ShapeSpec(("output_size", "one"))})
+    shapes: ParamShapesT = ImmutableMap({"b": ShapeSpec(("output_size", "one"))})
 
 
 # ----
@@ -841,11 +935,11 @@ class AffineTransform(AbstractSingleTransform):
     """
 
     transform: TransformFuncT = _affine_transform
-    param_priors: ParamPriorsT = eqx.field(
+    priors: ParamPriorsT = eqx.field(
         default=ImmutableMap({"A": dist.Normal(0, 1), "b": dist.Normal(0, 1)}),
         converter=ImmutableMap,
     )
-    param_shapes: ParamShapesT = ImmutableMap(
+    shapes: ParamShapesT = ImmutableMap(
         {
             "A": ShapeSpec(("output_size", "latent_size")),
             "b": ShapeSpec(("output_size", "one")),
@@ -872,13 +966,13 @@ class QuadraticTransform(AbstractSingleTransform):
     """
 
     transform: TransformFuncT = _quadratic_transform
-    param_priors: ParamPriorsT = eqx.field(
+    priors: ParamPriorsT = eqx.field(
         default=ImmutableMap(
             {"Q": dist.Normal(0, 1), "A": dist.Normal(0, 1), "b": dist.Normal(0, 1)}
         ),
         converter=ImmutableMap,
     )
-    param_shapes: ParamShapesT = ImmutableMap(
+    shapes: ParamShapesT = ImmutableMap(
         {
             "Q": ShapeSpec(("output_size", "latent_size", "latent_size")),
             "A": ShapeSpec(("output_size", "latent_size")),
@@ -1099,13 +1193,41 @@ class EquinoxNNTransform(AbstractTransform):
         default_factory=lambda: dist.Normal(0.0, 1.0)
     )
 
-    # No static param_priors or param_shapes - these are computed dynamically
-    param_priors: ParamPriorsT = eqx.field(default_factory=lambda: ImmutableMap())
-    param_shapes: ParamShapesT = eqx.field(default_factory=lambda: ImmutableMap())
+    # No static priors or shapes - these are computed dynamically
+    priors: ParamPriorsT = eqx.field(default_factory=lambda: ImmutableMap())
+    shapes: ParamShapesT = eqx.field(default_factory=lambda: ImmutableMap())
 
     # Internal state - computed in get_expanded_priors
     _param_paths: tuple[str, ...] = eqx.field(default=(), repr=False)
     _template_nn: Any = eqx.field(default=None, repr=False)  # eqx.Module
+
+    # --- BEGIN DEPRECATION BLOCK: param_priors -> priors ---
+    # TODO(deprecation): Remove this property after deprecation period
+    @property
+    def param_priors(self) -> ParamPriorsT:
+        """Deprecated. Use ``priors`` instead."""
+        warnings.warn(
+            "The 'param_priors' property is deprecated. Use 'priors' instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.priors
+
+    # --- END DEPRECATION BLOCK ---
+
+    # --- BEGIN DEPRECATION BLOCK: param_shapes -> shapes ---
+    # TODO(deprecation): Remove this property after deprecation period
+    @property
+    def param_shapes(self) -> ParamShapesT:
+        """Deprecated. Use ``shapes`` instead."""
+        warnings.warn(
+            "The 'param_shapes' property is deprecated. Use 'shapes' instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.shapes
+
+    # --- END DEPRECATION BLOCK ---
 
     def get_expanded_priors(
         self, latent_size: int, data_size: int | None = None

@@ -41,8 +41,8 @@ def test_infer_error_intrinsic_scatter():
     err_trans = plx.models.FunctionTransform(
         output_size=n_flux,
         transform=lambda err, s: jnp.sqrt(err**2 + s**2),
-        param_priors={"s": dist.HalfNormal(0.1).expand((n_flux,))},
-        param_shapes={},
+        priors={"s": dist.HalfNormal(0.1).expand((n_flux,))},
+        shapes={},
         vmap=False,
     )
 

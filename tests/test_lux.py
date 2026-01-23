@@ -82,8 +82,8 @@ def transform_sequence_with_err_model(model_config):
     err_trans = FunctionTransform(
         output_size=model_config["n_flux"],
         transform=scale_func,
-        param_priors={"scale": dist.Normal(1.0, 0.1)},
-        param_shapes={"scale": (1,)},
+        priors={"scale": dist.Normal(1.0, 0.1)},
+        shapes={"scale": (1,)},
         vmap=False,
     )
 
