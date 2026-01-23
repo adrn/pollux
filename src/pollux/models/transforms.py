@@ -1,6 +1,4 @@
-"""
-TODO: fix the docstrings and typing?
-"""
+"""Transforms for mapping latent vectors to output quantities."""
 
 __all__ = [
     "AbstractSingleTransform",
@@ -203,8 +201,8 @@ class AbstractSingleTransform(AbstractTransform):
 
     def unpack_pars(
         self, flat_pars: dict[str, Any], ignore_missing: bool = False
-    ) -> dict[str, Any]:  # TODO: fix Any types
-        """For compatibility with TransformSequence."""
+    ) -> dict[str, Any]:
+        """Unpack parameters (identity for single transforms)."""
         for param_name in self._param_names:
             if param_name not in flat_pars and not ignore_missing:
                 msg = f"Missing value in transform: {param_name}"
@@ -213,8 +211,8 @@ class AbstractSingleTransform(AbstractTransform):
 
     def pack_pars(
         self, nested_pars: dict[str, Any], ignore_missing: bool = False
-    ) -> dict[str, Any]:  # TODO: fix Any types
-        """For compatibility with TransformSequence."""
+    ) -> dict[str, Any]:
+        """Pack parameters (identity for single transforms)."""
         for param_name in self._param_names:
             if param_name not in nested_pars and not ignore_missing:
                 msg = f"Missing value in transform: {param_name}"

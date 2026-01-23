@@ -635,7 +635,7 @@ class Lux(eqx.Module):
 
     def pack_numpyro_pars(
         self,
-        pars: dict[str, Any],  # TODO: update Any to real types
+        pars: UnpackedParamsT,
         ignore_missing: bool = False,
     ) -> PackedParamsT:
         """Pack parameters into a flat dictionary keyed on numpyro names.

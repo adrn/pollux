@@ -105,6 +105,7 @@ filterwarnings = [
   "error",
   "ignore:jax\\.core\\.call_p is deprecated:DeprecationWarning",
   "ignore:jax\\.core\\.closed_call_p is deprecated:DeprecationWarning",
+  "ignore:The `LuxModel` class is deprecated:DeprecationWarning",
 ]
 log_cli_level = "INFO"
 testpaths = ["src", "docs", "tests"]
