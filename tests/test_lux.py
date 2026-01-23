@@ -11,13 +11,13 @@ from pollux.models.transforms import (
 )
 
 
-@pytest.fixture()
+@pytest.fixture
 def rng():
     """Random number generator for consistent test results."""
     return np.random.default_rng(42)
 
 
-@pytest.fixture()
+@pytest.fixture
 def model_config():
     """Basic model configuration used across tests."""
     return {
@@ -28,7 +28,7 @@ def model_config():
     }
 
 
-@pytest.fixture()
+@pytest.fixture
 def single_transform_model(model_config):
     """LuxModel with a single LinearTransform for testing basic functionality."""
     model = plx.LuxModel(latent_size=model_config["n_latents"])
@@ -36,7 +36,7 @@ def single_transform_model(model_config):
     return model
 
 
-@pytest.fixture()
+@pytest.fixture
 def single_transform_with_err_model(model_config):
     """LuxModel with LinearTransform and OffsetTransform error transform."""
     model = plx.LuxModel(latent_size=model_config["n_latents"])
@@ -48,7 +48,7 @@ def single_transform_with_err_model(model_config):
     return model
 
 
-@pytest.fixture()
+@pytest.fixture
 def transform_sequence_model(model_config):
     """LuxModel with a TransformSequence (LinearTransform + OffsetTransform)."""
     model = plx.LuxModel(latent_size=model_config["n_latents"])
@@ -62,7 +62,7 @@ def transform_sequence_model(model_config):
     return model
 
 
-@pytest.fixture()
+@pytest.fixture
 def transform_sequence_with_err_model(model_config):
     """LuxModel with TransformSequence and a FunctionTransform error transform."""
     model = plx.LuxModel(latent_size=model_config["n_latents"])
@@ -91,7 +91,7 @@ def transform_sequence_with_err_model(model_config):
     return model
 
 
-@pytest.fixture()
+@pytest.fixture
 def multi_output_model(model_config):
     """LuxModel with multiple outputs: TransformSequence flux + single transform labels."""
     model = plx.LuxModel(latent_size=model_config["n_latents"])

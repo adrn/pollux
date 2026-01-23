@@ -918,7 +918,8 @@ def _set_param_by_path(
         msg = f"Cannot traverse into type {type(obj)}"
         raise TypeError(msg)
 
-    return update_nested(module, parts, value)
+    result: eqx.Module = update_nested(module, parts, value)
+    return result
 
 
 class EquinoxNNTransform(AbstractTransform):
@@ -1071,7 +1072,8 @@ class EquinoxNNTransform(AbstractTransform):
         # Apply NN to each latent vector using vmap
         # The nn is an eqx.Module which is callable via __call__
         def forward(x: jax.Array) -> jax.Array:
-            return nn(x)  # type: ignore[operator]
+            result: jax.Array = nn(x)  # type: ignore[operator]
+            return result
 
         return jax.vmap(forward)(latents)
 

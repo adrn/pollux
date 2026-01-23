@@ -1,4 +1,5 @@
-from .lux import LuxModel
+from .cannon import Cannon
+from .lux import Lux, LuxModel
 from .transforms import *
 
-__all__ = ["LuxModel"]
+__all__ = ["Cannon", "Lux", "LuxModel"]

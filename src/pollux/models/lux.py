@@ -101,15 +101,15 @@ class LuxOutput(eqx.Module):
         return packed
 
 
-class LuxModel(eqx.Module):
+class Lux(eqx.Module):
     """A latent variable model with multiple outputs.
 
-    A Pollux model is a generative, latent variable model for output data. This is a
-    general framework for constructing multi-output or multi-task models in which the
-    output data is generated as a transformation away from some embedded vector
-    representation of each object. While this class and model structure can be used in a
-    broad range of applications, this package and implementation was written with
-    applications to stellar spectroscopic data in mind.
+    Lux is a generative, latent variable model for output data. This is a general
+    framework for constructing multi-output or multi-task models in which the output
+    data is generated as a transformation away from some embedded vector representation
+    of each object. While this class and model structure can be used in a broad range of
+    applications, this package and implementation was written with applications to
+    stellar spectroscopic data in mind.
 
     Parameters
     ----------
@@ -691,3 +691,7 @@ class LuxModel(eqx.Module):
                 packed[name] = pars[name]
 
         return packed
+
+
+# Deprecated alias for backwards compatibility
+LuxModel = Lux
