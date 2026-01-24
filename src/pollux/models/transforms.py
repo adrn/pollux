@@ -705,9 +705,9 @@ def polynomial_features(
     --------
     >>> import jax.numpy as jnp
     >>> x = jnp.array([[1.0, 2.0], [3.0, 4.0]])
-    >>> polynomial_features(x, degree=2, include_bias=True)
+    >>> polynomial_features(x, degree=2, include_bias=True)  # doctest: +NORMALIZE_WHITESPACE, +ELLIPSIS
     Array([[ 1.,  1.,  2.,  1.,  2.,  4.],
-           [ 1.,  3.,  4.,  9., 12., 16.]], dtype=float32)
+           [ 1.,  3.,  4.,  9., 12., 16.]], dtype=float...)
     """
     n_samples, n_features = x.shape
 

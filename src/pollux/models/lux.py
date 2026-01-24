@@ -2,10 +2,11 @@ import warnings
 from collections import defaultdict
 from collections.abc import Callable, Mapping
 from functools import partial
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import equinox as eqx
 import jax
+import jax.numpy as jnp
 import numpyro
 import numpyro.distributions as dist
 from numpyro.infer import SVI, Trace_ELBO
@@ -19,7 +20,11 @@ from ..typing import (
     PackedParamsT,
     UnpackedParamsT,
 )
+from .iterative import optimize_iterative
 from .transforms import AbstractSingleTransform, NoOpTransform, TransformSequence
+
+if TYPE_CHECKING:
+    from .iterative import IterativeOptimizationResult, ParameterBlock
 
 
 class LuxOutput(eqx.Module):
@@ -568,6 +573,103 @@ class Lux(eqx.Module):
         # TODO: should the pars get their own object?
         return unpacked_pars, svi_results
 
+    def optimize_iterative(
+        self,
+        data: PolluxData,
+        blocks: list["ParameterBlock"] | None = None,
+        max_cycles: int = 10,
+        tol: float = 1e-4,
+        rng_key: jax.Array | None = None,
+        initial_params: UnpackedParamsT | None = None,
+        latents_prior: dist.Distribution | None = None,
+        progress: bool = True,
+        record_history: bool = False,
+    ) -> "IterativeOptimizationResult":
+        """Optimize using iterative parameter block coordinate descent.
+
+        For models with purely linear outputs, this method exploits the linear structure
+        for faster convergence. For linear transforms, each sub-problem is solved
+        exactly using weighted least squares.
+
+        The default strategy alternates between:
+        1. Optimize latents (with output parameters fixed)
+        2. Optimize each output's parameters (with latents fixed)
+
+        Parameters
+        ----------
+        data
+            The training data.
+        blocks
+            List of :class:`~pollux.models.ParameterBlock` specifications.
+            If None, uses a default strategy that alternates between latents
+            and each output.
+        max_cycles
+            Maximum number of full optimization cycles.
+        tol
+            Convergence tolerance. Stops when relative change in loss < tol.
+        rng_key
+            Random key for initialization. If None, uses a default key.
+        initial_params
+            Initial parameter values. If None, initialized from priors.
+        latents_prior
+            Prior distribution for latents. If None, uses Normal(0, 1).
+            Used to determine regularization strength for latent least squares.
+        progress
+            Whether to display a tqdm progress bar showing optimization progress.
+        record_history
+            Whether to record detailed per-block loss history.
+
+        Returns
+        -------
+        IterativeOptimizationResult
+            The optimization result containing:
+            - ``params``: Optimized parameters in unpacked format
+            - ``losses_per_cycle``: Loss values at the end of each cycle
+            - ``n_cycles``: Number of cycles completed
+            - ``converged``: Whether optimization converged
+            - ``history``: Optional detailed history (if record_history=True)
+
+        Notes
+        -----
+        This method only supports models with linear transforms
+        (:class:`~pollux.models.LinearTransform`,
+        :class:`~pollux.models.AffineTransform`, or
+        :class:`~pollux.models.OffsetTransform`). For models with non-linear
+        transforms, use :meth:`optimize` instead.
+
+        Regularization is automatically extracted from the priors on the
+        transform parameters.
+
+        Examples
+        --------
+        Basic usage:
+
+        >>> result = model.optimize_iterative(data, max_cycles=20)  # doctest: +SKIP
+        >>> opt_params = result.params  # doctest: +SKIP
+
+        With custom blocks:
+
+        >>> from pollux.models import ParameterBlock  # doctest: +SKIP
+        >>> blocks = [  # doctest: +SKIP
+        ...     ParameterBlock("latents", "latents", optimizer="least_squares"),
+        ...     ParameterBlock("flux", "flux:data", optimizer="least_squares"),
+        ... ]
+        >>> result = model.optimize_iterative(data, blocks=blocks)  # doctest: +SKIP
+
+        """
+        return optimize_iterative(
+            model=self,
+            data=data,
+            blocks=blocks,
+            max_cycles=max_cycles,
+            tol=tol,
+            rng_key=rng_key,
+            initial_params=initial_params,
+            latents_prior=latents_prior,
+            progress=progress,
+            record_history=record_history,
+        )
+
     def unpack_numpyro_pars(
         self, pars: PackedParamsT, ignore_missing: bool = False
     ) -> dict[str, Any]:
@@ -675,7 +777,7 @@ class Lux(eqx.Module):
                 msg = f"Missing parameters for output {output_name}"
                 raise ValueError(msg)
 
-            output_pars = pars.get(output_name, {})
+            output_pars = dict(pars.get(output_name, {}))
             tmp = output.pack_pars(
                 {
                     "data": output_pars.get("data", {}),
@@ -690,7 +792,7 @@ class Lux(eqx.Module):
         # Handle non-output parameters (like latents)
         for name in pars:
             if name not in self.outputs:
-                packed[name] = pars[name]
+                packed[name] = jnp.array(pars[name])
 
         return packed
 
