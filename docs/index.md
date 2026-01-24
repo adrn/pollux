@@ -44,6 +44,7 @@ The best way to get started with `pollux` is to work through the tutorials:
 :caption: Tutorials
 
 tutorials/Lux-linear-simulated-data.ipynb
+tutorials/Lux-iterative-optimization.ipynb
 tutorials/Lux-simulated-data-underestimated-err.ipynb
 ```
 
