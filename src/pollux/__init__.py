@@ -10,4 +10,11 @@ from . import data, models
 from ._version import version as __version__
 from .models import Cannon, Lux, LuxModel
 
-__all__ = ["Cannon", "Lux", "LuxModel", "__version__", "data", "models"]
+__all__ = [
+    "Cannon",
+    "Lux",
+    "LuxModel",  # TODO: deprecated
+    "__version__",
+    "data",
+    "models",
+]

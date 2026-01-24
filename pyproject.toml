@@ -35,7 +35,8 @@ dependencies = [
   "numpyro-ext",
   "typing-extensions",
   "xmmutablemap",
-  "dataclassish"
+  "dataclassish",
+  "tqdm>=4.67.1",
 ]
 
 [dependency-groups]
