@@ -20,15 +20,15 @@ Examples
 
 Create and fit a Cannon model:
 
->>> labels = jnp.array([[5000., 4.0, -0.5], [5500., 3.5, 0.0]])  # 2 stars, 3 labels
->>> spectra = jnp.array([[...], [...]])  # 2 stars, n_pixels
->>> cannon = Cannon(label_size=3, output_size=n_pixels, poly_degree=2)
->>> cannon = cannon.fit(labels, spectra, spectra_ivar)
+>>> labels = jnp.array([[5000., 4.0, -0.5], [5500., 3.5, 0.0]])  # doctest: +SKIP
+>>> spectra = jnp.array([[1.0, 2.0], [3.0, 4.0]])  # doctest: +SKIP
+>>> cannon = Cannon(label_size=3, output_size=2, poly_degree=2)  # doctest: +SKIP
+>>> cannon = cannon.fit(labels, spectra)  # doctest: +SKIP
 
 Predict spectra for new labels:
 
->>> new_labels = jnp.array([[5200., 3.8, -0.2]])
->>> predicted = cannon.predict(new_labels)
+>>> new_labels = jnp.array([[5200., 3.8, -0.2]])  # doctest: +SKIP
+>>> predicted = cannon.predict(new_labels)  # doctest: +SKIP
 """
 
 from __future__ import annotations
@@ -144,8 +144,8 @@ class Cannon(eqx.Module):
         >>> features = cannon.get_features(labels)
         >>> features.shape
         (1, 6)
-        >>> features  # [1, x1, x2, x1^2, x1*x2, x2^2]
-        Array([[1., 1., 2., 1., 2., 4.]], dtype=float32)
+        >>> features  # doctest: +NORMALIZE_WHITESPACE, +ELLIPSIS
+        Array([[1., 1., 2., 1., 2., 4.]], dtype=float...)
         """
         return self._poly_transform.apply(labels)
 
@@ -286,8 +286,8 @@ class Cannon(eqx.Module):
 
         Examples
         --------
-        >>> cannon = cannon.fit(train_labels, train_spectra)
-        >>> predicted = cannon.predict(test_labels)
+        >>> cannon = cannon.fit(train_labels, train_spectra)  # doctest: +SKIP
+        >>> predicted = cannon.predict(test_labels)  # doctest: +SKIP
         """
         if not self.is_fitted:
             msg = "Cannon must be fitted before prediction. Call fit() first."
@@ -366,10 +366,10 @@ class Cannon(eqx.Module):
 
         Examples
         --------
-        >>> cannon = cannon.fit(labels, spectra)
-        >>> pars = cannon.get_coeffs_as_transform_pars()
+        >>> cannon = cannon.fit(labels, spectra)  # doctest: +SKIP
+        >>> pars = cannon.get_coeffs_as_transform_pars()  # doctest: +SKIP
         >>> # Use with LuxModel
-        >>> model.predict_outputs(labels, {"flux": pars})
+        >>> model.predict_outputs(labels, {"flux": pars})  # doctest: +SKIP
         """
         if not self.is_fitted:
             msg = "Cannon must be fitted to get coefficients."

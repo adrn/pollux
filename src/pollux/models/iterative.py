@@ -73,7 +73,7 @@ class ParameterBlock:
 
     Optimize flux parameters with Adam and custom learning rate:
 
-    >>> flux_block = ParameterBlock(
+    >>> flux_block = ParameterBlock(  # doctest: +SKIP
     ...     name="flux",
     ...     params="flux:data",
     ...     optimizer=numpyro.optim.Adam,
@@ -443,17 +443,17 @@ def optimize_iterative(
     --------
     Basic usage with default blocks:
 
-    >>> result = optimize_iterative(model, data, max_cycles=20)
-    >>> opt_params = result.params
+    >>> result = optimize_iterative(model, data, max_cycles=20)  # doctest: +SKIP
+    >>> opt_params = result.params  # doctest: +SKIP
 
     Custom block specification:
 
-    >>> blocks = [
+    >>> blocks = [  # doctest: +SKIP
     ...     ParameterBlock("latents", "latents", optimizer="least_squares"),
     ...     ParameterBlock("flux", "flux:data", optimizer="least_squares"),
     ...     ParameterBlock("labels", "label:data", num_steps=500),
     ... ]
-    >>> result = optimize_iterative(model, data, blocks=blocks)
+    >>> result = optimize_iterative(model, data, blocks=blocks)  # doctest: +SKIP
 
     """
     # Default blocks: alternate between latents and each output

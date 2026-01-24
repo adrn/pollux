@@ -644,17 +644,17 @@ class Lux(eqx.Module):
         --------
         Basic usage:
 
-        >>> result = model.optimize_iterative(data, max_cycles=20)
-        >>> opt_params = result.params
+        >>> result = model.optimize_iterative(data, max_cycles=20)  # doctest: +SKIP
+        >>> opt_params = result.params  # doctest: +SKIP
 
         With custom blocks:
 
-        >>> from pollux.models import ParameterBlock
-        >>> blocks = [
+        >>> from pollux.models import ParameterBlock  # doctest: +SKIP
+        >>> blocks = [  # doctest: +SKIP
         ...     ParameterBlock("latents", "latents", optimizer="least_squares"),
         ...     ParameterBlock("flux", "flux:data", optimizer="least_squares"),
         ... ]
-        >>> result = model.optimize_iterative(data, blocks=blocks)
+        >>> result = model.optimize_iterative(data, blocks=blocks)  # doctest: +SKIP
 
         """
         return optimize_iterative(
