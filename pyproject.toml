@@ -185,6 +185,7 @@ ignore = [
 "tests/**" = ["T20", "F841"]
 "noxfile.py" = ["T20"]
 "**/__init__.py" = ["F401", "F403"]
+"docs/**" = ["T201"]
 
 
 [tool.pylint]
