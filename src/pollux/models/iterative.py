@@ -1,4 +1,4 @@
-"""Iterative optimization strategies for LuxModel.
+"""Iterative optimization strategies for Lux.
 
 This module provides an alternating/block coordinate descent optimization scheme
 that exploits the structure of the Lux model for faster convergence.
@@ -30,7 +30,7 @@ from .transforms import (
 )
 
 if TYPE_CHECKING:
-    from .lux import LuxModel
+    from .lux import Lux
 
 
 @dataclass
@@ -166,7 +166,7 @@ def _get_regularization_from_prior(
 
 
 def _solve_latents_least_squares(
-    model: LuxModel,
+    model: Lux,
     data: PolluxData,
     current_params: dict[str, Any],
     latents_prior: dist.Distribution | None = None,
@@ -186,7 +186,7 @@ def _solve_latents_least_squares(
     Parameters
     ----------
     model
-        The LuxModel instance.
+        The Lux instance.
     data
         The data to fit.
     current_params
@@ -278,11 +278,12 @@ def _solve_latents_least_squares(
         AtWy = AtWy + reg_strength * prior_mean
 
     # Solve for each data point: z[i] = solve(AtWA[i], AtWy[i])
-    return jax.vmap(jnp.linalg.solve)(AtWA, AtWy)
+    result: jax.Array = jax.vmap(jnp.linalg.solve)(AtWA, AtWy)
+    return result
 
 
 def _solve_output_params_least_squares(
-    model: LuxModel,
+    model: Lux,
     data: PolluxData,
     output_name: str,
     latents: jax.Array,
@@ -302,7 +303,7 @@ def _solve_output_params_least_squares(
     Parameters
     ----------
     model
-        The LuxModel instance.
+        The Lux instance.
     data
         The data to fit.
     output_name
@@ -374,17 +375,20 @@ def _solve_output_params_least_squares(
         ZtWy = ZtW @ y_dim  # (latent_size,)
 
         # Solve with regularization and prior mean
-        return jnp.linalg.solve(ZtWZ + reg_matrix, ZtWy + prior_mean_row)
+        result: jax.Array = jnp.linalg.solve(ZtWZ + reg_matrix, ZtWy + prior_mean_row)
+        return result
 
     # Vectorize over output dimensions
     dim_data = (y.T, output_ivar.T, prior_mean_contrib)  # (output_size, ...) each
-    A = jax.vmap(fit_single_output_dim)(dim_data)  # (output_size, latent_size)
+    A: jax.Array = jax.vmap(fit_single_output_dim)(
+        dim_data
+    )  # (output_size, latent_size)
 
     return {"A": A}
 
 
 def optimize_iterative(
-    model: LuxModel,
+    model: Lux,
     data: PolluxData,
     blocks: list[ParameterBlock] | None = None,
     max_cycles: int = 10,
@@ -408,7 +412,7 @@ def optimize_iterative(
     Parameters
     ----------
     model
-        The LuxModel to optimize.
+        The Lux to optimize.
     data
         The training data.
     blocks
@@ -565,7 +569,7 @@ def optimize_iterative(
     )
 
 
-def _all_outputs_linear(model: LuxModel) -> bool:
+def _all_outputs_linear(model: Lux) -> bool:
     """Check if all model outputs use linear transforms."""
     return all(
         _is_linear_transform(out.data_transform) for out in model.outputs.values()
@@ -573,7 +577,7 @@ def _all_outputs_linear(model: LuxModel) -> bool:
 
 
 def _optimize_block_least_squares(
-    model: LuxModel,
+    model: Lux,
     data: PolluxData,
     block: ParameterBlock,
     current_params: dict[str, Any],
@@ -621,7 +625,7 @@ def _optimize_block_least_squares(
 
 
 def _build_fixed_pars(
-    model: LuxModel,
+    model: Lux,
     current_params: dict[str, Any],
     optimize_params: list[str],
 ) -> dict[str, Any]:
@@ -647,16 +651,17 @@ def _build_fixed_pars(
             output_params = current_params.get(output_name, {})
             if output_name not in fixed:
                 fixed[output_name] = {}
+            output_fixed = dict(fixed[output_name])  # type: ignore[arg-type]
             if data_fixed and "data" in output_params:
-                fixed[output_name]["data"] = output_params["data"]
+                output_fixed["data"] = output_params["data"]
             if err_fixed and "err" in output_params:
-                fixed[output_name]["err"] = output_params["err"]
+                output_fixed["err"] = output_params["err"]
 
     return fixed
 
 
 def _compute_loss(
-    model: LuxModel,
+    model: Lux,
     data: PolluxData,
     params: dict[str, Any],
 ) -> float:
@@ -679,6 +684,6 @@ def _compute_loss(
 
         # Gaussian negative log likelihood (ignoring constant)
         residuals = (pred - obs) / err
-        total_loss = total_loss + 0.5 * jnp.sum(residuals**2)
+        total_loss = float(total_loss) + float(0.5 * jnp.sum(residuals**2))
 
-    return float(total_loss)
+    return total_loss

@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 import equinox as eqx
 import jax
+import jax.numpy as jnp
 import numpyro
 import numpyro.distributions as dist
 from numpyro.infer import SVI, Trace_ELBO
@@ -776,7 +777,7 @@ class Lux(eqx.Module):
                 msg = f"Missing parameters for output {output_name}"
                 raise ValueError(msg)
 
-            output_pars = pars.get(output_name, {})
+            output_pars = dict(pars.get(output_name, {}))
             tmp = output.pack_pars(
                 {
                     "data": output_pars.get("data", {}),
@@ -791,7 +792,7 @@ class Lux(eqx.Module):
         # Handle non-output parameters (like latents)
         for name in pars:
             if name not in self.outputs:
-                packed[name] = pars[name]
+                packed[name] = jnp.array(pars[name])
 
         return packed
 

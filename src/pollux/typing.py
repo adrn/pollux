@@ -24,7 +24,7 @@ TransformFuncT = Callable[..., OutputT]
 OptimizerT = _NumPyroOptim | Optimizer | Any
 
 PackedParamsT = dict[str, Any]
-UnpackedParamsT = dict[str, dict[str, Any] | Any | tuple[Any, ...]]
+UnpackedParamsT = dict[str, dict[str, Any] | Array]
 
 __all__ = [
     "AnyShapeFloatT",
