@@ -17,8 +17,8 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import jax
 import jax.numpy as jnp
-import numpyro
 import numpyro.distributions as dist
+from numpyro.infer import Predictive
 from tqdm.auto import tqdm
 
 from ..data import PolluxData
@@ -473,18 +473,19 @@ def optimize_iterative(
                 )
             )
 
-    # Initialize parameters
+    # Initialize parameters by sampling from priors
     if initial_params is None:
         if rng_key is None:
             rng_key = jax.random.PRNGKey(0)
-        # Use one SVI step to initialize
         rng_key, init_key = jax.random.split(rng_key)
-        current_params, _ = model.optimize(
-            data,
-            num_steps=1,
-            rng_key=init_key,
-            optimizer=numpyro.optim.Adam(step_size=1e-3),
-        )
+        predictive = Predictive(model.default_numpyro_model, num_samples=1)
+        packed_samples = predictive(init_key, data)
+        # Remove the batch dimension from num_samples=1, and filter out
+        # observed samples (keys starting with "obs:")
+        packed_samples = {
+            k: v[0] for k, v in packed_samples.items() if not k.startswith("obs:")
+        }
+        current_params = model.unpack_numpyro_pars(packed_samples)
     else:
         current_params = initial_params
 
