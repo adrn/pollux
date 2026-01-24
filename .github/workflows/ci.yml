@@ -20,22 +20,18 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
-        # with:
-        #   enable-cache: true
-        #   cache-dependency-glob: "uv.lock"
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
 
       - name: Set up Python
         run: uv python install
 
-      - name: Install the project
-        run: |
-          uv venv
-          uv pip install ".[test]" nox
+      - name: Install pre-commit
+        run: uv tool install pre-commit
 
-      - uses: pre-commit/action@v3.0.1
-
-      - name: Run linter
-        run: uv run nox -s lint
+      - name: Run pre-commit
+        run: uv tool run pre-commit run --all-files --show-diff-on-failure
 
   checks:
     name: Check Python ${{ matrix.python-version }} on ${{ matrix.runs-on }}
@@ -56,7 +52,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install the project
-        run: uv sync --all-extras --dev
+        run: uv sync --group test
 
       - name: Test package
         run: >-

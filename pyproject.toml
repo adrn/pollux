@@ -28,15 +28,15 @@ classifiers = [
 ]
 dynamic = ["version"]
 dependencies = [
+  "dataclassish>=0.8.0",
   "equinox >=0.11.12",
-  "jax",
-  "jaxopt",
-  "numpyro",
-  "numpyro-ext",
-  "typing-extensions",
-  "xmmutablemap",
-  "dataclassish",
+  "jax>=0.7.2",
+  "jaxopt>=0.8.5",
+  "numpyro>=0.19.0",
+  "numpyro-ext>=0.0.4",
   "tqdm>=4.67.1",
+  "typing-extensions>=4.15.0",
+  "xmmutablemap>=0.2.0",
 ]
 
 [dependency-groups]
