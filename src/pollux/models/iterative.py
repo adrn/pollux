@@ -544,10 +544,10 @@ def optimize_iterative(
 
         # Check convergence
         if rel_change < tol:
-            pbar.set_postfix(
-                loss=f"{loss:.4g}",
-                status="converged",
-            )
+            # Update to show successful convergence (green/complete state)
+            pbar.set_description("Converged")
+            pbar.update(max_cycles - pbar.n)  # Complete the bar
+            pbar.set_postfix(loss=f"{loss:.4g}")
             pbar.close()
             return IterativeOptimizationResult(
                 params=current_params,
