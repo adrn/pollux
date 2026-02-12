@@ -13,12 +13,15 @@ __all__ = [
 ]
 
 from dataclasses import dataclass, field
+from functools import partial
 from typing import TYPE_CHECKING, Any, Literal
 
 import jax
 import jax.numpy as jnp
+import numpyro
 import numpyro.distributions as dist
-from numpyro.infer import Predictive
+from numpyro.infer import SVI, Predictive, Trace_ELBO
+from numpyro.infer.autoguide import AutoDelta
 from tqdm.auto import tqdm
 
 from ..data import PolluxData
@@ -514,15 +517,14 @@ def optimize_iterative(
                     model, data, block, current_params, latents_prior
                 )
             else:
-                # if rng_key is None:
-                #     msg = "rng_key required for SVI-based optimization"
-                #     raise ValueError(msg)
-                # rng_key, subkey = jax.random.split(rng_key)
-                # current_params = _optimize_block_svi(
-                #     model, data, block, current_params, subkey
-                # )
-                msg = "non-least-squares block optimization not yet implemented"
-                raise NotImplementedError(msg)
+                # Use numpyro SVI for non-linear blocks
+                if rng_key is None:
+                    msg = "rng_key required for SVI-based optimization"
+                    raise ValueError(msg)
+                rng_key, subkey = jax.random.split(rng_key)
+                current_params = _optimize_block_numpyro(
+                    model, data, block, current_params, subkey, latents_prior
+                )
 
             if record_history:
                 # Could compute loss here per block if needed
@@ -621,7 +623,112 @@ def _optimize_block_least_squares(
     return new_params
 
 
-# TODO: could also have an _optimize_block_adam for non-linear outputs
+def _optimize_block_numpyro(
+    model: Lux,
+    data: PolluxData,
+    block: ParameterBlock,
+    current_params: dict[str, Any],
+    rng_key: jax.Array,
+    latents_prior: dist.Distribution | None = None,
+) -> dict[str, Any]:
+    """Optimize a parameter block using numpyro SVI.
+
+    This function optimizes a subset of parameters (specified in the block)
+    while holding all other parameters fixed. It uses numpyro's SVI with
+    AutoDelta guide for MAP estimation.
+
+    Parameters
+    ----------
+    model
+        The Lux instance.
+    data
+        The training data.
+    block
+        ParameterBlock specification including which parameters to optimize,
+        the optimizer to use, and the number of optimization steps.
+    current_params
+        Current parameter estimates (unpacked format). Parameters not being
+        optimized will be held fixed.
+    rng_key
+        JAX random key for SVI.
+    latents_prior
+        Prior distribution for latents. If None, uses Normal(0, 1).
+
+    Returns
+    -------
+    dict
+        Updated parameters with the optimized block values merged in.
+
+    Notes
+    -----
+    The optimizer defaults to Adam with step_size=1e-3 if not specified
+    in the block.
+    """
+    params = block.params
+    if isinstance(params, str):
+        params = [params]
+
+    # Build fixed_pars containing everything NOT being optimized
+    fixed_pars = _build_fixed_pars(model, current_params, params)
+
+    # Build the optimizer
+    optimizer_cls = block.optimizer
+    if optimizer_cls is None:
+        optimizer_cls = numpyro.optim.Adam
+    elif optimizer_cls == "least_squares":
+        msg = (
+            "Least squares optimization should be handled by "
+            "_optimize_block_least_squares"
+        )
+        raise ValueError(msg)
+
+    optimizer_kwargs = {"step_size": 1e-3, **block.optimizer_kwargs}
+    optimizer = optimizer_cls(**optimizer_kwargs)
+
+    # Pack fixed parameters for numpyro
+    packed_fixed_pars = model.pack_numpyro_pars(fixed_pars, ignore_missing=True)
+
+    # Determine which outputs to include in this optimization
+    # (by default include all outputs that have data)
+    names = None  # Use all outputs
+
+    # Create partial model with fixed parameters
+    partial_model = partial(
+        model.default_numpyro_model,
+        fixed_pars=packed_fixed_pars,
+        names=names,
+        latents_prior=latents_prior,
+    )
+
+    # Run SVI optimization
+    svi_key, sample_key = jax.random.split(rng_key)
+    guide = AutoDelta(partial_model)
+    svi = SVI(partial_model, guide, optimizer, Trace_ELBO())
+    svi_results = svi.run(svi_key, block.num_steps, data, progress_bar=False)
+
+    # Extract optimized parameters
+    packed_map_pars = guide.sample_posterior(sample_key, svi_results.params)
+    optimized_subset = model.unpack_numpyro_pars(packed_map_pars, ignore_missing=True)
+
+    # Merge optimized parameters with current parameters
+    new_params = dict(current_params)
+    for param_spec in params:
+        if param_spec == "latents" and "latents" in optimized_subset:
+            new_params["latents"] = optimized_subset["latents"]
+        elif ":" in param_spec:
+            output_name, param_type = param_spec.split(":", 1)
+            if output_name in optimized_subset:
+                if output_name not in new_params:
+                    new_params[output_name] = {"data": {}, "err": {}}
+                opt_output = optimized_subset[output_name]
+                if param_type == "data" and "data" in opt_output:
+                    new_params[output_name]["data"] = opt_output["data"]
+                elif param_type == "err" and "err" in opt_output:
+                    new_params[output_name]["err"] = opt_output["err"]
+        elif param_spec in optimized_subset:
+            new_params[param_spec] = optimized_subset[param_spec]
+
+    return new_params
 
 
 def _build_fixed_pars(
