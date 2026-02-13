@@ -9,6 +9,8 @@ def make_simulated_linear_data(
     n_flux: int,
     A: ArrayLike | None = None,
     B: ArrayLike | None = None,
+    label_err_range: tuple[float, float] | None = None,
+    flux_err_range: tuple[float, float] | None = None,
     rng: np.random.Generator | None = None,
 ) -> tuple[dict[str, ArrayLike], dict[str, ArrayLike]]:
     rng = rng or np.random.default_rng()
@@ -19,6 +21,12 @@ def make_simulated_linear_data(
 
     if B is None:
         B = rngs[1].normal(size=(n_flux, n_latents))
+
+    if label_err_range is None:
+        label_err_range = (0.01, 0.1)
+
+    if flux_err_range is None:
+        flux_err_range = (0.01, 0.1)
 
     assert A.shape == (n_labels, n_latents)
     assert B.shape == (n_flux, n_latents)
@@ -31,8 +39,8 @@ def make_simulated_linear_data(
     assert np.all(np.isfinite(labels))
     assert np.all(np.isfinite(fluxs))
 
-    label_err = rng.uniform(0.01, 0.1, size=labels.shape)
-    flux_err = rng.uniform(0.01, 0.1, size=fluxs.shape)
+    label_err = rng.uniform(*label_err_range, size=labels.shape)
+    flux_err = rng.uniform(*flux_err_range, size=fluxs.shape)
 
     obs = {
         "label": rng.normal(labels, label_err),
