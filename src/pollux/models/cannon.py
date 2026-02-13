@@ -333,7 +333,7 @@ class Cannon(eqx.Module):
         >>> model.register_output("flux", transform)
         """
         return TransformSequence(
-            transforms=(  # type: ignore[arg-type]
+            transforms=(
                 PolyFeatureTransform(
                     degree=self.poly_degree, include_bias=self.include_bias
                 ),

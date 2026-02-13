@@ -5,6 +5,7 @@ __all__ = [
     "AbstractTransform",
     "AdditiveOffsetTransform",
     "AffineTransform",
+    "ConcatenateTransform",
     "EquinoxNNTransform",
     "FunctionTransform",
     "LinearTransform",
@@ -346,9 +347,9 @@ class TransformSequence(AbstractTransform):
     Parameters are stored as tuples of dictionaries, one element per transform.
     """
 
-    transforms: tuple[AbstractSingleTransform, ...]
+    transforms: tuple[AbstractTransform, ...]
 
-    def __init__(self, transforms: tuple[AbstractSingleTransform, ...]):
+    def __init__(self, transforms: tuple[AbstractTransform, ...]):
         """Initialize a sequence of transforms."""
         if not transforms:
             msg = "At least one transform required"
@@ -535,7 +536,7 @@ class TransformSequence(AbstractTransform):
 
     @property
     def names_nested(self) -> tuple[tuple[str, ...], ...]:
-        return tuple(t._param_names for t in self.transforms)
+        return tuple(t._param_names for t in self.transforms)  # type: ignore[attr-defined]
 
     @property
     def names_flat(self) -> tuple[str, ...]:
@@ -576,6 +577,289 @@ class TransformSequence(AbstractTransform):
                 current_size = transform.output_size
 
         return ImmutableMap(**priors)
+
+
+class ConcatenateTransform(AbstractTransform):
+    """Transform that splits input latents and passes slices to child transforms.
+
+    Splits the input latent vector by ``input_sizes``, passes each slice to a
+    corresponding child transform, and concatenates the outputs. This is useful
+    for models where different subsets of latent variables control different
+    output components (e.g., separate absorption and continuum models).
+
+    Parameters
+    ----------
+    transforms
+        Child transforms, one per input slice.
+    input_sizes
+        Number of latent dimensions to send to each child transform.
+        Must satisfy ``len(input_sizes) == len(transforms)`` and
+        ``sum(input_sizes) == latent_size``.
+
+    Examples
+    --------
+    >>> import jax.numpy as jnp
+    >>> from pollux.models.transforms import (
+    ...     ConcatenateTransform, LinearTransform, PolyFeatureTransform,
+    ...     TransformSequence,
+    ... )
+
+    Combine a polynomial feature transform with a linear transform:
+
+    >>> concat = ConcatenateTransform(
+    ...     transforms=(
+    ...         TransformSequence((
+    ...             PolyFeatureTransform(degree=2),
+    ...             LinearTransform(output_size=10),
+    ...         )),
+    ...         LinearTransform(output_size=4),
+    ...     ),
+    ...     input_sizes=(3, 4),
+    ... )
+
+    With 7 total latent dimensions (3 + 4), the first 3 go through the
+    polynomial + linear path producing 10 outputs, and the last 4 go through
+    the linear path producing 4 outputs, for a total output size of 14.
+    """
+
+    transforms: tuple[AbstractTransform, ...]
+    input_sizes: tuple[int, ...]
+
+    def __init__(
+        self,
+        transforms: tuple[AbstractTransform, ...],
+        input_sizes: tuple[int, ...],
+    ):
+        """Initialize a concatenation of transforms with input size allocation."""
+        if not transforms:
+            msg = "At least one transform required"
+            raise ModelValidationError(msg)
+
+        if len(transforms) != len(input_sizes):
+            msg = (
+                f"Number of transforms ({len(transforms)}) must match "
+                f"number of input_sizes ({len(input_sizes)})"
+            )
+            raise ModelValidationError(msg)
+
+        self.transforms = transforms
+        self.input_sizes = tuple(input_sizes)
+        self.output_size = sum(t.output_size for t in transforms)
+
+    @property
+    def _param_names(self) -> tuple[str, ...]:
+        """Flat parameter names using ``{index}:{param}`` convention."""
+        return self.names_flat
+
+    @property
+    def priors(self) -> ParamPriorsTupleT:
+        """Collect parameter priors from all transforms."""
+        return tuple(
+            getattr(transform, "priors", ImmutableMap())
+            for transform in self.transforms
+        )
+
+    @property
+    def shapes(self) -> ParamShapesTupleT:
+        """Collect parameter shapes from all transforms."""
+        return tuple(
+            getattr(transform, "shapes", ImmutableMap())
+            for transform in self.transforms
+        )
+
+    @property
+    def names_nested(self) -> tuple[tuple[str, ...], ...]:
+        """Parameter names grouped by child transform."""
+        return tuple(t._param_names for t in self.transforms)  # type: ignore[attr-defined]
+
+    @property
+    def names_flat(self) -> tuple[str, ...]:
+        """Flat parameter names using ``{index}:{param}`` convention."""
+        return tuple(
+            f"{i}:{name}" for i, names in enumerate(self.names_nested) for name in names
+        )
+
+    def apply(
+        self, latents: BatchedLatentsT, *args: dict[str, Any], **kwargs: Any
+    ) -> BatchedOutputT:
+        """Apply child transforms to slices of the input and concatenate outputs.
+
+        Parameters can be provided in two ways:
+
+        1. As positional arguments: One dictionary per transform.
+        2. As keyword arguments: Using ``"{transform_index}:{param}"`` naming.
+
+        Parameters
+        ----------
+        latents
+            Input latent vectors of shape ``(n_samples, sum(input_sizes))``.
+        *args
+            Parameter dictionaries, one per child transform.
+        **kwargs
+            Flat parameters using ``"{transform_index}:{param_name}"`` naming.
+
+        Returns
+        -------
+        array
+            Concatenated outputs of shape ``(n_samples, sum(output_sizes))``.
+        """
+        # Split latents by input_sizes along the last axis
+        split_indices = tuple(
+            sum(self.input_sizes[: i + 1]) for i in range(len(self.input_sizes) - 1)
+        )
+        latent_slices = jnp.split(latents, split_indices, axis=-1)
+
+        if args:
+            if len(args) != len(self.transforms):
+                msg = (
+                    f"Expected {len(self.transforms)} parameter dictionaries, "
+                    f"got {len(args)}"
+                )
+                raise ValueError(msg)
+
+            if kwargs:
+                msg = "Cannot mix positional parameter dicts with keyword parameters"
+                raise ValueError(msg)
+
+            outputs = [
+                transform.apply(slice_, **pars)
+                for transform, slice_, pars in zip(self.transforms, latent_slices, args)
+            ]
+            return jnp.concatenate(outputs, axis=-1)
+
+        # Handle flat format with "{index}:{param}" naming
+        transform_pars_list: list[dict[str, Any]] = [{} for _ in self.transforms]
+
+        for param_name, param_value in kwargs.items():
+            if ":" in param_name:
+                idx_str, actual_param_name = param_name.split(":", 1)
+                transform_idx = int(idx_str)
+                if not 0 <= transform_idx < len(self.transforms):
+                    msg = f"Invalid transform index: {transform_idx}"
+                    raise ValueError(msg)
+                transform_pars_list[transform_idx][actual_param_name] = param_value
+            else:
+                msg = f"Unsupported parameter name format: {param_name}"
+                raise ValueError(msg)
+
+        outputs = [
+            transform.apply(slice_, **pars)
+            for transform, slice_, pars in zip(
+                self.transforms, latent_slices, transform_pars_list
+            )
+        ]
+        return jnp.concatenate(outputs, axis=-1)
+
+    def get_expanded_priors(
+        self, latent_size: int, data_size: int | None = None
+    ) -> ParamPriorsT:
+        """Get expanded parameter priors using flat naming scheme.
+
+        Each child transform receives its corresponding ``input_sizes[i]`` as
+        its ``latent_size``.
+
+        Parameters
+        ----------
+        latent_size
+            Total latent size (must equal ``sum(input_sizes)``).
+        data_size
+            Number of objects in the dataset, passed through to child transforms.
+
+        Raises
+        ------
+        ModelValidationError
+            If ``latent_size`` does not match ``sum(input_sizes)``.
+        """
+        expected_total = sum(self.input_sizes)
+        if latent_size != expected_total:
+            msg = (
+                f"latent_size ({latent_size}) does not match "
+                f"sum(input_sizes) ({expected_total})"
+            )
+            raise ModelValidationError(msg)
+
+        priors = {}
+        for i, (transform, input_size) in enumerate(
+            zip(self.transforms, self.input_sizes)
+        ):
+            transform_priors = transform.get_expanded_priors(
+                latent_size=input_size, data_size=data_size
+            )
+            for param_name, prior in transform_priors.items():
+                flat_name = f"{i}:{param_name}"
+                priors[flat_name] = prior
+
+        return ImmutableMap(**priors)
+
+    def get_output_size(self, input_size: int) -> int:
+        """Compute total output size.
+
+        Validates that ``input_size`` matches ``sum(input_sizes)`` and returns
+        the total output size.
+
+        Parameters
+        ----------
+        input_size
+            Number of input features (must equal ``sum(input_sizes)``).
+
+        Returns
+        -------
+        int
+            Total output size (sum of child output sizes).
+        """
+        expected_total = sum(self.input_sizes)
+        if input_size != expected_total:
+            msg = (
+                f"input_size ({input_size}) does not match "
+                f"sum(input_sizes) ({expected_total})"
+            )
+            raise ModelValidationError(msg)
+        return self.output_size
+
+    def unpack_pars(
+        self, flat_pars: dict[str, Any], ignore_missing: bool = False
+    ) -> tuple[dict[str, Any], ...]:
+        """Convert flat parameter names to nested tuple structure.
+
+        Takes parameters with names like ``"0:A"``, ``"1:p1"`` and converts to
+        a tuple of parameter dictionaries.
+        """
+        nested_pars: list[dict[str, Any]] = [{} for _ in self.transforms]
+
+        for param_name in self.names_flat:
+            param_value = flat_pars.get(param_name)
+
+            if param_value is None:
+                if not ignore_missing:
+                    msg = f"Missing value in transform: {param_name}"
+                    raise ValueError(msg)
+                continue
+
+            if ":" in param_name:
+                idx_str, actual_param_name = param_name.split(":", 1)
+                transform_idx = int(idx_str)
+                if 0 <= transform_idx < len(self.transforms):
+                    nested_pars[transform_idx][actual_param_name] = param_value
+
+        return tuple(nested_pars)
+
+    def pack_pars(
+        self, nested_pars: list[dict[str, Any]], ignore_missing: bool = False
+    ) -> dict[str, Any]:
+        """Convert nested parameter structure to flat naming scheme.
+
+        Takes a list of parameter dictionaries and converts them to flat
+        parameter names like ``"0:A"``, ``"1:p1"``.
+        """
+        _ = ignore_missing
+
+        flat_pars = {}
+        for i, transform_pars in enumerate(nested_pars):
+            for param_name, param_value in transform_pars.items():
+                flat_name = f"{i}:{param_name}"
+                flat_pars[flat_name] = param_value
+
+        return flat_pars
 
 
 class FunctionTransform(AbstractSingleTransform):
@@ -782,6 +1066,11 @@ class PolyFeatureTransform(AbstractTransform):
     # output_size is computed dynamically based on input size
     # We set a placeholder that will be overridden in apply()
     output_size: int = eqx.field(default=0)
+
+    @property
+    def _param_names(self) -> tuple[str, ...]:
+        """Return empty tuple (no learnable parameters)."""
+        return ()
 
     # --- BEGIN DEPRECATION BLOCK: param_priors -> priors ---
     # TODO(deprecation): Remove this property after deprecation period
@@ -1200,6 +1489,11 @@ class EquinoxNNTransform(AbstractTransform):
     # Internal state - computed in get_expanded_priors
     _param_paths: tuple[str, ...] = eqx.field(default=(), repr=False)
     _template_nn: Any = eqx.field(default=None, repr=False)  # eqx.Module
+
+    @property
+    def _param_names(self) -> tuple[str, ...]:
+        """Parameter names (delegated to _param_paths)."""
+        return self._param_paths
 
     # --- BEGIN DEPRECATION BLOCK: param_priors -> priors ---
     # TODO(deprecation): Remove this property after deprecation period

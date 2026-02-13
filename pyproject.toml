@@ -76,6 +76,7 @@ dev = [
   "pre-commit",
   "twine",
   "ruff",
+  "mypy"
 ]
 
 [project.urls]

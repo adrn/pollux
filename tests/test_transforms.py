@@ -7,6 +7,7 @@ import pytest
 import pollux as plx
 from pollux.models.transforms import (
     AdditiveOffsetTransform,
+    ConcatenateTransform,
     EquinoxNNTransform,
     FunctionTransform,
     LinearTransform,
@@ -1079,3 +1080,339 @@ def test_additive_offset_transform_broadcast():
         for j in range(n_output):
             expected_val = base_output[i, j] + offset[i]
             assert np.isclose(result[i, j], expected_val)
+
+
+# --------------------------------------------------------------------------
+# ConcatenateTransform tests
+# --------------------------------------------------------------------------
+
+
+class TestConcatenateTransformValidation:
+    """Tests for ConcatenateTransform initialization validation."""
+
+    def test_empty_transforms_raises(self):
+        with pytest.raises(Exception, match="At least one transform required"):
+            ConcatenateTransform(transforms=(), input_sizes=())
+
+    def test_mismatched_lengths_raises(self):
+        with pytest.raises(Exception, match="must match"):
+            ConcatenateTransform(
+                transforms=(LinearTransform(output_size=4),),
+                input_sizes=(3, 4),
+            )
+
+    def test_output_size_is_sum(self):
+        concat = ConcatenateTransform(
+            transforms=(
+                LinearTransform(output_size=10),
+                LinearTransform(output_size=4),
+            ),
+            input_sizes=(3, 5),
+        )
+        assert concat.output_size == 14
+
+
+class TestConcatenateTransformApply:
+    """Tests for ConcatenateTransform.apply."""
+
+    def test_basic_apply_kwargs(self):
+        rng = np.random.default_rng(42)
+        n_stars = 16
+        in1, in2 = 3, 4
+        out1, out2 = 5, 6
+
+        concat = ConcatenateTransform(
+            transforms=(
+                LinearTransform(output_size=out1),
+                LinearTransform(output_size=out2),
+            ),
+            input_sizes=(in1, in2),
+        )
+
+        latents = jnp.array(rng.random((n_stars, in1 + in2)))
+        A0 = jnp.array(rng.random((out1, in1)))
+        A1 = jnp.array(rng.random((out2, in2)))
+
+        result = concat.apply(latents, **{"0:A": A0, "1:A": A1})
+
+        # Manually compute expected output
+        z0 = latents[:, :in1]
+        z1 = latents[:, in1:]
+        expected = jnp.concatenate(
+            [jnp.einsum("ij,nj->ni", A0, z0), jnp.einsum("ij,nj->ni", A1, z1)],
+            axis=-1,
+        )
+        assert np.allclose(result, expected, atol=1e-5)
+
+    def test_basic_apply_positional_args(self):
+        rng = np.random.default_rng(0)
+        n_stars = 8
+        in1, in2 = 2, 3
+        out1, out2 = 4, 5
+
+        concat = ConcatenateTransform(
+            transforms=(
+                LinearTransform(output_size=out1),
+                LinearTransform(output_size=out2),
+            ),
+            input_sizes=(in1, in2),
+        )
+
+        latents = jnp.array(rng.random((n_stars, in1 + in2)))
+        A0 = jnp.array(rng.random((out1, in1)))
+        A1 = jnp.array(rng.random((out2, in2)))
+
+        result = concat.apply(latents, {"A": A0}, {"A": A1})
+
+        z0 = latents[:, :in1]
+        z1 = latents[:, in1:]
+        expected = jnp.concatenate(
+            [jnp.einsum("ij,nj->ni", A0, z0), jnp.einsum("ij,nj->ni", A1, z1)],
+            axis=-1,
+        )
+        assert np.allclose(result, expected, atol=1e-5)
+
+    def test_apply_wrong_n_positional_args(self):
+        concat = ConcatenateTransform(
+            transforms=(
+                LinearTransform(output_size=4),
+                LinearTransform(output_size=4),
+            ),
+            input_sizes=(3, 3),
+        )
+        latents = jnp.zeros((2, 6))
+        with pytest.raises(ValueError, match="Expected 2 parameter dictionaries"):
+            concat.apply(latents, {"A": jnp.zeros((4, 3))})
+
+
+class TestConcatenateTransformPriors:
+    """Tests for ConcatenateTransform.get_expanded_priors and naming."""
+
+    def test_get_expanded_priors_flat_names(self):
+        concat = ConcatenateTransform(
+            transforms=(
+                LinearTransform(output_size=5),
+                LinearTransform(output_size=6),
+            ),
+            input_sizes=(3, 4),
+        )
+
+        priors = concat.get_expanded_priors(latent_size=7)
+        assert set(priors.keys()) == {"0:A", "1:A"}
+        assert priors["0:A"].batch_shape == (5, 3)
+        assert priors["1:A"].batch_shape == (6, 4)
+
+    def test_latent_size_mismatch_raises(self):
+        concat = ConcatenateTransform(
+            transforms=(
+                LinearTransform(output_size=5),
+                LinearTransform(output_size=6),
+            ),
+            input_sizes=(3, 4),
+        )
+        with pytest.raises(Exception, match="does not match"):
+            concat.get_expanded_priors(latent_size=10)
+
+    def test_names_flat(self):
+        concat = ConcatenateTransform(
+            transforms=(
+                LinearTransform(output_size=5),
+                LinearTransform(output_size=6),
+            ),
+            input_sizes=(3, 4),
+        )
+        assert concat.names_flat == ("0:A", "1:A")
+
+    def test_param_names_property(self):
+        concat = ConcatenateTransform(
+            transforms=(
+                LinearTransform(output_size=5),
+                LinearTransform(output_size=6),
+            ),
+            input_sizes=(3, 4),
+        )
+        assert concat._param_names == ("0:A", "1:A")
+
+
+class TestConcatenateTransformPackUnpack:
+    """Tests for pack/unpack round-trip."""
+
+    def test_pack_unpack_roundtrip(self):
+        rng = np.random.default_rng(42)
+
+        concat = ConcatenateTransform(
+            transforms=(
+                LinearTransform(output_size=5),
+                LinearTransform(output_size=6),
+            ),
+            input_sizes=(3, 4),
+        )
+
+        A0 = jnp.array(rng.random((5, 3)))
+        A1 = jnp.array(rng.random((6, 4)))
+
+        flat = {"0:A": A0, "1:A": A1}
+        nested = concat.unpack_pars(flat)
+        assert len(nested) == 2
+        assert np.allclose(nested[0]["A"], A0)
+        assert np.allclose(nested[1]["A"], A1)
+
+        repacked = concat.pack_pars(list(nested))
+        assert set(repacked.keys()) == set(flat.keys())
+        for k in flat:
+            assert np.allclose(repacked[k], flat[k])
+
+
+class TestConcatenateTransformGetOutputSize:
+    """Tests for get_output_size."""
+
+    def test_returns_total_output_size(self):
+        concat = ConcatenateTransform(
+            transforms=(
+                LinearTransform(output_size=10),
+                LinearTransform(output_size=4),
+            ),
+            input_sizes=(3, 5),
+        )
+        assert concat.get_output_size(8) == 14
+
+    def test_wrong_input_size_raises(self):
+        concat = ConcatenateTransform(
+            transforms=(
+                LinearTransform(output_size=10),
+                LinearTransform(output_size=4),
+            ),
+            input_sizes=(3, 5),
+        )
+        with pytest.raises(Exception, match="does not match"):
+            concat.get_output_size(99)
+
+
+class TestConcatenateTransformWithPolyFeature:
+    """Tests for ConcatenateTransform with PolyFeatureTransform child."""
+
+    def test_with_poly_feature_in_sequence(self):
+        """ConcatenateTransform wrapping a TransformSequence(Poly -> Linear)."""
+        rng = np.random.default_rng(42)
+        n_stars = 16
+        in1, in2 = 3, 4
+        out1, out2 = 10, 6
+
+        concat = ConcatenateTransform(
+            transforms=(
+                TransformSequence(
+                    (
+                        PolyFeatureTransform(degree=2),
+                        LinearTransform(output_size=out1),
+                    )
+                ),
+                LinearTransform(output_size=out2),
+            ),
+            input_sizes=(in1, in2),
+        )
+
+        # PolyFeatureTransform(degree=2) on 3 inputs gives 10 features
+        # (1 + 3 + 6 = 10 with bias), so inner LinearTransform input is 10
+        priors = concat.get_expanded_priors(latent_size=in1 + in2)
+        assert "0:1:A" in priors  # TransformSequence nests: "0:1:A"
+        assert "1:A" in priors
+        assert priors["0:1:A"].batch_shape == (out1, 10)
+        assert priors["1:A"].batch_shape == (out2, in2)
+
+        # Apply with concrete parameters
+        A_inner = jnp.array(rng.random((out1, 10)))
+        A_outer = jnp.array(rng.random((out2, in2)))
+        latents = jnp.array(rng.random((n_stars, in1 + in2)))
+
+        result = concat.apply(latents, **{"0:1:A": A_inner, "1:A": A_outer})
+        assert result.shape == (n_stars, out1 + out2)
+
+
+class TestConcatenateTransformInTransformSequence:
+    """Tests for ConcatenateTransform nested inside TransformSequence."""
+
+    def test_concat_inside_sequence(self):
+        """ConcatenateTransform as the first step of a TransformSequence."""
+        rng = np.random.default_rng(0)
+        n_stars = 8
+        in1, in2 = 3, 4
+        concat_out = 5 + 6  # 11
+
+        concat = ConcatenateTransform(
+            transforms=(
+                LinearTransform(output_size=5),
+                LinearTransform(output_size=6),
+            ),
+            input_sizes=(in1, in2),
+        )
+
+        seq = TransformSequence(
+            (
+                concat,
+                LinearTransform(output_size=8),
+            )
+        )
+
+        priors = seq.get_expanded_priors(latent_size=in1 + in2)
+        # ConcatenateTransform params are prefixed "0:{concat_flat_name}"
+        assert "0:0:A" in priors
+        assert "0:1:A" in priors
+        # Second transform in sequence: "1:A"
+        assert "1:A" in priors
+        # Second linear takes concat output (11) as input
+        assert priors["1:A"].batch_shape == (8, concat_out)
+
+        A0 = jnp.array(rng.random((5, in1)))
+        A1 = jnp.array(rng.random((6, in2)))
+        A2 = jnp.array(rng.random((8, concat_out)))
+
+        latents = jnp.array(rng.random((n_stars, in1 + in2)))
+        result = seq.apply(latents, **{"0:0:A": A0, "0:1:A": A1, "1:A": A2})
+        assert result.shape == (n_stars, 8)
+
+
+class TestConcatenateTransformWithLuxModel:
+    """Tests for ConcatenateTransform with LuxModel integration."""
+
+    def test_register_and_predict(self):
+        rng = np.random.default_rng(42)
+        n_stars = 16
+        in1, in2 = 3, 4
+        n_latents = in1 + in2
+
+        concat = ConcatenateTransform(
+            transforms=(
+                LinearTransform(output_size=5),
+                LinearTransform(output_size=6),
+            ),
+            input_sizes=(in1, in2),
+        )
+
+        model = plx.LuxModel(latent_size=n_latents)
+        model.register_output("flux", concat)
+
+        A0 = jnp.array(rng.random((5, in1)))
+        A1 = jnp.array(rng.random((6, in2)))
+        latents = jnp.array(rng.random((n_stars, n_latents)))
+
+        pars = {"flux": {"data": {"0:A": A0, "1:A": A1}}}
+        result = model.predict_outputs(latents, pars)
+        assert result["flux"].shape == (n_stars, 11)
+
+
+class TestParamNamesOnPolyFeature:
+    """Verify _param_names is available on PolyFeatureTransform."""
+
+    def test_param_names_empty(self):
+        poly = PolyFeatureTransform(degree=2)
+        assert poly._param_names == ()
+
+    def test_poly_in_transform_sequence_names_nested(self):
+        seq = TransformSequence(
+            (
+                PolyFeatureTransform(degree=2),
+                LinearTransform(output_size=8),
+            )
+        )
+        assert seq.names_nested == ((), ("A",))
+        assert seq.names_flat == ("1:A",)
