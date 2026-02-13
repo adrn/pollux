@@ -535,6 +535,11 @@ class TransformSequence(AbstractTransform):
         return flat_pars
 
     @property
+    def _param_names(self) -> tuple[str, ...]:
+        """Flat parameter names for TransformSequence compatibility when nested."""
+        return self.names_flat
+
+    @property
     def names_nested(self) -> tuple[tuple[str, ...], ...]:
         return tuple(t._param_names for t in self.transforms)  # type: ignore[attr-defined]
 
