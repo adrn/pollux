@@ -53,6 +53,9 @@ class NullPreprocessor(AbstractPreprocessor):
     >>> assert jnp.all(new_data == data)
     """
 
+    def __init__(self) -> None:
+        pass
+
     @classmethod
     def from_data(cls, *_: Any) -> "NullPreprocessor":
         """Compute preprocessing parameters from data."""
