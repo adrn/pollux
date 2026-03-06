@@ -387,10 +387,46 @@ def _solve_output_params_least_squares(
     return {"A": A}
 
 
+def _string_to_parameter_block(model: Lux, name: str) -> ParameterBlock:
+    """Convert a string block name to a ParameterBlock with inferred optimizer."""
+    optimizer: Literal["least_squares"] | None
+    if name == "latents":
+        optimizer = "least_squares" if _all_outputs_linear(model) else None
+        return ParameterBlock(name="latents", params="latents", optimizer=optimizer)
+
+    output_name = name.split(":")[0]
+    if output_name not in model.outputs:
+        msg = f"Unknown parameter block: '{name}'"
+        raise ValueError(msg)
+
+    transform = model.outputs[output_name].data_transform
+    optimizer = "least_squares" if _is_linear_transform(transform) else None
+    return ParameterBlock(name=name, params=name, optimizer=optimizer)
+
+
+def _build_initial_params_from_fixed(
+    model: Lux,
+    data: PolluxData,
+    fixed_pars: dict[str, Any],
+    blocks: list[ParameterBlock],
+) -> dict[str, Any]:
+    """Build initial params by merging fixed_pars with zero-initialized optimized params."""
+    initial: dict[str, Any] = dict(fixed_pars)
+
+    for block in blocks:
+        param_specs = block.params if isinstance(block.params, list) else [block.params]
+        for spec in param_specs:
+            if spec == "latents" and "latents" not in initial:
+                initial["latents"] = jnp.zeros((len(data), model.latent_size))
+
+    return initial
+
+
 def optimize_iterative(
     model: Lux,
     data: PolluxData,
-    blocks: list[ParameterBlock] | None = None,
+    blocks: list[ParameterBlock] | list[str] | None = None,
+    fixed_pars: dict[str, Any] | None = None,
     max_cycles: int = 10,
     tol: float = 1e-4,
     rng_key: jax.Array | None = None,
@@ -416,8 +452,18 @@ def optimize_iterative(
     data
         The training data.
     blocks
-        List of ParameterBlock specifications. If None, uses a default strategy
-        that alternates between latents and each output.
+        List of :class:`ParameterBlock` specifications, or a list of strings
+        naming which parameter groups to optimize (e.g. ``["latents"]``).
+        If strings are given, :class:`ParameterBlock` instances are constructed
+        automatically with an inferred optimizer (``"least_squares"`` for linear
+        transforms). If None, uses a default strategy that alternates between
+        latents and each output.
+    fixed_pars
+        Parameters to hold fixed during optimization. When provided alongside
+        string ``blocks``, the function initializes latents to zero and merges
+        ``fixed_pars`` with the optimized parameters before returning, so the
+        result contains a complete parameter dict. Ignored when ``initial_params``
+        is also provided (caller is responsible for merging in that case).
     max_cycles
         Maximum number of full optimization cycles.
     tol
@@ -425,7 +471,9 @@ def optimize_iterative(
     rng_key
         Random key for SVI-based optimization. Required if any block uses SVI.
     initial_params
-        Initial parameter values. If None, initialized from priors.
+        Initial parameter values. If None and ``fixed_pars`` is provided, built
+        automatically by merging ``fixed_pars`` with zero-initialized optimized
+        params. If both are None, initialized from priors.
     latents_prior
         Prior distribution for latents. If None, uses Normal(0, 1).
         Used to determine regularization strength for latent least squares.
@@ -437,7 +485,9 @@ def optimize_iterative(
     Returns
     -------
     IterativeOptimizationResult
-        The optimization result containing optimized parameters and convergence info.
+        The optimization result containing optimized parameters and convergence
+        info. When ``fixed_pars`` is provided, ``result.params`` includes both
+        the fixed and optimized parameters.
 
     Examples
     --------
@@ -455,10 +505,31 @@ def optimize_iterative(
     ... ]
     >>> result = optimize_iterative(model, data, blocks=blocks)  # doctest: +SKIP
 
+    Optimizing only latents with fixed output parameters (e.g. applying a
+    trained model to new test data):
+
+    >>> result = optimize_iterative(  # doctest: +SKIP
+    ...     model, test_data, blocks=["latents"], fixed_pars=trained_pars
+    ... )
+    >>> test_opt_pars = result.params  # already contains fixed + optimized  # doctest: +SKIP
+
     """
+    # Resolve blocks to list[ParameterBlock] | None (convert strings if needed)
+    _blocks: list[ParameterBlock] | None
+    if blocks is not None and len(blocks) > 0 and isinstance(blocks[0], str):
+        _blocks = [_string_to_parameter_block(model, name) for name in blocks]  # type: ignore[arg-type]
+    else:
+        _blocks = blocks  # type: ignore[assignment]
+
+    # Build initial_params from fixed_pars if not provided
+    if initial_params is None and fixed_pars is not None:
+        initial_params = _build_initial_params_from_fixed(
+            model, data, fixed_pars, _blocks or []
+        )
+
     # Default blocks: alternate between latents and each output
-    if blocks is None:
-        blocks = [
+    if _blocks is None:
+        _blocks = [
             ParameterBlock(
                 name="latents",
                 params="latents",
@@ -467,7 +538,7 @@ def optimize_iterative(
         ]
         for output_name, lux_output in model.outputs.items():
             transform = lux_output.data_transform
-            blocks.append(
+            _blocks.append(
                 ParameterBlock(
                     name=output_name,
                     params=f"{output_name}:data",
@@ -508,7 +579,7 @@ def optimize_iterative(
     for cycle in pbar:
         cycle_history: dict[str, Any] = {}
 
-        for block in blocks:
+        for block in _blocks:
             if block.optimizer == "least_squares":
                 current_params = _optimize_block_least_squares(
                     model, data, block, current_params, latents_prior
@@ -544,10 +615,10 @@ def optimize_iterative(
 
         # Check convergence
         if rel_change < tol:
-            pbar.set_postfix(
-                loss=f"{loss:.4g}",
-                status="converged",
-            )
+            pbar.set_description("Converged")
+            pbar.update(max_cycles - pbar.n)  # Complete the bar
+            pbar.set_postfix(loss=f"{loss:.4g}")
+            pbar.colour = "green"
             pbar.close()
             return IterativeOptimizationResult(
                 params=current_params,
@@ -558,6 +629,7 @@ def optimize_iterative(
             )
         prev_loss = loss
 
+    pbar.colour = "red"
     pbar.close()
 
     return IterativeOptimizationResult(

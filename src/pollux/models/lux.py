@@ -576,7 +576,8 @@ class Lux(eqx.Module):
     def optimize_iterative(
         self,
         data: PolluxData,
-        blocks: list["ParameterBlock"] | None = None,
+        blocks: "list[ParameterBlock] | list[str] | None" = None,
+        fixed_pars: UnpackedParamsT | None = None,
         max_cycles: int = 10,
         tol: float = 1e-4,
         rng_key: jax.Array | None = None,
@@ -600,9 +601,17 @@ class Lux(eqx.Module):
         data
             The training data.
         blocks
-            List of :class:`~pollux.models.ParameterBlock` specifications.
+            List of :class:`~pollux.models.ParameterBlock` specifications, or a
+            list of strings naming which parameter groups to optimize (e.g.
+            ``["latents"]``). When strings are provided, :class:`ParameterBlock`
+            instances are constructed automatically with an inferred optimizer.
             If None, uses a default strategy that alternates between latents
             and each output.
+        fixed_pars
+            Parameters to hold fixed during optimization. When provided alongside
+            string ``blocks``, the function initializes the optimized parameters
+            (e.g. latents to zero) and merges ``fixed_pars`` with them before
+            returning, so ``result.params`` is a complete parameter dict.
         max_cycles
             Maximum number of full optimization cycles.
         tol
@@ -610,7 +619,8 @@ class Lux(eqx.Module):
         rng_key
             Random key for initialization. If None, uses a default key.
         initial_params
-            Initial parameter values. If None, initialized from priors.
+            Initial parameter values. If None and ``fixed_pars`` is provided,
+            built automatically. If both are None, initialized from priors.
         latents_prior
             Prior distribution for latents. If None, uses Normal(0, 1).
             Used to determine regularization strength for latent least squares.
@@ -623,7 +633,8 @@ class Lux(eqx.Module):
         -------
         IterativeOptimizationResult
             The optimization result containing:
-            - ``params``: Optimized parameters in unpacked format
+            - ``params``: Optimized parameters in unpacked format (includes fixed
+              params when ``fixed_pars`` is provided)
             - ``losses_per_cycle``: Loss values at the end of each cycle
             - ``n_cycles``: Number of cycles completed
             - ``converged``: Whether optimization converged
@@ -656,11 +667,20 @@ class Lux(eqx.Module):
         ... ]
         >>> result = model.optimize_iterative(data, blocks=blocks)  # doctest: +SKIP
 
+        Optimizing only latents with fixed output parameters (e.g. applying a
+        trained model to test data):
+
+        >>> result = model.optimize_iterative(  # doctest: +SKIP
+        ...     test_data, blocks=["latents"], fixed_pars=trained_pars
+        ... )
+        >>> test_opt_pars = result.params  # contains fixed + optimized params  # doctest: +SKIP
+
         """
         return optimize_iterative(
             model=self,
             data=data,
             blocks=blocks,
+            fixed_pars=fixed_pars,
             max_cycles=max_cycles,
             tol=tol,
             rng_key=rng_key,

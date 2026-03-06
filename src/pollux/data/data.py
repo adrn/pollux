@@ -81,7 +81,7 @@ class OutputData(eqx.Module):
     err: BatchedDataT = eqx.field(
         default_factory=lambda: jnp.array(0.0), converter=jnp.asarray
     )
-    preprocessor: AbstractPreprocessor = eqx.field(default=NullPreprocessor())  # type: ignore[no-untyped-call]
+    preprocessor: AbstractPreprocessor = eqx.field(default=NullPreprocessor())
     processed: bool = eqx.field(default=False)
 
     def __post_init__(self) -> None:
