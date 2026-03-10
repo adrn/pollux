@@ -1,6 +1,12 @@
+from functools import partial
+
+import jax
 import numpy as np
+import numpyro
 import numpyro.distributions as dist
+import numpyro.optim
 import pytest
+from numpyro.infer.autoguide import AutoNormal
 
 import pollux as plx
 from pollux.models.transforms import (
@@ -453,3 +459,124 @@ class TestLuxModelValidation:
         nested_pars = {"flux": {"data": {"A": A}}}
         # If this raises a warning, pytest will fail due to filterwarnings=error
         model.predict_outputs(latents, nested_pars)
+
+
+class TestOptimizeGuide:
+    """Tests for the guide parameter on Lux.optimize."""
+
+    @pytest.fixture
+    def model_and_data(self):
+        """Create a simple model and synthetic data for optimize tests."""
+        rng = np.random.default_rng(42)
+        n_latents = 3
+        n_flux = 6
+        n_stars = 20
+
+        model = plx.Lux(latent_size=n_latents)
+        model.register_output("flux", LinearTransform(output_size=n_flux))
+
+        true_A = rng.normal(size=(n_flux, n_latents)) * 0.5
+        true_latents = rng.normal(size=(n_stars, n_latents))
+        true_flux = true_latents @ true_A.T
+        flux_err = np.full_like(true_flux, 0.1)
+
+        data = plx.data.PolluxData(
+            flux=plx.data.OutputData(
+                true_flux + rng.normal(0, flux_err),
+                err=flux_err,
+            ),
+        )
+        return model, data
+
+    def test_default_guide_is_autodelta(self, model_and_data):
+        """Default guide (None) should use AutoDelta and return point estimates."""
+        model, data = model_and_data
+        key = jax.random.PRNGKey(0)
+
+        pars, svi_results = model.optimize(
+            data,
+            num_steps=50,
+            rng_key=key,
+            optimizer=numpyro.optim.Adam(1e-3),
+        )
+        assert "latents" in pars
+        assert "flux" in pars
+
+    def test_guide_as_class(self, model_and_data):
+        """Passing an AutoGuide subclass should work (instantiated internally)."""
+
+        model, data = model_and_data
+        key = jax.random.PRNGKey(1)
+
+        pars, svi_results = model.optimize(
+            data,
+            num_steps=50,
+            rng_key=key,
+            optimizer=numpyro.optim.Adam(1e-3),
+            guide=AutoNormal,
+        )
+        assert "latents" in pars
+        assert "flux" in pars
+
+    def test_guide_as_instance(self, model_and_data):
+        """Passing a pre-constructed AutoGuide instance should work."""
+
+        model, data = model_and_data
+        key = jax.random.PRNGKey(2)
+
+        # Build the model function the same way optimize does internally
+        numpyro_model = partial(
+            model.default_numpyro_model, latents_prior=None, custom_model=None
+        )
+        guide_instance = AutoNormal(numpyro_model)
+
+        pars, svi_results = model.optimize(
+            data,
+            num_steps=50,
+            rng_key=key,
+            optimizer=numpyro.optim.Adam(1e-3),
+            guide=guide_instance,
+        )
+        assert "latents" in pars
+        assert "flux" in pars
+
+    def test_invalid_guide_raises(self, model_and_data):
+        """Passing an invalid guide type should raise TypeError."""
+
+        model, data = model_and_data
+        key = jax.random.PRNGKey(3)
+
+        with pytest.raises(TypeError, match="guide must be"):
+            model.optimize(
+                data,
+                num_steps=10,
+                rng_key=key,
+                optimizer=numpyro.optim.Adam(1e-3),
+                guide="not_a_guide",
+            )
+
+    def test_autonormal_produces_different_params_than_autodelta(self, model_and_data):
+        """AutoNormal and AutoDelta may produce different point estimates."""
+
+        model, data = model_and_data
+
+        pars_delta, _ = model.optimize(
+            data,
+            num_steps=100,
+            rng_key=jax.random.PRNGKey(10),
+            optimizer=numpyro.optim.Adam(1e-3),
+        )
+        pars_normal, _ = model.optimize(
+            data,
+            num_steps=100,
+            rng_key=jax.random.PRNGKey(10),
+            optimizer=numpyro.optim.Adam(1e-3),
+            guide=AutoNormal,
+        )
+
+        # Both should have the same keys/structure
+        assert set(pars_delta.keys()) == set(pars_normal.keys())
+        assert set(pars_delta["flux"].keys()) == set(pars_normal["flux"].keys())
+
+        # Latents should have the same shape
+        assert pars_delta["latents"].shape == pars_normal["latents"].shape

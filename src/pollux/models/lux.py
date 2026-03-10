@@ -10,7 +10,7 @@ import jax.numpy as jnp
 import numpyro
 import numpyro.distributions as dist
 from numpyro.infer import SVI, Trace_ELBO
-from numpyro.infer.autoguide import AutoDelta
+from numpyro.infer.autoguide import AutoDelta, AutoGuide
 
 from ..data import PolluxData
 from ..typing import (
@@ -525,11 +525,39 @@ class Lux(eqx.Module):
         fixed_pars: UnpackedParamsT | None = None,
         names: list[str] | None = None,
         svi_run_kwargs: dict[str, Any] | None = None,
+        guide: type[AutoGuide] | AutoGuide | None = None,
     ) -> tuple[UnpackedParamsT, Any]:
-        """Optimize the model parameters.
+        """Optimize the model parameters using SVI.
 
         Parameters
         ----------
+        data
+            The observed data to optimize against.
+        num_steps
+            Number of SVI optimization steps.
+        rng_key
+            JAX random key for the optimization.
+        optimizer
+            Numpyro optimizer to use. Defaults to ``numpyro.optim.Adam()``.
+        latents_prior
+            Prior distribution for the latent vectors. If ``None``, uses a unit
+            Gaussian. If ``False``, uses an improper uniform prior.
+        custom_model
+            Optional callable for custom modeling components.
+        fixed_pars
+            Parameters to hold fixed during optimization.
+        names
+            Output names to include. If ``None``, includes all outputs.
+        svi_run_kwargs
+            Additional keyword arguments passed to ``SVI.run()``.
+        guide
+            The autoguide to use for variational inference. Can be:
+
+            - ``None`` (default): uses ``AutoDelta`` for MAP estimation.
+            - A guide class (e.g. ``AutoNormal``): will be instantiated with the
+              model function.
+            - A guide instance: used directly (must already be constructed with
+              the model function).
 
         """
 
@@ -561,10 +589,22 @@ class Lux(eqx.Module):
 
         svi_run_kwargs = svi_run_kwargs or {}
 
-        guide = AutoDelta(model)
-        svi = SVI(model, guide, optimizer, Trace_ELBO())
+        if guide is None:
+            _guide = AutoDelta(model)
+        elif isinstance(guide, type) and issubclass(guide, AutoGuide):
+            _guide = guide(model)
+        elif isinstance(guide, AutoGuide):
+            _guide = guide
+        else:
+            msg = (
+                "guide must be None, an AutoGuide subclass, or an AutoGuide instance, "
+                f"got {type(guide)}"
+            )
+            raise TypeError(msg)
+
+        svi = SVI(model, _guide, optimizer, Trace_ELBO())
         svi_results = svi.run(svi_key, num_steps, data, **svi_run_kwargs)
-        packed_MAP_pars = guide.sample_posterior(sample_key, svi_results.params)
+        packed_MAP_pars = _guide.sample_posterior(sample_key, svi_results.params)
 
         unpacked_pars = self.unpack_numpyro_pars(
             packed_MAP_pars,

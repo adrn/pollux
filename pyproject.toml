@@ -182,7 +182,7 @@ ignore = [
 # typing-modules = ["pollux._compat.typing"]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["T20", "F841"]
+"tests/**" = ["T20", "F841", "RUF059"]
 "noxfile.py" = ["T20"]
 "**/__init__.py" = ["F401", "F403"]
 "docs/**" = ["T201"]
