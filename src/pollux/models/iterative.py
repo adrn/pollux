@@ -12,6 +12,7 @@ __all__ = [
     "optimize_iterative",
 ]
 
+import warnings
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -547,6 +548,35 @@ def optimize_iterative(
                     else None,
                 )
             )
+
+    # Warn if any output has err_transform parameters that are neither being
+    # optimized (in active blocks) nor intentionally held fixed (in fixed_pars)
+    active_block_params = {b.params for b in _blocks}
+    for output_name, lux_output in model.outputs.items():
+        err_key = f"{output_name}:err"
+        err_is_fixed = (
+            fixed_pars is not None
+            and output_name in fixed_pars
+            and "err" in fixed_pars[output_name]
+        )
+        if err_key not in active_block_params and not err_is_fixed:
+            et = lux_output.err_transform
+            priors = et.priors
+            has_params = (
+                any(len(p) > 0 for p in priors)
+                if isinstance(priors, tuple)
+                else len(priors) > 0
+            )
+            if has_params:
+                warnings.warn(
+                    f"Output '{output_name}' has an err_transform with learnable "
+                    f"parameters, but '{err_key}' is not in the active optimization "
+                    "blocks. These parameters will not be updated during iterative "
+                    f"optimization. To optimize them, add a ParameterBlock with "
+                    f"params='{err_key}'.",
+                    UserWarning,
+                    stacklevel=2,
+                )
 
     # Initialize parameters by sampling from priors
     if initial_params is None:
