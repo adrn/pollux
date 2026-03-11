@@ -88,6 +88,18 @@ def test_shift_scale_errors():
     assert np.allclose(preprocessor.transform_err(errors) * preprocessor.scale, errors)
 
 
+def test_shift_scale_constant_pixels_raises():
+    # Data where the second pixel (column) is constant across all samples - like a bad
+    # APOGEE detector pixel
+    data = np.array([[1.0, 5.0], [3.0, 5.0], [5.0, 5.0]])
+
+    with pytest.raises(ValueError, match="identical values"):
+        plx.data.ShiftScalePreprocessor.from_data(data)
+
+    with pytest.raises(ValueError, match="identical values"):
+        plx.data.ShiftScalePreprocessor.from_data_percentiles(data)
+
+
 def test_shift_scale_with_nans():
     # Create test data with NaNs
     data = np.array([[1.0, 2.0], [3.0, float("nan")], [5.0, 6.0]])
