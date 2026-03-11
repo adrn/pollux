@@ -174,7 +174,7 @@ if "GITHUB_TOKEN" in os.environ:
     print("GitHub Token found: retrieving artifact")
 
     # The name of your GitHub repository
-    rtds_action_github_repo = "adrn/[pollux]"
+    rtds_action_github_repo = "adrn/pollux"
 
     # The path where the artifact should be extracted
     # Note: this is relative to the conf.py file!
