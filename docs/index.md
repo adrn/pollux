@@ -39,14 +39,8 @@ In the future, we plan to provide stable releases through PyPI.
 
 The best way to get started with `pollux` is to work through the tutorials:
 
-```{toctree}
-:maxdepth: 1
-:caption: Tutorials
-
-tutorials/Lux-linear-simulated-data.ipynb
-tutorials/Lux-getting-started-apogee.ipynb
-tutorials/Lux-iterative-optimization.ipynb
-tutorials/Lux-simulated-data-underestimated-err.ipynb
+```{eval-rst}
+.. include:: _tutorials.rst
 ```
 
 ```{toctree}
