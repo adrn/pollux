@@ -617,7 +617,10 @@ class Lux(eqx.Module):
         tol
             Convergence tolerance. Stops when relative change in loss < tol.
         rng_key
-            Random key for initialization. If None, uses a default key.
+            JAX random key. Required when any block uses SVI (i.e.,
+            ``optimizer != "least_squares"``). If None and ``initial_params``
+            is also None, falls back to ``jax.random.PRNGKey(0)`` for
+            initialization from priors.
         initial_params
             Initial parameter values. If None and ``fixed_pars`` is provided,
             built automatically. If both are None, initialized from priors.
@@ -642,11 +645,13 @@ class Lux(eqx.Module):
 
         Notes
         -----
-        This method only supports models with linear transforms
-        (:class:`~pollux.models.LinearTransform`,
-        :class:`~pollux.models.AffineTransform`, or
-        :class:`~pollux.models.OffsetTransform`). For models with non-linear
-        transforms, use :meth:`optimize` instead.
+        For blocks with linear transforms (:class:`~pollux.models.LinearTransform`,
+        :class:`~pollux.models.AffineTransform`,
+        :class:`~pollux.models.OffsetTransform`), each sub-problem is solved
+        exactly via weighted least squares. For non-linear transforms, SVI is
+        used with ``numpyro.optim.Adam`` at ``step_size=1e-3`` by default;
+        override via ``optimizer_kwargs`` on the block, e.g.
+        ``ParameterBlock(..., optimizer_kwargs={"step_size": 1e-4})``.
 
         Regularization is automatically extracted from the priors on the
         transform parameters.

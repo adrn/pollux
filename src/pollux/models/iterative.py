@@ -56,10 +56,14 @@ class ParameterBlock:
     optimizer
         The optimizer to use for this block. If ``"least_squares"``, uses a closed-form
         weighted least squares solution (only valid for linear models).
-        If None, uses numpyro SVI with the default optimizer.
+        If None, uses numpyro SVI with ``numpyro.optim.Adam`` at ``step_size=1e-3``
+        by default. Pass a different optimizer class and/or set ``optimizer_kwargs``
+        to override.
     optimizer_kwargs
-        Keyword arguments to pass to the optimizer constructor (e.g., ``step_size`` for
-        Adam). Ignored when using ``"least_squares"`` optimizer.
+        Keyword arguments to pass to the optimizer constructor. When ``optimizer``
+        is None (i.e., Adam is used), the default is ``{"step_size": 1e-3}``; any
+        keys provided here override that default. Ignored when using
+        ``"least_squares"``.
     num_steps
         Number of optimization steps for this block (for SVI optimizers).
         Ignored for least_squares.
@@ -472,7 +476,10 @@ def optimize_iterative(
     tol
         Convergence tolerance. Stops when relative change in loss < tol.
     rng_key
-        Random key for SVI-based optimization. Required if any block uses SVI.
+        JAX random key. Required when any block uses SVI (i.e., ``optimizer !=
+        "least_squares"``) or when ``initial_params`` is None (used to sample
+        initial values from the model priors; falls back to
+        ``jax.random.PRNGKey(0)`` if not provided in that case).
     initial_params
         Initial parameter values. If None and ``fixed_pars`` is provided, built
         automatically by merging ``fixed_pars`` with zero-initialized optimized
@@ -491,6 +498,12 @@ def optimize_iterative(
         The optimization result containing optimized parameters and convergence
         info. When ``fixed_pars`` is provided, ``result.params`` includes both
         the fixed and optimized parameters.
+
+    Notes
+    -----
+    When a block has ``optimizer=None``, SVI is run with ``numpyro.optim.Adam``
+    at ``step_size=1e-3``. Override via ``optimizer_kwargs`` on the block, e.g.
+    ``ParameterBlock(..., optimizer_kwargs={"step_size": 1e-4})``.
 
     Examples
     --------
