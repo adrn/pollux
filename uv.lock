@@ -2107,6 +2107,7 @@ dev = [
     { name = "pytest-arraydiff" },
     { name = "pytest-cov" },
     { name = "pytz" },
+    { name = "rtds-action" },
     { name = "ruff" },
     { name = "sphinx" },
     { name = "sphinx-autodoc-typehints" },
@@ -2123,12 +2124,14 @@ dev = [
 docs = [
     { name = "astropy" },
     { name = "h5py" },
+    { name = "ipykernel" },
     { name = "ipywidgets" },
     { name = "jupyter-client" },
     { name = "matplotlib" },
     { name = "myst-nb" },
     { name = "myst-parser" },
     { name = "pytz" },
+    { name = "rtds-action" },
     { name = "sphinx" },
     { name = "sphinx-autodoc-typehints" },
     { name = "sphinx-book-theme" },
@@ -2175,6 +2178,7 @@ dev = [
     { name = "pytest-arraydiff", specifier = ">=0.6" },
     { name = "pytest-cov", specifier = ">=3" },
     { name = "pytz", specifier = ">=2024.2" },
+    { name = "rtds-action", specifier = ">=1.1.0" },
     { name = "ruff" },
     { name = "sphinx", specifier = ">=7.0" },
     { name = "sphinx-autodoc-typehints", specifier = ">=3.0.0" },
@@ -2191,12 +2195,14 @@ dev = [
 docs = [
     { name = "astropy", specifier = ">=7.2.0" },
     { name = "h5py", specifier = ">=3.16.0" },
+    { name = "ipykernel" },
     { name = "ipywidgets" },
     { name = "jupyter-client" },
     { name = "matplotlib" },
     { name = "myst-nb", specifier = ">=1.1.2" },
     { name = "myst-parser", specifier = ">=0.13" },
     { name = "pytz", specifier = ">=2024.2" },
+    { name = "rtds-action", specifier = ">=1.1.0" },
     { name = "sphinx", specifier = ">=7.0" },
     { name = "sphinx-autodoc-typehints", specifier = ">=3.0.0" },
     { name = "sphinx-book-theme", specifier = "==1.1.3" },
@@ -2748,6 +2754,21 @@ wheels = [
 ]
 
 [[package]]
+name = "rtds-action"
+version = "1.1.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "requests" },
+    { name = "setuptools" },
+    { name = "setuptools-scm" },
+    { name = "sphinx" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e5/f2/d6b99748e97ba132f856f1caa891d577da63bacb44a08eb4944e6511c986/rtds_action-1.1.0.tar.gz", hash = "sha256:f824851318a5d41550ae30edfb166dc6442bc9b9940a50ea06e649cd471f6ac1", size = 81459, upload-time = "2023-06-01T11:44:34.68Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/40/54/b9aaf8e4867e95ac8ea27cd3249946c62c58058779e998040442d6d07625/rtds_action-1.1.0-py2.py3-none-any.whl", hash = "sha256:097a73eac507387a32b24c3da690f3a876936cb56150aa1786d52a9a67cd62f9", size = 6660, upload-time = "2023-06-01T11:44:33.475Z" },
+]
+
+[[package]]
 name = "ruff"
 version = "0.14.13"
 source = { registry = "https://pypi.org/simple" }
@@ -2864,6 +2885,19 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/18/5d/3bf57dcd21979b887f014ea83c24ae194cfcd12b9e0fda66b957c69d1fca/setuptools-80.9.0.tar.gz", hash = "sha256:f36b47402ecde768dbfafc46e8e4207b4360c654f1f3bb84475f0a28628fb19c", size = 1319958, upload-time = "2025-05-27T00:56:51.443Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/a3/dc/17031897dae0efacfea57dfd3a82fdd2a2aeb58e0ff71b77b87e44edc772/setuptools-80.9.0-py3-none-any.whl", hash = "sha256:062d34222ad13e0cc312a4c02d73f059e86a4acbfbdea8f8f76b28c99f306922", size = 1201486, upload-time = "2025-05-27T00:56:49.664Z" },
+]
+
+[[package]]
+name = "setuptools-scm"
+version = "9.2.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "packaging" },
+    { name = "setuptools" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/7b/b1/19587742aad604f1988a8a362e660e8c3ac03adccdb71c96d86526e5eb62/setuptools_scm-9.2.2.tar.gz", hash = "sha256:1c674ab4665686a0887d7e24c03ab25f24201c213e82ea689d2f3e169ef7ef57", size = 203385, upload-time = "2025-10-19T22:08:05.608Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/3d/ea/ac2bf868899d0d2e82ef72d350d97a846110c709bacf2d968431576ca915/setuptools_scm-9.2.2-py3-none-any.whl", hash = "sha256:30e8f84d2ab1ba7cb0e653429b179395d0c33775d54807fc5f1dd6671801aef7", size = 62975, upload-time = "2025-10-19T22:08:04.007Z" },
 ]
 
 [[package]]
