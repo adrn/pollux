@@ -397,7 +397,7 @@ def _string_to_parameter_block(model: Lux, name: str) -> ParameterBlock:
         optimizer = "least_squares" if _all_outputs_linear(model) else None
         return ParameterBlock(name="latents", params="latents", optimizer=optimizer)
 
-    output_name = name.split(":")[0]
+    output_name = name.split(":", maxsplit=1)[0]
     if output_name not in model.outputs:
         msg = f"Unknown parameter block: '{name}'"
         raise ValueError(msg)
@@ -430,7 +430,7 @@ def optimize_iterative(
     data: PolluxData,
     blocks: list[ParameterBlock] | list[str] | None = None,
     fixed_pars: dict[str, Any] | None = None,
-    max_cycles: int = 10,
+    max_cycles: int = 100,
     tol: float = 1e-4,
     rng_key: jax.Array | None = None,
     initial_params: dict[str, Any] | None = None,
