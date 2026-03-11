@@ -1,0 +1,77 @@
+name: Tutorials
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  release:
+    types:
+      - published
+
+jobs:
+  check_skip_flags:
+    name: Check skip flags
+    runs-on: ubuntu-latest
+    outputs:
+      head-commit-message:
+        ${{ steps.get_head_commit_message.outputs.HEAD_COMMIT_MESSAGE }}
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.GITHUB_SHA }}
+      - name: Get head commit message
+        id: get_head_commit_message
+        run: echo "HEAD_COMMIT_MESSAGE=$(git show -s --format=%s)" >> "$GITHUB_OUTPUT"
+
+  notebooks:
+    name: "Build the notebooks for the docs"
+    runs-on: ubuntu-latest
+    needs: check_skip_flags
+    if:
+      ${{ github.event.pull_request.draft == false &&
+      !contains(github.event.pull_request.labels.*.name, 'skip docs') &&
+      !contains(needs.check_skip_flags.outputs.head-commit-message, '[skip docs]') }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install
+
+      - name: Install dependencies
+        run: uv sync --group docs
+
+      - name: Download APOGEE data
+        uses: ethanjli/cached-download-action@v0.1.3
+        with:
+          url: https://users.flatironinstitute.org/~apricewhelan/pollux/rgb-highSNR-1k-1chip.h5
+          destination: docs/_data/rgb-highSNR-1k-1chip.h5
+
+      - name: Execute the notebooks
+        run: |
+          for nb in docs/tutorials/*.ipynb; do
+            echo "Executing $nb"
+            uv run jupyter nbconvert --to notebook --execute --inplace "$nb"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: notebooks-for-${{ github.sha }}
+          path: docs/tutorials
+
+      - name: Trigger RTDs build
+        if: ${{ github.event_name != 'pull_request' }}
+        uses: dfm/rtds-action@v1.1.0
+        with:
+          webhook_url: ${{ secrets.RTDS_WEBHOOK_URL }}
+          webhook_token: ${{ secrets.RTDS_WEBHOOK_TOKEN }}
+          commit_ref: ${{ github.ref }}

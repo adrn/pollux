@@ -48,6 +48,7 @@ test = [
 docs = [
   "astropy>=7.2.0",
   "h5py>=3.16.0",
+  "ipykernel",
   "ipywidgets",
   "jupyter_client",
   "matplotlib",
