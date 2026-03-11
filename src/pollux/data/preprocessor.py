@@ -186,7 +186,7 @@ class ShiftScalePreprocessor(AbstractPreprocessor):
             )
             / 2.0
         )[0]
-        constant_mask = _scale == 0
+        constant_mask = jnp.std(data, axis=axis) == 0
         if jnp.any(constant_mask):
             (bad_idx,) = jnp.where(jnp.atleast_1d(constant_mask))
             msg = (
