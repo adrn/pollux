@@ -5,12 +5,28 @@ list see the documentation:
 # https://www.sphinx-doc.org/en/master/usage/configuration.html
 """
 
+import urllib.request
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import pytz
 
 from pollux import __version__
+
+# -- Tutorial data -----------------------------------------------------------
+
+_DATA_DIR = Path(__file__).parent / "_data"
+_TUTORIAL_DATA = {
+    "rgb-highSNR-1k-1chip.h5": "https://users.flatironinstitute.org/~apricewhelan/pollux/rgb-highSNR-1k-1chip.h5",
+}
+
+_DATA_DIR.mkdir(exist_ok=True)
+for _filename, _url in _TUTORIAL_DATA.items():
+    _path = _DATA_DIR / _filename
+    if not _path.exists():
+        print(f"Downloading tutorial data: {_filename}")
+        urllib.request.urlretrieve(_url, _path)
 
 # -- Project information -----------------------------------------------------
 
@@ -45,6 +61,7 @@ python_use_unqualified_type_names = True
 
 exclude_patterns = [
     "_build",
+    "_data",
     "**.ipynb_checkpoints",
     "Thumbs.db",
     ".DS_Store",

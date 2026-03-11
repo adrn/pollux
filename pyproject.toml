@@ -46,6 +46,8 @@ test = [
   "pytest-arraydiff >=0.6",
 ]
 docs = [
+  "astropy>=7.2.0",
+  "h5py>=3.16.0",
   "ipywidgets",
   "jupyter_client",
   "matplotlib",
