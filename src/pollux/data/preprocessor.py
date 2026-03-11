@@ -140,7 +140,19 @@ class ShiftScalePreprocessor(AbstractPreprocessor):
         axis
             The axis along which to compute the mean and standard deviation.
         """
-        return cls(jnp.mean(data, axis=axis), jnp.std(data, axis=axis))
+        scale = jnp.std(data, axis=axis)
+        constant_mask = scale == 0
+        if jnp.any(constant_mask):
+            (bad_idx,) = jnp.where(jnp.atleast_1d(constant_mask))
+            msg = (
+                f"Found {len(bad_idx)} feature(s) with identical values across all "
+                f"samples (e.g., bad detector pixels). These features have zero "
+                f"variance and cannot be normalized. Feature indices: "
+                f"{bad_idx.tolist()}. Remove or mask these features before "
+                "preprocessing."
+            )
+            raise ValueError(msg)
+        return cls(jnp.mean(data, axis=axis), scale)
 
     @classmethod
     def from_data_percentiles(
@@ -174,6 +186,17 @@ class ShiftScalePreprocessor(AbstractPreprocessor):
             )
             / 2.0
         )[0]
+        constant_mask = jnp.std(data, axis=axis) == 0
+        if jnp.any(constant_mask):
+            (bad_idx,) = jnp.where(jnp.atleast_1d(constant_mask))
+            msg = (
+                f"Found {len(bad_idx)} feature(s) with identical values across all "
+                f"samples (e.g., bad detector pixels). These features have zero "
+                f"variance and cannot be normalized. Feature indices: "
+                f"{bad_idx.tolist()}. Remove or mask these features before "
+                "preprocessing."
+            )
+            raise ValueError(msg)
         return cls(jnp.nanpercentile(data, loc_percentile, axis=axis), _scale)
 
     def transform(self, X: BatchedDataT) -> BatchedDataT:
