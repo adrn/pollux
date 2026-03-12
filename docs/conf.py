@@ -191,6 +191,7 @@ if "GITHUB_TOKEN" in os.environ:
     rtds_action_error_if_missing = True
 
 else:
+    print("No GitHub Token found: skipping artifact retrieval")
     rtds_action_github_repo = ""
     rtds_action_github_token = ""
     rtds_action_path = ""
