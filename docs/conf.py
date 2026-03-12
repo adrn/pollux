@@ -177,8 +177,8 @@ if "GITHUB_TOKEN" in os.environ:
     rtds_action_github_repo = "adrn/pollux"
 
     # The path where the artifact should be extracted
-    # Note: this is relative to the conf.py file!
-    rtds_action_path = "tutorials"
+    # Note: this is relative to the CWD when sphinx runs (the repo root on RTD)
+    rtds_action_path = "docs/tutorials"
 
     # The "prefix" used in the `upload-artifact` step of the action
     rtds_action_artifact_prefix = "notebooks-for-"
