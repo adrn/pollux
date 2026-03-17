@@ -64,7 +64,7 @@ jobs:
             uv run jupyter nbconvert --to notebook --execute --inplace "$nb"
           done
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: notebooks-for-${{ github.sha }}
           path: docs/tutorials
