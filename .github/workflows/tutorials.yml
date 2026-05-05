@@ -52,7 +52,7 @@ jobs:
         run: uv sync --group docs
 
       - name: Download APOGEE data
-        uses: ethanjli/cached-download-action@v0.1.3
+        uses: ethanjli/cached-download-action@v0.1.4
         with:
           url: https://users.flatironinstitute.org/~apricewhelan/pollux/rgb-highSNR-1k-1chip.h5
           destination: docs/_data/rgb-highSNR-1k-1chip.h5
