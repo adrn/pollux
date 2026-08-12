@@ -21,6 +21,7 @@ __all__ = [
 
 import abc
 import inspect
+from collections.abc import Callable
 from itertools import accumulate, combinations_with_replacement
 from math import comb
 from typing import Any
@@ -276,7 +277,10 @@ class AbstractMultiTransform(AbstractTransform):
     @property
     def names_nested(self) -> tuple[tuple[str, ...], ...]:
         """Parameter names grouped by child transform."""
-        return tuple(t._param_names for t in self.transforms)  # type: ignore[attr-defined]
+        # Every concrete transform defines _param_names, as a field or a
+        # property, but it cannot be declared on AbstractTransform: eqx.AbstractVar
+        # reads as a required dataclass field, which then breaks every constructor.
+        return tuple(t._param_names for t in self.transforms)  # ty: ignore[unresolved-attribute]
 
     @property
     def names_flat(self) -> tuple[str, ...]:
@@ -1143,10 +1147,11 @@ class EquinoxNNTransform(AbstractTransform):
             )
             raise RuntimeError(msg)
 
-        # Reconstruct the NN, swapping in whichever parameters were provided
+        # Reconstruct the NN, swapping in whichever parameters were provided.
+        # Typed as a callable because that is what this transform requires of it.
         arrays, static = eqx.partition(self._template_nn, eqx.is_array)
         leaves, treedef = jtu.tree_flatten(arrays)
-        nn: eqx.Module = eqx.combine(
+        nn: Callable[[jax.Array], jax.Array] = eqx.combine(
             jtu.tree_unflatten(
                 treedef,
                 [
@@ -1159,11 +1164,7 @@ class EquinoxNNTransform(AbstractTransform):
 
         # Apply NN to each latent vector using vmap
         # The nn is an eqx.Module which is callable via __call__
-        def forward(x: jax.Array) -> jax.Array:
-            result: jax.Array = nn(x)  # type: ignore[operator]
-            return result
-
-        return jax.vmap(forward)(latents)
+        return jax.vmap(nn)(latents)
 
     def unpack_pars(
         self, flat_pars: dict[str, Any], ignore_missing: bool = False

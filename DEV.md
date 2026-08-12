@@ -19,10 +19,11 @@ uv run pytest --ignore=tests/integration # skip the slow SVI fits (~14s)
 `pytest` collects `src`, `docs`, and `tests`, so docstring examples run too.
 `tests/integration/` fits real models and accounts for most of the runtime.
 
-Linters, on all files rather than just staged ones:
+Type checking and linters, on all files rather than just staged ones:
 
 ```bash
-uv run pre-commit run --all-files
+uv run ty check src
+uv run pre-commit run --all-files   # includes ty, ruff, and the rest
 ```
 
 ## Docs

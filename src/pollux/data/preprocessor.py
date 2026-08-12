@@ -1,5 +1,4 @@
 from abc import abstractmethod
-from typing import Any
 
 import equinox as eqx
 import jax
@@ -68,8 +67,9 @@ class NullPreprocessor(AbstractPreprocessor):
         pass
 
     @classmethod
-    def from_data(cls, *_: Any) -> "NullPreprocessor":
-        """Compute preprocessing parameters from data."""
+    def from_data(cls, data: BatchedDataT) -> "NullPreprocessor":
+        """Return a preprocessor; there is nothing to compute from the data."""
+        del data
         return cls()
 
     def transform(self, X: BatchedDataT) -> BatchedDataT:
