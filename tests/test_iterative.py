@@ -1,6 +1,7 @@
 """Tests for iterative optimization."""
 
 import inspect
+import warnings
 
 import jax
 import jax.numpy as jnp
@@ -11,13 +12,14 @@ import pytest
 
 import pollux as plx
 from pollux._linalg import weighted_least_squares
+from pollux.exceptions import PolluxLinearizationWarning
 from pollux.models.iterative import (
     IterativeOptimizationResult,
     ParameterBlock,
     _build_fixed_pars,
     _get_regularization_from_prior,
-    _is_linear_transform,
     _latents_probe_point,
+    _least_squares_blocker,
     _linearize_latents,
     _optimize_block_numpyro,
     _solve_latents_least_squares,
@@ -100,22 +102,44 @@ class TestGetRegularizationFromPrior:
         assert jnp.isclose(prior_mean, 0.0)
 
 
-class TestIsLinearTransform:
-    """Tests for _is_linear_transform utility."""
+class TestLeastSquaresBlocker:
+    """Which blocks get a closed-form solve is decided by structure, not by type."""
 
-    def test_linear_transform_is_linear(self):
-        trans = LinearTransform(output_size=8)
-        assert _is_linear_transform(trans) is True
+    def test_bare_linear_transform_is_solvable(self, linear_model_and_data):
+        model, data = linear_model_and_data["model"], linear_model_and_data["data"]
+        params = {"flux": {"data": {"A": jnp.array(linear_model_and_data["true_A"])}}}
+        block = ParameterBlock("flux", "flux:data", optimizer="least_squares")
+        assert _least_squares_blocker(model, data, params, block) is None
 
-    def test_sequence_not_supported(self):
-        trans = TransformSequence(
-            transforms=(
-                LinearTransform(output_size=8),
-                LinearTransform(output_size=4),
+    def test_a_sequence_of_linear_pieces_is_solvable(self):
+        """A composition used to be refused outright for being a TransformSequence."""
+        n_stars, n_out = 8, 5
+        model = plx.Lux(latent_size=4)
+        model.register_output(
+            "flux",
+            TransformSequence(
+                (_latent_slice(0, 2), LinearTransform(output_size=n_out))
+            ),
+        )
+        data = plx.data.PolluxData(
+            flux=plx.data.OutputData(
+                jnp.ones((n_stars, n_out)), err=jnp.full((n_stars, n_out), 0.1)
             )
         )
-        # TransformSequence is not supported for iterative optimization
-        assert _is_linear_transform(trans) is False
+        params = {
+            "flux": {"data": ({}, {"A": jnp.zeros((n_out, 2))})},
+            "latents": jnp.zeros((n_stars, 4)),
+        }
+        for spec in ("latents", "flux:data"):
+            block = ParameterBlock(spec, spec, optimizer="least_squares")
+            assert _least_squares_blocker(model, data, params, block) is None
+
+    def test_error_transform_blocks_are_declined(self, linear_model_and_data):
+        model, data = linear_model_and_data["model"], linear_model_and_data["data"]
+        block = ParameterBlock("flux-err", "flux:err", optimizer="least_squares")
+        reason = _least_squares_blocker(model, data, {}, block)
+        assert reason is not None
+        assert "error transform" in reason
 
 
 class TestParameterBlock:
@@ -498,6 +522,89 @@ class TestSolveOutputParamsComposed:
             _solve_output_params_least_squares(model, data, "flux", jnp.zeros((8, 3)))
 
 
+class TestOptimizeIterativePartitionedLatents:
+    """End to end: a model whose latent vector is split between two linear branches."""
+
+    @pytest.fixture
+    def partitioned_model_and_data(self):
+        n_stars, n_spec, n_labels = 256, 12, 3
+        rng = np.random.default_rng(17)
+        latents = jnp.array(rng.normal(size=(n_stars, 4)))
+        A_spec = jnp.array(rng.normal(size=(n_spec, 2)))
+        A_labels = jnp.array(rng.normal(size=(n_labels, 2)))
+
+        model = plx.Lux(latent_size=4)
+        model.register_output(
+            "spec",
+            TransformSequence(
+                (_latent_slice(0, 2), LinearTransform(output_size=n_spec))
+            ),
+        )
+        model.register_output(
+            "labels",
+            TransformSequence(
+                (_latent_slice(2, 4), LinearTransform(output_size=n_labels))
+            ),
+        )
+
+        # Noiseless, so the test measures whether the solve finds the right subspace
+        # rather than how much noise a 4-latent model can absorb
+        data = plx.data.PolluxData(
+            spec=plx.data.OutputData(
+                latents[:, :2] @ A_spec.T, err=jnp.full((n_stars, n_spec), 1e-2)
+            ),
+            labels=plx.data.OutputData(
+                latents[:, 2:] @ A_labels.T, err=jnp.full((n_stars, n_labels), 1e-2)
+            ),
+        )
+        return model, data, latents, A_spec, A_labels
+
+    def test_every_block_uses_the_closed_form_solve(self, partitioned_model_and_data):
+        """This model ran entirely on Adam before: the branches are FunctionTransforms."""
+        model, data, *_ = partitioned_model_and_data
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")  # no fallback warning may be raised
+            result = optimize_iterative(
+                model,
+                data,
+                max_cycles=3,
+                rng_key=jax.random.PRNGKey(0),
+                progress=False,
+            )
+
+        assert [b.optimizer for b in result.blocks] == ["least_squares"] * 3
+        assert [b.name for b in result.blocks] == [
+            "latents",
+            "spec:data",
+            "labels:data",
+        ]
+
+    def test_recovers_the_generating_parameters(self, partitioned_model_and_data):
+        model, data, latents, A_spec, A_labels = partitioned_model_and_data
+
+        result = optimize_iterative(
+            model,
+            data,
+            max_cycles=100,
+            tol=1e-12,
+            rng_key=jax.random.PRNGKey(0),
+            latents_prior=dist.Normal(0.0, 1e3),
+            progress=False,
+        )
+
+        # The factorization is only fixed up to a linear reparametrization within each
+        # branch, so compare predictions rather than the individual factors.
+        # Alternating least squares converges linearly on a bilinear problem, so the
+        # tolerance is loose: what matters is that it heads for the right answer.
+        predictions = model.predict_outputs(result.params["latents"], result.params)
+        assert jnp.allclose(predictions["spec"], latents[:, :2] @ A_spec.T, atol=2e-2)
+        assert jnp.allclose(
+            predictions["labels"], latents[:, 2:] @ A_labels.T, atol=2e-2
+        )
+        assert result.losses_per_cycle[-1] < result.losses_per_cycle[0]
+
+
 class TestOptimizeIterative:
     """Tests for the main optimize_iterative function."""
 
@@ -794,23 +901,42 @@ class TestOptimizeIterativeWithNonlinear:
         return model, data
 
     def test_optimize_iterative_nonlinear_runs(self, nonlinear_model_and_data):
-        """Test that optimize_iterative runs with non-linear transforms."""
+        """Non-linear transforms fall back to SVI, and say so on the way."""
         model, data = nonlinear_model_and_data
 
         # Use default blocks (should auto-detect non-linear and use numpyro)
-        result = optimize_iterative(
-            model,
-            data,
-            max_cycles=2,
-            rng_key=jax.random.PRNGKey(42),
-            progress=False,
-        )
+        with pytest.warns(
+            PolluxLinearizationWarning, match="not affine in the latents"
+        ):
+            result = optimize_iterative(
+                model,
+                data,
+                max_cycles=2,
+                rng_key=jax.random.PRNGKey(42),
+                progress=False,
+            )
 
         assert isinstance(result, IterativeOptimizationResult)
         assert result.n_cycles >= 1
         assert len(result.losses_per_cycle) >= 1
         assert "latents" in result.params
         assert "flux" in result.params
+        # Every block ran with SVI, and the result says which
+        assert [b.optimizer for b in result.blocks] == [None, None]
+
+    def test_the_fallback_warning_can_be_silenced(self, nonlinear_model_and_data):
+        """The warning is a category, so the stdlib filter machinery turns it off."""
+        model, data = nonlinear_model_and_data
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            warnings.filterwarnings("ignore", category=PolluxLinearizationWarning)
+            optimize_iterative(
+                model,
+                data,
+                max_cycles=1,
+                rng_key=jax.random.PRNGKey(42),
+                progress=False,
+            )
 
     def test_optimize_iterative_nonlinear_loss_decreases(
         self, nonlinear_model_and_data
@@ -922,21 +1048,30 @@ class TestMixedLinearNonlinear:
         return model, data
 
     def test_mixed_model_auto_blocks(self, mixed_model_and_data):
-        """Test that auto-generated blocks correctly identify linear vs non-linear."""
+        """One non-linear output blocks the shared latents, but not the linear output."""
         model, data = mixed_model_and_data
 
-        result = optimize_iterative(
-            model,
-            data,
-            max_cycles=2,
-            rng_key=jax.random.PRNGKey(42),
-            progress=False,
-        )
+        with pytest.warns(PolluxLinearizationWarning) as record:
+            result = optimize_iterative(
+                model,
+                data,
+                max_cycles=2,
+                rng_key=jax.random.PRNGKey(42),
+                progress=False,
+            )
 
         assert isinstance(result, IterativeOptimizationResult)
         assert "latents" in result.params
         assert "label" in result.params
         assert "flux" in result.params
+
+        # The latents couple every output, so one non-linear output rules them out;
+        # the linear output's own parameters are still solved in closed form
+        by_name = {b.name: b.optimizer for b in result.blocks}
+        assert by_name["latents"] is None
+        assert by_name["flux:data"] is None
+        assert by_name["label:data"] == "least_squares"
+        assert "2 of 3 blocks" in str(record[0].message)
 
     def test_mixed_model_explicit_blocks(self, mixed_model_and_data):
         """Test mixed model with explicit block specification."""

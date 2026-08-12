@@ -14,7 +14,7 @@ __all__ = [
 
 import warnings
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import partial
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -25,23 +25,19 @@ import numpyro.distributions as dist
 from numpyro.infer import SVI, Predictive, Trace_ELBO
 from numpyro.infer.autoguide import AutoDelta
 from tqdm.auto import tqdm
-from typing_extensions import TypeIs
 
 from .._linalg import weighted_least_squares
 from ..data import OutputData, PolluxData
+from ..exceptions import PolluxLinearizationWarning
 from .transforms import (
     AbstractTransform,
     AffineTransform,
     LinearTransform,
-    OffsetTransform,
     TransformSequence,
 )
 
 if TYPE_CHECKING:
     from .lux import Lux
-
-#: Transforms whose least squares sub-problem has a closed-form solution
-type LinearTransformT = LinearTransform | AffineTransform | OffsetTransform
 
 
 @dataclass
@@ -124,6 +120,10 @@ class IterativeOptimizationResult:
         Number of full cycles completed.
     converged
         Whether the optimization converged according to tolerance.
+    blocks
+        The parameter blocks as they were actually run, after checking which ones
+        could use a closed-form solve. Inspect ``block.optimizer`` to see what each
+        block got: ``"least_squares"`` for the exact solve, anything else for SVI.
 
     """
 
@@ -131,15 +131,7 @@ class IterativeOptimizationResult:
     losses_per_cycle: list[float]
     n_cycles: int
     converged: bool
-
-
-def _is_linear_transform(transform: Any) -> TypeIs[LinearTransformT]:
-    """Check if a transform is linear (amenable to least squares).
-
-    Note: TransformSequence is not supported for iterative optimization,
-    even if all component transforms are linear.
-    """
-    return isinstance(transform, (LinearTransform, AffineTransform, OffsetTransform))
+    blocks: list[ParameterBlock] = field(default_factory=list)
 
 
 def _split_param_layer(
@@ -224,6 +216,21 @@ def _linearize_latents(
     if residual > _AFFINE_RTOL * jnp.abs(pred).max():
         return None
     return c, jvp, jax.linear_transpose(jvp, z0)
+
+
+def _output_predict_fn(
+    model: Lux, output_name: str, params: dict[str, Any]
+) -> JVPFuncT:
+    """The latents -> prediction map for one output, with its parameters bound.
+
+    Goes through :meth:`~pollux.models.Lux.predict_outputs` so the solvers linearize
+    exactly what the model predicts, and cannot drift away from it.
+    """
+
+    def predict(latents: jax.Array) -> jax.Array:
+        return model.predict_outputs(latents, params, names=[output_name])[output_name]
+
+    return predict
 
 
 def _latents_probe_point(
@@ -340,12 +347,9 @@ def _solve_latents_least_squares(
         if output_name not in data:
             continue
 
-        # Linearize exactly what the model predicts, so the solver cannot drift
-        # away from predict_outputs
-        def predict(z: jax.Array, name: str = output_name) -> jax.Array:
-            return model.predict_outputs(z, current_params, names=[name])[name]
-
-        linearized = _linearize_latents(predict, z0, probe)
+        linearized = _linearize_latents(
+            _output_predict_fn(model, output_name, current_params), z0, probe
+        )
         if linearized is None:
             msg = (
                 f"Output '{output_name}' is not affine in the latents, so the latents "
@@ -497,20 +501,84 @@ def _solve_output_params_least_squares(
 
 
 def _string_to_parameter_block(model: Lux, name: str) -> ParameterBlock:
-    """Convert a string block name to a ParameterBlock with inferred optimizer."""
-    optimizer: Literal["least_squares"] | None
-    if name == "latents":
-        optimizer = "least_squares" if _all_outputs_linear(model) else None
-        return ParameterBlock(name="latents", params="latents", optimizer=optimizer)
+    """Convert a string block name to a ParameterBlock that asks for a closed form.
 
-    output_name = name.split(":", maxsplit=1)[0]
-    if output_name not in model.outputs:
+    Whether it gets one is decided later by :func:`_resolve_blocks`, which can see
+    the current parameters and so can actually test the transform.
+    """
+    if name != "latents" and name.split(":", maxsplit=1)[0] not in model.outputs:
         msg = f"Unknown parameter block: '{name}'"
         raise ValueError(msg)
+    return ParameterBlock(name=name, params=name, optimizer="least_squares")
 
-    transform = model.outputs[output_name].data_transform
-    optimizer = "least_squares" if _is_linear_transform(transform) else None
-    return ParameterBlock(name=name, params=name, optimizer=optimizer)
+
+def _least_squares_blocker(
+    model: Lux,
+    data: PolluxData,
+    current_params: dict[str, Any],
+    block: ParameterBlock,
+) -> str | None:
+    """Why this block cannot be solved in closed form, or None if it can be."""
+    for spec in block.params_list:
+        if spec == "latents":
+            z0 = jnp.zeros((len(data), model.latent_size))
+            probe = _latents_probe_point(current_params.get("latents"), z0.shape)
+            for output_name in model.outputs:
+                if output_name in data and (
+                    _linearize_latents(
+                        _output_predict_fn(model, output_name, current_params),
+                        z0,
+                        probe,
+                    )
+                    is None
+                ):
+                    return f"output '{output_name}' is not affine in the latents"
+            continue
+
+        output_name, _, param_type = spec.partition(":")
+        if param_type == "err":
+            return f"'{spec}' is an error transform, which has no closed-form solve"
+        if _split_param_layer(model.outputs[output_name].data_transform) is None:
+            return (
+                f"output '{output_name}' does not end in a linear layer holding all "
+                "of its parameters"
+            )
+    return None
+
+
+def _resolve_blocks(
+    model: Lux,
+    data: PolluxData,
+    current_params: dict[str, Any],
+    blocks: list[ParameterBlock],
+) -> list[ParameterBlock]:
+    """Verify every block that wants a closed-form solve, downgrading those that can't.
+
+    Blocks the caller explicitly assigned an SVI optimizer are left alone -- that was
+    a choice, not a fallback, so it is not worth warning about.
+    """
+    resolved = []
+    fallbacks = []
+    for block in blocks:
+        if block.optimizer == "least_squares":
+            reason = _least_squares_blocker(model, data, current_params, block)
+            if reason is not None:
+                block = replace(block, optimizer=None)  # noqa: PLW2901
+                fallbacks.append((block.name, reason))
+        resolved.append(block)
+
+    if fallbacks:
+        detail = "\n".join(f"  {name:<12} - {reason}" for name, reason in fallbacks)
+        warnings.warn(
+            f"optimize_iterative could not use closed-form solves for "
+            f"{len(fallbacks)} of {len(blocks)} blocks, falling back to SVI/Adam:\n"
+            f"{detail}\n"
+            'Silence with warnings.filterwarnings("ignore", '
+            "category=pollux.exceptions.PolluxLinearizationWarning)",
+            PolluxLinearizationWarning,
+            stacklevel=3,
+        )
+    return resolved
 
 
 def _build_initial_params_from_fixed(
@@ -626,29 +694,20 @@ def optimize_iterative(
     >>> test_opt_pars = result.params  # already contains fixed + optimized  # doctest: +SKIP
 
     """
-    # Resolve blocks to list[ParameterBlock] | None, converting any string specs.
-    # Done per element rather than by sniffing blocks[0], so a mixed list works.
-    _blocks: list[ParameterBlock] | None = (
-        None
-        if blocks is None
-        else [
-            _string_to_parameter_block(model, b) if isinstance(b, str) else b
-            for b in blocks
-        ]
-    )
+    # Default blocks: alternate between latents and each output. String specs are
+    # converted per element rather than by sniffing blocks[0], so a mixed list works.
+    if blocks is None:
+        blocks = ["latents", *(f"{o}:data" for o in model.outputs)]
+    _blocks: list[ParameterBlock] = [
+        _string_to_parameter_block(model, b) if isinstance(b, str) else b
+        for b in blocks
+    ]
 
     # Build initial_params from fixed_pars if not provided
     if initial_params is None and fixed_pars is not None:
         initial_params = _build_initial_params_from_fixed(
-            model, data, fixed_pars, _blocks or []
+            model, data, fixed_pars, _blocks
         )
-
-    # Default blocks: alternate between latents and each output
-    if _blocks is None:
-        _blocks = [
-            _string_to_parameter_block(model, name)
-            for name in ("latents", *(f"{o}:data" for o in model.outputs))
-        ]
 
     # Warn if any output has err_transform parameters that are neither being
     # optimized (in active blocks) nor intentionally held fixed (in fixed_pars)
@@ -694,6 +753,11 @@ def optimize_iterative(
         current_params = model.unpack_numpyro_pars(packed_samples)
     else:
         current_params = initial_params
+
+    # Now that there are parameters to probe with, settle which blocks actually get a
+    # closed-form solve. Done once here rather than per cycle: the answer is a
+    # property of the model's structure, not of the current parameter values.
+    _blocks = _resolve_blocks(model, data, current_params, _blocks)
 
     losses_per_cycle: list[float] = []
 
@@ -755,13 +819,7 @@ def optimize_iterative(
         losses_per_cycle=losses_per_cycle,
         n_cycles=n_cycles,
         converged=converged,
-    )
-
-
-def _all_outputs_linear(model: Lux) -> bool:
-    """Check if all model outputs use linear transforms."""
-    return all(
-        _is_linear_transform(out.data_transform) for out in model.outputs.values()
+        blocks=_blocks,
     )
 
 
