@@ -171,67 +171,33 @@ def _split_param_layer(
 #: 1e-6..1e-5 separates the two by orders of magnitude.
 _AFFINE_RTOL = 1e-6
 
-#: Types for the two closures :func:`jax.linearize` and :func:`jax.linear_transpose`
-#: hand back: apply the effective design matrix, and apply its transpose.
-type JVPFuncT = Callable[[jax.Array], jax.Array]
-type VJPFuncT = Callable[[jax.Array], tuple[jax.Array, ...]]
-
 
 def _linearize_latents(
-    f: JVPFuncT, z0: jax.Array, probes: tuple[jax.Array, ...]
-) -> tuple[jax.Array, JVPFuncT, VJPFuncT] | None:
+    f: Callable[[jax.Array], jax.Array],
+    z0: jax.Array,
+    probes: tuple[jax.Array, ...],
+) -> tuple[jax.Array, Any, Any] | None:
     """Linearize a prediction map in the latents, or return None if it is not affine.
 
     Returns ``(c, jvp, vjpT)`` with ``f(z) == jvp(z) + c``, where ``jvp`` applies the
-    effective design matrix ``J`` and ``vjpT`` applies its transpose.
+    effective design matrix ``J`` and ``vjpT`` applies its transpose. ``J`` is never
+    materialized: for spectra-sized outputs it would be ``latent_size`` copies of the
+    data, while ``jvp``/``vjpT`` keep every temporary the size of one output array.
 
-    Where it applies, this is exact rather than approximate. For a composition of
-    linear primitives the JVP runs the same multiply-add sequence on the same values
-    as the primal, so it returns the design matrix itself: for a bare
-    :class:`~pollux.models.transforms.LinearTransform` it recovers ``A`` bitwise, and
-    ``c`` is bitwise zero.
+    :func:`jax.linearize` never fails -- handed a nonlinear function it returns the
+    tangent plane, which would be silently wrong to use as a design matrix. So the
+    verdict comes from testing the defining property, ``f(z) == f(0) + J z``, at the
+    given probe points. That is one-sided: an affine map reproduces its linearization
+    exactly and can never be wrongly refused, while a nonlinear one could in principle
+    slip through by touching its tangent plane exactly where we look. See the
+    "Closed-form solves, found by linearization" page in the documentation for why
+    that is unlikely enough to rely on.
 
-    ``J`` is never materialized. For spectra-sized outputs it would be ``latent_size``
-    copies of the data; going through ``jvp``/``vjpT`` keeps every temporary the size
-    of one output array.
-
-    How the affineness test works
-    -----------------------------
-    :func:`jax.linearize` never fails. Handed a nonlinear function it returns the
-    tangent plane at ``z0``, which would be silently wrong to use as a design matrix.
-    So the verdict comes from testing the defining property directly -- ``f`` is
-    affine if and only if ``f(z) == f(0) + J z`` for every ``z`` -- at concrete
-    points, and refusing when the identity does not hold.
-
-    That gives a one-sided guarantee. A genuinely affine map reproduces its own
-    linearization exactly, so it can never be wrongly refused. The residual risk runs
-    the other way: a nonlinear map whose deviation from the tangent plane happens to
-    vanish where we look. Two things make that unlikely enough to rely on:
-
-    - each probe array holds ``n_data`` independent points, one per object, and the
-      residual is maxed over every output element of every one of them, so a false
-      pass needs thousands of coincident zeros rather than one;
-    - the probes come at different amplitudes. A smooth nonlinearity's residual grows
-      like the square of the probe amplitude, so a probe an order of magnitude out is
-      two orders of magnitude more sensitive to a nearly-linear map.
-
-    Proving linearity outright would mean walking the jaxpr and checking that every
-    primitive reached from the input is linear -- a whitelist of dozens of JAX
-    primitives, which is the very thing this design exists to avoid.
-
-    Parameters
-    ----------
-    f
-        Maps latents of shape ``(n_data, latent_size)`` to predictions of shape
-        ``(n_data, output_size)``. Each object's prediction must depend only on its
-        own latents -- the same plate independence the numpyro model assumes. The
-        transpose sums over objects, so a genuinely cross-object map would fold the
-        cross terms into the wrong place.
-    z0
-        Zeros of the latent shape; the point to linearize about. Affine maps have the
-        same derivative everywhere, so the choice only fixes ``c = f(0)``.
-    probes
-        Points to test affineness at, from :func:`_latents_probe_points`.
+    ``f`` maps ``(n_data, latent_size)`` latents to ``(n_data, output_size)``
+    predictions, and each object's prediction must depend only on its own latents --
+    the same plate independence the numpyro model assumes. The transpose sums over
+    objects, so a genuinely cross-object map would fold the cross terms into the wrong
+    place.
     """
     c, jvp = jax.linearize(f, z0)
     for probe in probes:
@@ -244,12 +210,8 @@ def _linearize_latents(
 
 def _output_predict_fn(
     model: Lux, output_name: str, params: dict[str, Any]
-) -> JVPFuncT:
-    """The latents -> prediction map for one output, with its parameters bound.
-
-    Goes through :meth:`~pollux.models.Lux.predict_outputs` so the solvers linearize
-    exactly what the model predicts, and cannot drift away from it.
-    """
+) -> Callable[[jax.Array], jax.Array]:
+    """One output's latents -> prediction map, via predict_outputs so it cannot drift."""
 
     def predict(latents: jax.Array) -> jax.Array:
         return model.predict_outputs(latents, params, names=[output_name])[output_name]
@@ -257,27 +219,47 @@ def _output_predict_fn(
     return predict
 
 
-#: Amplitudes to test affineness at, relative to the latents being fitted. One at the
-#: working scale, one an order of magnitude out: a smooth nonlinearity's residual grows
-#: quadratically with amplitude, so the second is ~100x more sensitive to a map that is
-#: only slightly non-affine.
-_PROBE_SCALES = (1.0, 10.0)
-
-
 def _latents_probe_points(
     latents: jax.Array | None, shape: tuple[int, ...]
 ) -> tuple[jax.Array, ...]:
     """Points to test affineness at, scaled to the latents we are actually fitting.
 
-    Each returned array is ``(n_data, latent_size)``, so it is ``n_data`` independent
-    probe points rather than one -- the transform is applied per object.
+    Each array is ``(n_data, latent_size)``, so it is ``n_data`` independent probe
+    points rather than one -- the transform is applied per object. The second is an
+    order of magnitude further out: a smooth nonlinearity's deviation from its tangent
+    plane grows quadratically with amplitude, so it is ~100x more sensitive to a map
+    that is only slightly non-affine. Fixed keys, so the verdict does not depend on
+    when it is asked.
     """
     scale = 1.0 if latents is None else jnp.maximum(jnp.abs(latents).max(), 1.0)
-    # Fixed keys: the affineness verdict should not depend on when it is asked.
-    return tuple(
-        scale * factor * jax.random.normal(jax.random.PRNGKey(i), shape)
-        for i, factor in enumerate(_PROBE_SCALES)
+    return (
+        scale * jax.random.normal(jax.random.PRNGKey(0), shape),
+        10 * scale * jax.random.normal(jax.random.PRNGKey(1), shape),
     )
+
+
+def _linearize_outputs(
+    model: Lux, data: PolluxData, current_params: dict[str, Any]
+) -> dict[str, tuple[jax.Array, Any, Any]] | str:
+    """Linearize every output that has data.
+
+    Returns ``{output_name: (c, jvp, vjpT)}``, or the name of the first output that
+    turns out not to be affine in the latents.
+    """
+    z0 = jnp.zeros((len(data), model.latent_size))
+    probes = _latents_probe_points(current_params.get("latents"), z0.shape)
+
+    linearized = {}
+    for output_name in model.outputs:
+        if output_name not in data:
+            continue
+        result = _linearize_latents(
+            _output_predict_fn(model, output_name, current_params), z0, probes
+        )
+        if result is None:
+            return output_name
+        linearized[output_name] = result
+    return linearized
 
 
 def _inverse_variance(output_data: OutputData) -> jax.Array:
@@ -373,30 +355,20 @@ def _solve_latents_least_squares(
     n_data = len(data)
     latent_size = model.latent_size
 
-    z0 = jnp.zeros((n_data, latent_size))
-    probes = _latents_probe_points(current_params.get("latents"), z0.shape)
-    basis = jnp.eye(latent_size)
+    linearized = _linearize_outputs(model, data, current_params)
+    if isinstance(linearized, str):
+        msg = (
+            f"Output '{linearized}' is not affine in the latents, so the latents "
+            "cannot be solved in closed form. Optimize them with an SVI block "
+            "instead (ParameterBlock('latents', 'latents'))."
+        )
+        raise ValueError(msg)
 
     # Sum the per-output contributions to the normal equations
     AtWA = jnp.zeros((n_data, latent_size, latent_size))
     AtWy = jnp.zeros((n_data, latent_size))
 
-    for output_name in model.outputs:
-        if output_name not in data:
-            continue
-
-        linearized = _linearize_latents(
-            _output_predict_fn(model, output_name, current_params), z0, probes
-        )
-        if linearized is None:
-            msg = (
-                f"Output '{output_name}' is not affine in the latents, so the latents "
-                "cannot be solved in closed form. Optimize them with an SVI block "
-                "instead (ParameterBlock('latents', 'latents'))."
-            )
-            raise ValueError(msg)
-        c, jvp, vjpT = linearized
-
+    for output_name, (c, jvp, vjpT) in linearized.items():
         output_data = data[output_name]
         w = _inverse_variance(output_data)
 
@@ -407,7 +379,11 @@ def _solve_latents_least_squares(
         # back. Column k costs one JVP and one VJP, and no (n, output_size, latent_size)
         # intermediate is built.
         AtWA = AtWA + jnp.stack(
-            [vjpT(w * jvp(jnp.broadcast_to(e, z0.shape)))[0] for e in basis], axis=-1
+            [
+                vjpT(w * jvp(jnp.broadcast_to(e, (n_data, latent_size))))[0]
+                for e in jnp.eye(latent_size)
+            ],
+            axis=-1,
         )
 
     # Get regularization from latents prior
@@ -514,15 +490,12 @@ def _solve_output_params_least_squares(
         reg_matrix = reg_matrix.at[-1, -1].set(alpha_b)
         rhs_extra = rhs_extra.at[:, -1].set(alpha_b * mu_b)
 
-    def fit_single_output_dim(
-        y_dim: jax.Array, ivar_dim: jax.Array, rhs_row: jax.Array
-    ) -> jax.Array:
-        """Fit the features -> output coefficients for a single output dimension."""
-        return weighted_least_squares(design, y_dim, ivar_dim, reg_matrix, rhs_row)
-
-    solution: jax.Array = jax.vmap(fit_single_output_dim)(
-        y.T, output_ivar.T, rhs_extra
-    )  # (output_size, n_design)
+    # One independent solve per output dimension -> (output_size, n_design)
+    solution: jax.Array = jax.vmap(
+        lambda y_dim, ivar_dim, rhs_row: weighted_least_squares(
+            design, y_dim, ivar_dim, reg_matrix, rhs_row
+        )
+    )(y.T, output_ivar.T, rhs_extra)
 
     solved = (
         {"A": solution[:, :-1], "b": solution[:, -1]} if has_bias else {"A": solution}
@@ -539,11 +512,8 @@ def _solve_output_params_least_squares(
 
 
 def _string_to_parameter_block(model: Lux, name: str) -> ParameterBlock:
-    """Convert a string block name to a ParameterBlock that asks for a closed form.
-
-    Whether it gets one is decided later by :func:`_resolve_blocks`, which can see
-    the current parameters and so can actually test the transform.
-    """
+    """A block that asks for a closed form; :func:`_resolve_blocks` decides if it gets
+    one, once there are parameters to test the transform with."""
     if name != "latents" and name.split(":", maxsplit=1)[0] not in model.outputs:
         msg = f"Unknown parameter block: '{name}'"
         raise ValueError(msg)
@@ -559,18 +529,9 @@ def _least_squares_blocker(
     """Why this block cannot be solved in closed form, or None if it can be."""
     for spec in block.params_list:
         if spec == "latents":
-            z0 = jnp.zeros((len(data), model.latent_size))
-            probes = _latents_probe_points(current_params.get("latents"), z0.shape)
-            for output_name in model.outputs:
-                if output_name in data and (
-                    _linearize_latents(
-                        _output_predict_fn(model, output_name, current_params),
-                        z0,
-                        probes,
-                    )
-                    is None
-                ):
-                    return f"output '{output_name}' is not affine in the latents"
+            linearized = _linearize_outputs(model, data, current_params)
+            if isinstance(linearized, str):
+                return f"output '{linearized}' is not affine in the latents"
             continue
 
         output_name, _, param_type = spec.partition(":")

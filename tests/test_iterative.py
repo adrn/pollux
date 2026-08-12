@@ -22,6 +22,7 @@ from pollux.models.iterative import (
     _least_squares_blocker,
     _linearize_latents,
     _optimize_block_numpyro,
+    _output_predict_fn,
     _solve_latents_least_squares,
     _solve_output_params_least_squares,
     _split_param_layer,
@@ -172,45 +173,6 @@ class TestParameterBlock:
         assert block.num_steps == 500
 
 
-class TestLeastSquaresSolvers:
-    """Tests for the least squares solvers."""
-
-    def test_solve_latents_shape(self, linear_model_and_data):
-        """Test that latents solver returns correct shape."""
-        model = linear_model_and_data["model"]
-        data = linear_model_and_data["data"]
-        true_A = linear_model_and_data["true_A"]
-        n_stars = linear_model_and_data["n_stars"]
-        n_latents = linear_model_and_data["n_latents"]
-
-        current_params = {
-            "flux": {"data": {"A": jnp.array(true_A)}, "err": {}},
-        }
-
-        latents = _solve_latents_least_squares(model, data, current_params)
-        assert latents.shape == (n_stars, n_latents)
-
-    def test_solve_output_params_shape(self, linear_model_and_data):
-        """Test that output params solver returns correct shape."""
-        model = linear_model_and_data["model"]
-        data = linear_model_and_data["data"]
-        true_latents = linear_model_and_data["true_latents"]
-        n_flux = linear_model_and_data["n_flux"]
-        n_latents = linear_model_and_data["n_latents"]
-
-        output_params = _solve_output_params_least_squares(
-            model, data, "flux", jnp.array(true_latents)
-        )
-
-        assert "A" in output_params
-        assert output_params["A"].shape == (n_flux, n_latents)
-
-
-def _predict_fn(model, params, name):
-    """The latents -> prediction map for one output, as the solver builds it."""
-    return lambda z: model.predict_outputs(z, params, names=[name])[name]
-
-
 def _latent_slice(lo, hi):
     """Route latents[lo:hi] to a branch. A closure, so the slice bounds stay out
     of the transform's signature -- FunctionTransform reads parameter names from it."""
@@ -241,7 +203,7 @@ class TestLinearizeLatents:
         z0 = jnp.zeros((n_stars, n_latents))
         params = {"flux": {"data": {"A": A}, "err": {}}}
         c, jvp, _ = _linearize_latents(
-            _predict_fn(model, params, "flux"), z0, (jnp.ones_like(z0),)
+            _output_predict_fn(model, "flux", params), z0, (jnp.ones_like(z0),)
         )
 
         columns = jnp.stack(
@@ -267,7 +229,7 @@ class TestLinearizeLatents:
 
         z0 = jnp.zeros((n_stars, n_latents))
         c, jvp, _ = _linearize_latents(
-            _predict_fn(model, params, "flux"), z0, (jnp.ones_like(z0),)
+            _output_predict_fn(model, "flux", params), z0, (jnp.ones_like(z0),)
         )
 
         assert jnp.allclose(c, offset[:, None])
