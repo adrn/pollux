@@ -71,6 +71,58 @@ def test_offset_transform():
     assert np.allclose(result_prior, expected)
 
 
+@pytest.mark.parametrize(
+    ("cls", "extra_pars"),
+    [
+        (plx.models.transforms.AffineTransform, {}),
+        (plx.models.transforms.QuadraticTransform, {"Q": jnp.zeros((3, 4, 4))}),
+    ],
+)
+def test_bias_shape_does_not_broadcast_to_a_matrix(cls, extra_pars):
+    """The bias is one value per output dimension, not an (output_size, 1) column.
+
+    With a trailing 1 the per-sample ``A @ z + b`` broadcasts ``(O,) + (O, 1)`` to
+    ``(O, O)``, which made these transforms unusable in any model.
+    """
+    n_stars, n_latents, n_out = 6, 4, 3
+    trans = cls(output_size=n_out)
+    assert trans.shapes["b"] == ("output_size",)
+
+    priors = trans.get_expanded_priors(latent_size=n_latents)
+    assert priors["b"].batch_shape == (n_out,)
+
+    out = trans.apply(
+        jnp.ones((n_stars, n_latents)),
+        A=jnp.ones((n_out, n_latents)),
+        b=jnp.ones((n_out,)),
+        **extra_pars,
+    )
+    assert out.shape == (n_stars, n_out)
+
+
+@pytest.mark.parametrize(
+    "cls",
+    [plx.models.transforms.AffineTransform, plx.models.transforms.QuadraticTransform],
+)
+def test_bias_transforms_run_in_a_model(cls):
+    """End-to-end guard: a model containing one of these used to fail to optimize."""
+    n_stars, n_out = 6, 3
+    model = plx.Lux(latent_size=4)
+    model.register_output("flux", cls(output_size=n_out))
+    data = plx.data.PolluxData(
+        flux=plx.data.OutputData(
+            data=jnp.ones((n_stars, n_out)), err=jnp.full((n_stars, n_out), 0.1)
+        )
+    )
+    pars, _ = model.optimize(
+        data,
+        num_steps=2,
+        rng_key=jax.random.PRNGKey(0),
+        svi_run_kwargs={"progress_bar": False},
+    )
+    assert pars["flux"]["data"]["b"].shape == (n_out,)
+
+
 def test_transform_sequence():
     n_stars = 128
     n_latents = 32
