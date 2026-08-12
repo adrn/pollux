@@ -160,7 +160,7 @@ def _check_least_squares_transform(
 def _inverse_variance(output_data: OutputData) -> jax.Array:
     """Inverse-variance weights for an output, or ones where errors are absent."""
     err = output_data.err
-    if not jnp.any(err > 0):
+    if jnp.all(err <= 0):
         return jnp.ones_like(output_data.data)
     return 1.0 / err**2
 

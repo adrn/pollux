@@ -1,5 +1,7 @@
 """Tests for iterative optimization."""
 
+import inspect
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -269,6 +271,32 @@ class TestOptimizeIterative:
         assert result.n_cycles >= 1
         # Providing initial params should work and produce finite losses
         assert all(jnp.isfinite(loss) for loss in result.losses_per_cycle)
+
+
+class TestLuxOptimizeIterativeSignature:
+    """The Lux.optimize_iterative method's parameter order."""
+
+    def test_blocks_can_be_passed_positionally(self, linear_model_and_data):
+        """`model.optimize_iterative(data, blocks)` binds blocks, not max_cycles."""
+        model = linear_model_and_data["model"]
+        data = linear_model_and_data["data"]
+
+        result = model.optimize_iterative(
+            data,
+            ["latents"],
+            max_cycles=2,
+            rng_key=jax.random.PRNGKey(0),
+            progress=False,
+        )
+        assert isinstance(result, IterativeOptimizationResult)
+        assert result.n_cycles <= 2
+        assert "latents" in result.params
+
+    def test_defaults_to_ten_cycles(self):
+        """The method keeps its own max_cycles default, not the function's 100."""
+        sig = inspect.signature(plx.Lux.optimize_iterative)
+        assert sig.parameters["max_cycles"].default == 10
+        assert list(sig.parameters)[:4] == ["self", "data", "blocks", "fixed_pars"]
 
 
 class TestOptimizeBlockNumpyro:

@@ -1,6 +1,7 @@
 from functools import partial
 
 import equinox as eqx
+import jax
 import jax.numpy as jnp
 import numpy as np
 import numpyro.distributions as dist
@@ -1198,6 +1199,72 @@ class TestConcatenateTransformWithLux:
         pars = {"flux": {"data": {"0:A": A0, "1:A": A1}}}
         result = model.predict_outputs(latents, pars)
         assert result["flux"].shape == (n_stars, 11)
+
+
+class TestPublicSignatures:
+    """The keyword names of the public pack/unpack API."""
+
+    def test_pack_pars_accepts_its_documented_keyword(self):
+        """pack_pars is called with nested_pars= by name, not only positionally."""
+        rng = np.random.default_rng(0)
+        A = jnp.array(rng.random((3, 2)))
+
+        single = LinearTransform(output_size=3)
+        assert single.pack_pars(nested_pars={"A": A}) == {"A": A}
+
+        seq = TransformSequence((single, OffsetTransform(output_size=3)))
+        packed = seq.pack_pars(nested_pars=[{"A": A}, {}])
+        assert set(packed) == {"0:A"}
+
+        nn = EquinoxNNTransform(output_size=3, nn_factory=mlp_factory)
+        nn.get_expanded_priors(latent_size=2)
+        weight = jnp.zeros((16, 2))
+        packed = nn.pack_pars(
+            nested_pars={"layers.0.weight": weight}, ignore_missing=True
+        )
+        assert packed["layers.0.weight"] is weight
+
+
+class TestEquinoxNNParamPaths:
+    """Parameter paths for networks that are not plain attribute/sequence trees."""
+
+    def test_dict_valued_module_fields(self):
+        """A module holding submodules in a dict names its parameters, not crashes."""
+
+        class DictNet(eqx.Module):
+            layers: dict
+
+            def __call__(self, x):
+                return self.layers["out"](self.layers["in_"](x))
+
+        def factory(in_size, out_size, key):
+            k1, k2 = jax.random.split(key)
+            return DictNet(
+                layers={
+                    "in_": eqx.nn.Linear(in_size, 8, key=k1),
+                    "out": eqx.nn.Linear(8, out_size, key=k2),
+                }
+            )
+
+        trans = EquinoxNNTransform(output_size=4, nn_factory=factory)
+        priors = trans.get_expanded_priors(latent_size=3)
+
+        assert set(priors) == {
+            "layers.in_.weight",
+            "layers.in_.bias",
+            "layers.out.weight",
+            "layers.out.bias",
+        }
+        assert priors["layers.in_.weight"].batch_shape == (8, 3)
+
+        # ...and the network still runs with those parameters
+        rng = np.random.default_rng(0)
+        params = {
+            path: jnp.array(rng.normal(size=prior.batch_shape))
+            for path, prior in priors.items()
+        }
+        out = trans.apply(jnp.array(rng.random((5, 3))), **params)
+        assert out.shape == (5, 4)
 
 
 class TestParamNamesOnPolyFeature:

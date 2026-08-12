@@ -24,7 +24,7 @@ from .iterative import optimize_iterative
 from .transforms import AbstractSingleTransform, NoOpTransform, TransformSequence
 
 if TYPE_CHECKING:
-    from .iterative import IterativeOptimizationResult
+    from .iterative import IterativeOptimizationResult, ParameterBlock
 
 
 class LuxOutput(eqx.Module):
@@ -518,7 +518,16 @@ class Lux(eqx.Module):
         return unpacked_pars, svi_results
 
     def optimize_iterative(
-        self, data: PolluxData, max_cycles: int = 10, **kwargs: Any
+        self,
+        data: PolluxData,
+        blocks: "list[ParameterBlock] | list[str] | None" = None,
+        fixed_pars: UnpackedParamsT | None = None,
+        max_cycles: int = 10,
+        tol: float = 1e-4,
+        rng_key: jax.Array | None = None,
+        initial_params: UnpackedParamsT | None = None,
+        latents_prior: dist.Distribution | None = None,
+        progress: bool = True,
     ) -> "IterativeOptimizationResult":
         """Optimize using iterative parameter block coordinate descent.
 
@@ -529,11 +538,20 @@ class Lux(eqx.Module):
         parameters (with the latents fixed).
 
         See :func:`pollux.models.optimize_iterative` for the full description of
-        the accepted keyword arguments and of the returned result. Note that this
-        method defaults to ``max_cycles=10``.
+        the parameters and of the returned result. Note that this method defaults
+        to ``max_cycles=10``.
         """
         return optimize_iterative(
-            model=self, data=data, max_cycles=max_cycles, **kwargs
+            model=self,
+            data=data,
+            blocks=blocks,
+            fixed_pars=fixed_pars,
+            max_cycles=max_cycles,
+            tol=tol,
+            rng_key=rng_key,
+            initial_params=initial_params,
+            latents_prior=latents_prior,
+            progress=progress,
         )
 
     def unpack_numpyro_pars(

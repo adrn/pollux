@@ -232,14 +232,18 @@ class AbstractSingleTransform(AbstractTransform):
     def unpack_pars(
         self, flat_pars: dict[str, Any], ignore_missing: bool = False
     ) -> dict[str, Any]:
-        """Pack/unpack parameters (identity for single transforms)."""
+        """Unpack parameters (identity for single transforms)."""
         for param_name in self._param_names:
             if param_name not in flat_pars and not ignore_missing:
                 msg = f"Missing value in transform: {param_name}"
                 raise ValueError(msg)
         return flat_pars
 
-    pack_pars = unpack_pars
+    def pack_pars(
+        self, nested_pars: dict[str, Any], ignore_missing: bool = False
+    ) -> dict[str, Any]:
+        """Pack parameters (identity for single transforms)."""
+        return self.unpack_pars(nested_pars, ignore_missing=ignore_missing)
 
 
 class AbstractMultiTransform(AbstractTransform):
@@ -949,16 +953,26 @@ class QuadraticTransform(AbstractSingleTransform):
 # ----
 
 
+def _param_path_key_str(key: Any) -> str:
+    """Format one JAX key path entry, e.g. ``"layers"``, ``"0"``, or a dict key."""
+    if isinstance(key, jtu.GetAttrKey):
+        return str(key.name)
+    if isinstance(key, jtu.SequenceKey):
+        return str(key.idx)
+    if isinstance(key, (jtu.DictKey, jtu.FlattenedIndexKey)):
+        return str(key.key)
+    # Custom pytree nodes may register their own key type
+    return str(key).lstrip(".")
+
+
 def _param_path_str(path: tuple[Any, ...]) -> str:
     """Format a JAX key path as a dotted string, e.g. ``"layers.0.weight"``.
 
-    Only attribute and sequence keys are handled, which are the only kinds that
-    Equinox modules produce.
+    Handles the standard JAX key types, so modules holding their submodules in a
+    dict (``DictKey``) or in a custom pytree node (``FlattenedIndexKey``) name
+    their parameters just as well as attributes and sequences do.
     """
-    return ".".join(
-        str(key.idx) if isinstance(key, jtu.SequenceKey) else str(key.name)
-        for key in path
-    )
+    return ".".join(_param_path_key_str(key) for key in path)
 
 
 def _get_flat_params(module: eqx.Module) -> tuple[tuple[str, jax.Array], ...]:
@@ -1154,7 +1168,7 @@ class EquinoxNNTransform(AbstractTransform):
     def unpack_pars(
         self, flat_pars: dict[str, Any], ignore_missing: bool = False
     ) -> dict[str, Any]:
-        """Pack/unpack parameters (identity, keyed by NN parameter path)."""
+        """Unpack parameters (identity, keyed by NN parameter path)."""
         result = {}
         for path in self._param_paths:
             if path in flat_pars:
@@ -1164,7 +1178,11 @@ class EquinoxNNTransform(AbstractTransform):
                 raise ValueError(msg)
         return result
 
-    pack_pars = unpack_pars
+    def pack_pars(
+        self, nested_pars: dict[str, Any], ignore_missing: bool = False
+    ) -> dict[str, Any]:
+        """Pack parameters (identity, keyed by NN parameter path)."""
+        return self.unpack_pars(nested_pars, ignore_missing=ignore_missing)
 
 
 # ----
