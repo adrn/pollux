@@ -461,6 +461,39 @@ class TestLuxValidation:
         model.predict_outputs(latents, nested_pars)
 
 
+class TestOptimizeDefaults:
+    """Default arguments of Lux.optimize that no test previously exercised."""
+
+    @pytest.fixture
+    def model_and_data(self):
+        rng = np.random.default_rng(42)
+        model = plx.Lux(latent_size=2)
+        model.register_output("flux", LinearTransform(output_size=3))
+        true_flux = rng.normal(size=(8, 2)) @ rng.normal(size=(3, 2)).T
+        data = plx.data.PolluxData(
+            flux=plx.data.OutputData(true_flux, err=np.full_like(true_flux, 0.1))
+        )
+        return model, data
+
+    def test_default_optimizer(self, model_and_data):
+        """optimize() works without an explicit optimizer (numpyro Adam needs a step)."""
+        model, data = model_and_data
+        pars, _ = model.optimize(data, num_steps=2, rng_key=jax.random.PRNGKey(0))
+        assert pars["latents"].shape == (8, 2)
+
+    def test_improper_uniform_latents_prior(self, model_and_data):
+        """latents_prior=False uses an improper uniform over the latents."""
+        model, data = model_and_data
+        pars, _ = model.optimize(
+            data,
+            num_steps=2,
+            rng_key=jax.random.PRNGKey(0),
+            optimizer=numpyro.optim.Adam(1e-3),
+            latents_prior=False,
+        )
+        assert pars["latents"].shape == (8, 2)
+
+
 class TestOptimizeGuide:
     """Tests for the guide parameter on Lux.optimize."""
 

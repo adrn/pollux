@@ -167,7 +167,7 @@ class OutputData(eqx.Module):
         )
 
 
-class PolluxData(ImmutableMap[str, OutputData]):  # type: ignore[misc]
+class PolluxData(ImmutableMap[str, OutputData]):
     def __init__(self, **kwargs: OutputData) -> None:
         """A data container for observed outputs from a Pollux model.
 

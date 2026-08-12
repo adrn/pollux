@@ -512,12 +512,16 @@ def optimize_iterative(
     >>> test_opt_pars = result.params  # already contains fixed + optimized  # doctest: +SKIP
 
     """
-    # Resolve blocks to list[ParameterBlock] | None (convert strings if needed)
-    _blocks: list[ParameterBlock] | None
-    if blocks and isinstance(blocks[0], str):
-        _blocks = [_string_to_parameter_block(model, name) for name in blocks]  # type: ignore[arg-type]
-    else:
-        _blocks = blocks  # type: ignore[assignment]
+    # Resolve blocks to list[ParameterBlock] | None, converting any string specs.
+    # Done per element rather than by sniffing blocks[0], so a mixed list works.
+    _blocks: list[ParameterBlock] | None = (
+        None
+        if blocks is None
+        else [
+            _string_to_parameter_block(model, b) if isinstance(b, str) else b
+            for b in blocks
+        ]
+    )
 
     # Build initial_params from fixed_pars if not provided
     if initial_params is None and fixed_pars is not None:

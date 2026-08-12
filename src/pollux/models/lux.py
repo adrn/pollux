@@ -396,7 +396,6 @@ class Lux(eqx.Module):
                 dist.constraints.real,
                 (),
                 event_shape=(),
-                sample_shape=(n_data,),
             )
 
         elif not isinstance(latents_prior, dist.Distribution):
@@ -447,7 +446,8 @@ class Lux(eqx.Module):
         rng_key
             JAX random key for the optimization.
         optimizer
-            Numpyro optimizer to use. Defaults to ``numpyro.optim.Adam()``.
+            Numpyro optimizer to use. Defaults to
+            ``numpyro.optim.Adam(step_size=1e-3)``.
         latents_prior
             Prior distribution for the latent vectors. If ``None``, uses a unit
             Gaussian. If ``False``, uses an improper uniform prior.
@@ -470,8 +470,9 @@ class Lux(eqx.Module):
 
         """
 
-        # Default to using Adam optimizer:
-        optimizer = optimizer or numpyro.optim.Adam()
+        # Default to using Adam optimizer. numpyro's Adam has no default step
+        # size; 1e-3 matches the default used by optimize_iterative's SVI blocks.
+        optimizer = optimizer or numpyro.optim.Adam(step_size=1e-3)
 
         # ignore_missing=True: fixed_pars typically holds only a subset of the
         # parameters, namely the ones to hold fixed during optimization

@@ -59,15 +59,23 @@ repos:
       - id: check-readthedocs
 
   - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: "v1.19.1"
+    # Keep in step with the mypy in the dev dependency group: a stale pin here
+    # once failed CI on PEP 695 `type` statements in numpy's stubs
+    rev: "v2.3.0"
     hooks:
       - id: mypy
         files: src
         args: []
         exclude: tests
+        # mypy needs the real runtime dependencies: without them the imports
+        # resolve to Any and it reports different errors than a project-env run
         additional_dependencies:
           - pytest
           - equinox
+          - numpyro
+          - tqdm
+          - typing-extensions
+          - xmmutablemap
 
   - repo: https://github.com/kynan/nbstripout
     rev: 0.8.1
