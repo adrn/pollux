@@ -29,7 +29,8 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: hynek/build-and-inspect-python-package@v2
+      # v3 bundles Twine 7, which understands core metadata 2.5 (pypa/twine#1327)
+      - uses: hynek/build-and-inspect-python-package@v3
 
   publish:
     needs: [dist]
