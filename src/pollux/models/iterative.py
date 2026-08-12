@@ -13,6 +13,7 @@ __all__ = [
 ]
 
 import warnings
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import partial
 from typing import TYPE_CHECKING, Any, Literal
@@ -157,6 +158,68 @@ def _check_least_squares_transform(
     return transform
 
 
+#: Relative tolerance for deciding that a prediction map is affine in the latents.
+#: A composition of linear primitives reproduces its own linearization bitwise, while
+#: a nonlinearity contributing 1e-4 of the signal shows up at ~1e-4, so anything in
+#: 1e-6..1e-5 separates the two by orders of magnitude.
+_AFFINE_RTOL = 1e-6
+
+#: Types for the two closures :func:`jax.linearize` and :func:`jax.linear_transpose`
+#: hand back: apply the effective design matrix, and apply its transpose.
+type JVPFuncT = Callable[[jax.Array], jax.Array]
+type VJPFuncT = Callable[[jax.Array], tuple[jax.Array, ...]]
+
+
+def _linearize_latents(
+    f: JVPFuncT, z0: jax.Array, probe: jax.Array
+) -> tuple[jax.Array, JVPFuncT, VJPFuncT] | None:
+    """Linearize a prediction map in the latents, or return None if it is not affine.
+
+    Returns ``(c, jvp, vjpT)`` with ``f(z) == jvp(z) + c``, where ``jvp`` applies the
+    effective design matrix ``J`` and ``vjpT`` applies its transpose.
+
+    This is exact rather than approximate. For a composition of linear primitives the
+    JVP runs the same multiply-add sequence on the same values as the primal, so it
+    returns the design matrix itself: for a bare :class:`~pollux.models.transforms.
+    LinearTransform` it recovers ``A`` bitwise, and ``c`` is bitwise zero. Whether
+    the map really is affine is not assumed, it is measured -- hence the probe.
+
+    ``J`` is never materialized. For spectra-sized outputs it would be ``latent_size``
+    copies of the data; going through ``jvp``/``vjpT`` keeps every temporary the size
+    of one output array.
+
+    Parameters
+    ----------
+    f
+        Maps latents of shape ``(n_data, latent_size)`` to predictions of shape
+        ``(n_data, output_size)``. Each object's prediction must depend only on its
+        own latents -- the same plate independence the numpyro model assumes. The
+        transpose sums over objects, so a genuinely cross-object map would fold the
+        cross terms into the wrong place.
+    z0
+        Zeros of the latent shape; the point to linearize about. Affine maps have the
+        same derivative everywhere, so the choice only fixes ``c = f(0)``.
+    probe
+        Where to test affineness, ideally at the amplitude of the real latents: the
+        residual of a nonlinear map grows with the probe amplitude.
+    """
+    c, jvp = jax.linearize(f, z0)
+    pred = f(probe)
+    residual = jnp.abs(pred - (c + jvp(probe))).max()
+    if residual > _AFFINE_RTOL * jnp.abs(pred).max():
+        return None
+    return c, jvp, jax.linear_transpose(jvp, z0)
+
+
+def _latents_probe_point(
+    latents: jax.Array | None, shape: tuple[int, ...]
+) -> jax.Array:
+    """A point to test affineness at, scaled to the latents we are actually fitting."""
+    scale = 1.0 if latents is None else jnp.maximum(jnp.abs(latents).max(), 1.0)
+    # Fixed key: the affineness verdict should not depend on when it is asked.
+    return scale * jax.random.normal(jax.random.PRNGKey(0), shape)
+
+
 def _inverse_variance(output_data: OutputData) -> jax.Array:
     """Inverse-variance weights for an output, or ones where errors are absent."""
     err = output_data.err
@@ -208,15 +271,19 @@ def _solve_latents_least_squares(
 ) -> jax.Array:
     """Solve for optimal latents using weighted least squares.
 
-    For linear models: y = A @ z, we solve for z using the normal equations:
-        z = (A^T W A + λI)^{-1} A^T W y
+    Each output contributes a prediction ``y ≈ J z + c``, where ``J`` is whatever
+    effective design matrix the output's transform amounts to. Summing the outputs'
+    contributions gives one normal-equation system per object::
 
-    When there are multiple outputs, we combine them into a block-diagonal system:
-        [y1]   [A1  0 ]       [A1^T W1 A1 + ... ] z = [A1^T W1 y1 + ...]
-        [y2] = [0  A2 ] z  →
-        ...
+        (sum_o Jo^T Wo Jo + λI) z = sum_o Jo^T Wo (yo - co) + λ μ
 
-    This sums the contributions from each output to form a single linear system.
+    ``J`` and ``c`` come from linearizing the transform (see
+    :func:`_linearize_latents`), not from looking up a parameter by name, so any
+    composition that happens to be affine in the latents works: a slice feeding a
+    linear map, a :class:`~pollux.models.transforms.ConcatenateTransform` of linear
+    children, a linear map plus a fixed per-object offset. Compositions that are not
+    affine, like polynomial features of the latents, are rejected here and belong in
+    an SVI block.
 
     Parameters
     ----------
@@ -225,7 +292,7 @@ def _solve_latents_least_squares(
     data
         The data to fit.
     current_params
-        Current parameter estimates (used for A matrices).
+        Current parameter estimates. Everything except the latents is held fixed.
     latents_prior
         Prior distribution for latents. If None, uses Normal(0, 1).
         The regularization strength is extracted from this prior.
@@ -237,54 +304,54 @@ def _solve_latents_least_squares(
 
     Notes
     -----
-    Memory considerations: Rather than forming a large block-diagonal matrix,
-    we accumulate the contributions to the normal equations from each output.
-    This is O(n_latents^2) memory rather than O(n_outputs * n_output_size * n_latents).
+    Memory: no design matrix is ever formed. The largest temporaries are one output
+    array, ``(n_data, output_size)``, and the accumulated ``(n_data, latent_size,
+    latent_size)`` system -- the same footprint as the explicit-``A`` version this
+    replaces, and independent of how the transform is composed.
 
     """
     n_data = len(data)
     latent_size = model.latent_size
 
-    # Initialize normal equations: sum over outputs
-    # AtWA shape: (n_data, latent_size, latent_size)
-    # AtWy shape: (n_data, latent_size)
+    z0 = jnp.zeros((n_data, latent_size))
+    probe = _latents_probe_point(current_params.get("latents"), z0.shape)
+    basis = jnp.eye(latent_size)
+
+    # Sum the per-output contributions to the normal equations
     AtWA = jnp.zeros((n_data, latent_size, latent_size))
     AtWy = jnp.zeros((n_data, latent_size))
 
-    for output_name, lux_output in model.outputs.items():
-        _check_least_squares_transform(lux_output.data_transform, output_name)
-
+    for output_name in model.outputs:
         if output_name not in data:
             continue
 
+        # Linearize exactly what the model predicts, so the solver cannot drift
+        # away from predict_outputs
+        def predict(z: jax.Array, name: str = output_name) -> jax.Array:
+            return model.predict_outputs(z, current_params, names=[name])[name]
+
+        linearized = _linearize_latents(predict, z0, probe)
+        if linearized is None:
+            msg = (
+                f"Output '{output_name}' is not affine in the latents, so the latents "
+                "cannot be solved in closed form. Optimize them with an SVI block "
+                "instead (ParameterBlock('latents', 'latents'))."
+            )
+            raise ValueError(msg)
+        c, jvp, vjpT = linearized
+
         output_data = data[output_name]
-        y = output_data.data  # (n_data, output_size)
         w = _inverse_variance(output_data)
 
-        # Get the transformation matrix A from current params
-        # For LinearTransform: y = A @ z, so A has shape (output_size, latent_size)
-        output_params = current_params.get(output_name, {}).get("data", {})
-        A = output_params.get("A")
+        # J^T W (y - c), one VJP
+        AtWy = AtWy + vjpT(w * (output_data.data - c))[0]
 
-        if A is None:
-            msg = f"Could not find matrix 'A' for output '{output_name}'"
-            raise ValueError(msg)
-
-        # Accumulate contributions to normal equations
-        # A: (output_size, latent_size)
-        # y: (n_data, output_size)
-        # w: (n_data, output_size) inverse variances
-
-        # For each data point i:
-        #   AtWA[i] += A.T @ diag(w[i]) @ A
-        #   AtWy[i] += A.T @ (w[i] * y[i])
-
-        # AtWA[i] = A.T @ diag(w[i]) @ A = sum_j w[i,j] * A[j,:].T @ A[j,:]
-        AtWA = AtWA + jnp.einsum("nj,jk,jl->nkl", w, A, A)
-
-        # A.T @ (w * y) for each data point
-        # (w * y): (n_data, output_size)
-        AtWy = AtWy + jnp.einsum("nj,jk,nj->nk", w, A, y)
+        # J^T W J column by column: push a basis vector through J, weight it, pull it
+        # back. Column k costs one JVP and one VJP, and no (n, output_size, latent_size)
+        # intermediate is built.
+        AtWA = AtWA + jnp.stack(
+            [vjpT(w * jvp(jnp.broadcast_to(e, z0.shape)))[0] for e in basis], axis=-1
+        )
 
     # Get regularization from latents prior
     if latents_prior is None:

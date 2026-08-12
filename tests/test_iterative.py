@@ -16,6 +16,8 @@ from pollux.models.iterative import (
     _build_fixed_pars,
     _get_regularization_from_prior,
     _is_linear_transform,
+    _latents_probe_point,
+    _linearize_latents,
     _optimize_block_numpyro,
     _solve_latents_least_squares,
     _solve_output_params_least_squares,
@@ -24,6 +26,7 @@ from pollux.models.iterative import (
 from pollux.models.transforms import (
     FunctionTransform,
     LinearTransform,
+    PolyFeatureTransform,
     TransformSequence,
 )
 
@@ -174,6 +177,199 @@ class TestLeastSquaresSolvers:
 
         assert "A" in output_params
         assert output_params["A"].shape == (n_flux, n_latents)
+
+
+def _predict_fn(model, params, name):
+    """The latents -> prediction map for one output, as the solver builds it."""
+    return lambda z: model.predict_outputs(z, params, names=[name])[name]
+
+
+def _latent_slice(lo, hi):
+    """Route latents[lo:hi] to a branch. A closure, so the slice bounds stay out
+    of the transform's signature -- FunctionTransform reads parameter names from it."""
+    return FunctionTransform(output_size=hi - lo, transform=lambda z: z[lo:hi])
+
+
+def _per_object_offset(output_size):
+    """A fixed per-object additive offset, the distance-modulus recipe."""
+    return FunctionTransform(
+        output_size=output_size,
+        transform=lambda y, offset: y + offset[:, None],
+        priors={"offset": dist.Normal(0.0, 5.0)},
+        shapes={"offset": ("data_size",)},
+        vmap=False,
+    )
+
+
+class TestLinearizeLatents:
+    """The linearization is exact where it claims to be, and declines where it isn't."""
+
+    def test_recovers_the_design_matrix_bitwise(self, linear_model_and_data):
+        """For a linear transform, the JVP *is* A -- not an approximation to it."""
+        model = linear_model_and_data["model"]
+        A = jnp.array(linear_model_and_data["true_A"])
+        n_stars = linear_model_and_data["n_stars"]
+        n_latents = linear_model_and_data["n_latents"]
+
+        z0 = jnp.zeros((n_stars, n_latents))
+        params = {"flux": {"data": {"A": A}, "err": {}}}
+        c, jvp, _ = _linearize_latents(
+            _predict_fn(model, params, "flux"), z0, jnp.ones_like(z0)
+        )
+
+        columns = jnp.stack(
+            [jvp(jnp.broadcast_to(e, z0.shape)) for e in jnp.eye(n_latents)], axis=-1
+        )
+        assert jnp.all(columns == A), "design matrix is not bitwise equal to A"
+        assert jnp.all(c == 0), "offset is not bitwise zero"
+
+    def test_offset_goes_into_c_and_not_the_design_matrix(self):
+        """A per-object offset is constant in z, so it belongs entirely to c."""
+        n_stars, n_latents, n_out = 8, 3, 5
+        A = jax.random.normal(jax.random.PRNGKey(1), (n_out, n_latents))
+        offset = jax.random.normal(jax.random.PRNGKey(2), (n_stars,))
+
+        model = plx.Lux(latent_size=n_latents)
+        model.register_output(
+            "flux",
+            TransformSequence(
+                (LinearTransform(output_size=n_out), _per_object_offset(n_out))
+            ),
+        )
+        params = {"flux": {"data": ({"A": A}, {"offset": offset}), "err": {}}}
+
+        z0 = jnp.zeros((n_stars, n_latents))
+        c, jvp, _ = _linearize_latents(
+            _predict_fn(model, params, "flux"), z0, jnp.ones_like(z0)
+        )
+
+        assert jnp.allclose(c, offset[:, None])
+        columns = jnp.stack(
+            [jvp(jnp.broadcast_to(e, z0.shape)) for e in jnp.eye(n_latents)], axis=-1
+        )
+        assert jnp.allclose(columns, A)
+
+    @pytest.mark.parametrize("scale", [0.1, 1.0, 100.0])
+    def test_affine_verdict_holds_at_every_probe_scale(self, scale):
+        """Linear stays linear and a 1e-4 nonlinearity stays detected, at any amplitude."""
+        n_stars, n_latents, n_out = 8, 3, 5
+        A = jax.random.normal(jax.random.PRNGKey(1), (n_out, n_latents))
+        z0 = jnp.zeros((n_stars, n_latents))
+        probe = scale * jax.random.normal(jax.random.PRNGKey(3), z0.shape)
+
+        assert _linearize_latents(lambda z: z @ A.T, z0, probe) is not None
+        assert (
+            _linearize_latents(lambda z: z @ A.T + 1e-4 * (z**2) @ A.T, z0, probe)
+            is None
+        )
+
+    def test_probe_point_tracks_the_current_latents(self):
+        """The probe scales with the latents, and never collapses to zero."""
+        shape = (4, 2)
+        assert jnp.abs(_latents_probe_point(None, shape)).max() > 0
+        assert jnp.abs(_latents_probe_point(jnp.zeros(shape), shape)).max() > 0
+        big = _latents_probe_point(jnp.full(shape, 50.0), shape)
+        small = _latents_probe_point(jnp.full(shape, 0.5), shape)
+        assert jnp.abs(big).max() > 10 * jnp.abs(small).max()
+
+
+class TestSolveLatentsComposed:
+    """The latents solve works on compositions, not just bare LinearTransforms."""
+
+    def test_matches_the_explicit_normal_equations(self, linear_model_and_data):
+        """Same answer as building A^T W A and A^T W y from A directly."""
+        model = linear_model_and_data["model"]
+        data = linear_model_and_data["data"]
+        A = jnp.array(linear_model_and_data["true_A"])
+        n_latents = linear_model_and_data["n_latents"]
+
+        params = {"flux": {"data": {"A": A}, "err": {}}}
+        solved = _solve_latents_least_squares(model, data, params)
+
+        w = 1.0 / data["flux"].err ** 2
+        AtWA = jnp.einsum("nj,jk,jl->nkl", w, A, A) + jnp.eye(n_latents)
+        AtWy = jnp.einsum("nj,jk,nj->nk", w, A, data["flux"].data)
+        assert jnp.allclose(solved, jax.vmap(jnp.linalg.solve)(AtWA, AtWy))
+
+    def test_partitioned_latents_recover_the_truth(self):
+        """Half the latents feed one linear output, half feed another."""
+        n_stars, n_out1, n_out2 = 256, 10, 3
+        rng = np.random.default_rng(7)
+        latents = jnp.array(rng.normal(size=(n_stars, 4)))
+        A1 = jnp.array(rng.normal(size=(n_out1, 2)))
+        A2 = jnp.array(rng.normal(size=(n_out2, 2)))
+
+        model = plx.Lux(latent_size=4)
+        for name, lo, hi, A in [("spec", 0, 2, A1), ("labels", 2, 4, A2)]:
+            model.register_output(
+                name,
+                TransformSequence(
+                    (_latent_slice(lo, hi), LinearTransform(output_size=A.shape[0]))
+                ),
+            )
+
+        err1 = jnp.full((n_stars, n_out1), 1e-3)
+        err2 = jnp.full((n_stars, n_out2), 1e-3)
+        data = plx.data.PolluxData(
+            spec=plx.data.OutputData(latents[:, :2] @ A1.T, err=err1),
+            labels=plx.data.OutputData(latents[:, 2:] @ A2.T, err=err2),
+        )
+        params = {
+            "spec": {"data": ({}, {"A": A1}), "err": {}},
+            "labels": {"data": ({}, {"A": A2}), "err": {}},
+        }
+
+        solved = _solve_latents_least_squares(
+            model, data, params, latents_prior=dist.Normal(0.0, 1e3)
+        )
+        assert jnp.allclose(solved, latents, atol=1e-2)
+
+    def test_respects_a_fixed_per_object_offset(self):
+        """Dropping c would bias every latent; the offset here is large enough to see."""
+        n_stars, n_latents, n_out = 128, 3, 6
+        rng = np.random.default_rng(11)
+        latents = jnp.array(rng.normal(size=(n_stars, n_latents)))
+        A = jnp.array(rng.normal(size=(n_out, n_latents)))
+        offset = jnp.array(rng.normal(size=n_stars) * 20.0)
+
+        model = plx.Lux(latent_size=n_latents)
+        model.register_output(
+            "flux",
+            TransformSequence(
+                (LinearTransform(output_size=n_out), _per_object_offset(n_out))
+            ),
+        )
+        err = jnp.full((n_stars, n_out), 1e-3)
+        data = plx.data.PolluxData(
+            flux=plx.data.OutputData(latents @ A.T + offset[:, None], err=err)
+        )
+        params = {"flux": {"data": ({"A": A}, {"offset": offset}), "err": {}}}
+
+        solved = _solve_latents_least_squares(
+            model, data, params, latents_prior=dist.Normal(0.0, 1e3)
+        )
+        assert jnp.allclose(solved, latents, atol=1e-2)
+
+    def test_nonlinear_output_is_refused_with_a_useful_message(self):
+        """Polynomial features of the latents are not affine, so say so."""
+        n_stars, n_latents, n_out = 16, 3, 5
+        model = plx.Lux(latent_size=n_latents)
+        model.register_output(
+            "flux",
+            TransformSequence(
+                (PolyFeatureTransform(degree=2), LinearTransform(output_size=n_out))
+            ),
+        )
+        data = plx.data.PolluxData(
+            flux=plx.data.OutputData(
+                jnp.ones((n_stars, n_out)), err=jnp.full((n_stars, n_out), 0.1)
+            )
+        )
+        A = jax.random.normal(jax.random.PRNGKey(0), (n_out, 10))
+        params = {"flux": {"data": ({}, {"A": A}), "err": {}}}
+
+        with pytest.raises(ValueError, match="not affine in the latents"):
+            _solve_latents_least_squares(model, data, params)
 
 
 class TestOptimizeIterative:
