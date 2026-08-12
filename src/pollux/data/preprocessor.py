@@ -47,12 +47,6 @@ class AbstractPreprocessor(eqx.Module):
     def inverse_transform_err(self, X_err: BatchedDataT) -> BatchedDataT:
         """Apply inverse preprocessing transform to the input data uncertainties."""
 
-    def __call__(self, X: BatchedDataT, inverse: bool = False) -> BatchedDataT:
-        """Apply preprocessing transform or inverse to the input data."""
-        if inverse:
-            return self.inverse_transform(X)
-        return self.transform(X)
-
 
 class NullPreprocessor(AbstractPreprocessor):
     """A preprocessor that does nothing to the input data.
@@ -69,6 +63,8 @@ class NullPreprocessor(AbstractPreprocessor):
     """
 
     def __init__(self) -> None:
+        # Explicit (rather than equinox's generated __init__) so that callers
+        # constructing a NullPreprocessor type check.
         pass
 
     @classmethod

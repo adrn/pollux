@@ -11,6 +11,7 @@ import pollux as plx
 from pollux.models.iterative import (
     IterativeOptimizationResult,
     ParameterBlock,
+    _build_fixed_pars,
     _get_regularization_from_prior,
     _is_linear_transform,
     _optimize_block_numpyro,
@@ -273,49 +274,25 @@ class TestOptimizeIterative:
 class TestOptimizeBlockNumpyro:
     """Tests for the _optimize_block_numpyro function."""
 
-    @pytest.fixture
-    def nonlinear_model_and_data(self):
-        """Create a model with a non-linear FunctionTransform for testing."""
-        n_stars = 32
-        n_latents = 4
-        n_flux = 16
+    def test_build_fixed_pars_holds_everything_else(self, linear_model_and_data):
+        """Parameters outside the optimized block are held fixed, not left free."""
+        model = linear_model_and_data["model"]
+        model.register_output("label", LinearTransform(output_size=2))
 
-        rng = np.random.default_rng(42)
-
-        # Create a simple non-linear transform: y = exp(latents @ A.T)
-        def exp_transform(latents, A):
-            return jnp.exp(latents @ A.T)
-
-        transform = FunctionTransform(
-            output_size=n_flux,
-            transform=jax.vmap(lambda z, A: exp_transform(z, A), in_axes=(0, None)),
-            priors={"A": dist.Normal(0.0, 0.5)},
-            shapes={"A": (n_flux, n_latents)},
-            vmap=False,
-        )
-
-        model = plx.LuxModel(latent_size=n_latents)
-        model.register_output("flux", transform)
-
-        # Generate data using the nonlinear model
-        true_A = rng.normal(size=(n_flux, n_latents)) * 0.2
-        true_latents = rng.normal(size=(n_stars, n_latents)) * 0.5
-        true_flux = np.exp(true_latents @ true_A.T)
-        flux_err = np.full_like(true_flux, 0.05)
-
-        data = plx.data.PolluxData(
-            flux=plx.data.OutputData(
-                true_flux + rng.normal(0, flux_err),
-                err=flux_err,
-            ),
-        )
-
-        return {
-            "model": model,
-            "data": data,
-            "true_A": true_A,
-            "true_latents": true_latents,
+        current_params = {
+            "latents": jnp.zeros((8, 4)),
+            "flux": {"data": {"A": jnp.ones((16, 4))}, "err": {"b": jnp.ones((16, 1))}},
+            "label": {"data": {"A": jnp.ones((2, 4))}, "err": {}},
         }
+        fixed = _build_fixed_pars(model, current_params, ["flux:data"])
+
+        # Latents and the other output are fixed entirely...
+        assert jnp.allclose(fixed["latents"], current_params["latents"])
+        assert set(fixed["label"]) == {"data", "err"}
+        # ...as is the error transform of the output being optimized...
+        assert jnp.allclose(fixed["flux"]["err"]["b"], jnp.ones((16, 1)))
+        # ...but not the block itself
+        assert "data" not in fixed["flux"]
 
     def test_optimize_block_numpyro_returns_params(self, linear_model_and_data):
         """Test that _optimize_block_numpyro returns valid parameters."""

@@ -117,8 +117,6 @@ class IterativeOptimizationResult:
         Number of full cycles completed.
     converged
         Whether the optimization converged according to tolerance.
-    history
-        Optional detailed history of losses per block per cycle.
 
     """
 
@@ -126,7 +124,6 @@ class IterativeOptimizationResult:
     losses_per_cycle: list[float]
     n_cycles: int
     converged: bool
-    history: list[dict[str, Any]] | None = None
 
 
 def _is_linear_transform(transform: Any) -> TypeIs[LinearTransformT]:
@@ -444,7 +441,6 @@ def optimize_iterative(
     initial_params: dict[str, Any] | None = None,
     latents_prior: dist.Distribution | None = None,
     progress: bool = True,
-    record_history: bool = False,
 ) -> IterativeOptimizationResult:
     """Optimize model using iterative block coordinate descent.
 
@@ -493,8 +489,6 @@ def optimize_iterative(
         Used to determine regularization strength for latent least squares.
     progress
         Whether to display a tqdm progress bar showing optimization progress.
-    record_history
-        Whether to record detailed per-block loss history.
 
     Returns
     -------
@@ -600,7 +594,6 @@ def optimize_iterative(
         current_params = initial_params
 
     losses_per_cycle: list[float] = []
-    history: list[dict[str, Any]] = []
 
     prev_loss = float("inf")
 
@@ -616,7 +609,6 @@ def optimize_iterative(
 
     for cycle in pbar:
         n_cycles = cycle + 1
-        cycle_history: dict[str, Any] = {}
 
         for block in _blocks:
             if block.optimizer == "least_squares":
@@ -633,16 +625,9 @@ def optimize_iterative(
                     model, data, block, current_params, subkey, latents_prior
                 )
 
-            if record_history:
-                # Could compute loss here per block if needed
-                cycle_history[block.name] = None
-
         # Compute loss at end of cycle
         loss = _compute_loss(model, data, current_params)
         losses_per_cycle.append(float(loss))
-
-        if record_history:
-            history.append(cycle_history)
 
         # Update progress bar with loss info
         rel_change = abs(prev_loss - loss) / (abs(prev_loss) + 1e-8)
@@ -668,7 +653,6 @@ def optimize_iterative(
         losses_per_cycle=losses_per_cycle,
         n_cycles=n_cycles,
         converged=converged,
-        history=history,
     )
 
 
@@ -779,15 +763,10 @@ def _optimize_block_numpyro(
     # Pack fixed parameters for numpyro
     packed_fixed_pars = model.pack_numpyro_pars(fixed_pars, ignore_missing=True)
 
-    # Determine which outputs to include in this optimization
-    # (by default include all outputs that have data)
-    names = None  # Use all outputs
-
-    # Create partial model with fixed parameters
+    # Create partial model with fixed parameters (names=None: all outputs)
     partial_model = partial(
         model.default_numpyro_model,
         fixed_pars=packed_fixed_pars,
-        names=names,
         latents_prior=latents_prior,
     )
 
@@ -828,32 +807,24 @@ def _build_fixed_pars(
     optimize_params: list[str],
 ) -> dict[str, Any]:
     """Build fixed_pars dict containing everything not being optimized."""
-    fixed = {}
+    fixed: dict[str, Any] = {}
 
     # Check if latents should be fixed
     if "latents" not in optimize_params:
         fixed["latents"] = current_params.get("latents")
 
-    # Check each output
+    # Check each output: hold "data" / "err" fixed unless this block optimizes them
     for output_name in model.outputs:
-        data_fixed = (
-            f"{output_name}:data" not in optimize_params
+        output_params = current_params.get(output_name, {})
+        output_fixed = {
+            key: output_params[key]
+            for key in ("data", "err")
+            if key in output_params
             and output_name not in optimize_params
-        )
-        err_fixed = (
-            f"{output_name}:err" not in optimize_params
-            and output_name not in optimize_params
-        )
-
-        if data_fixed or err_fixed:
-            output_params = current_params.get(output_name, {})
-            if output_name not in fixed:
-                fixed[output_name] = {}
-            output_fixed = dict(fixed[output_name])  # type: ignore[arg-type]
-            if data_fixed and "data" in output_params:
-                output_fixed["data"] = output_params["data"]
-            if err_fixed and "err" in output_params:
-                output_fixed["err"] = output_params["err"]
+            and f"{output_name}:{key}" not in optimize_params
+        }
+        if output_fixed:
+            fixed[output_name] = output_fixed
 
     return fixed
 

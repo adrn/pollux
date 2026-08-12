@@ -179,105 +179,6 @@ class Lux(eqx.Module):
             err_transform = NoOpTransform()
         self.outputs[name] = LuxOutput(data_transform, err_transform)
 
-    def _extract_transform_pars(
-        self, pars: dict[str, Any], transform_type: str = "data"
-    ) -> dict[str, Any]:
-        """Extract data or error transform parameters from nested parameter structure.
-
-        This method handles the unpacking of parameters from the nested structure
-        returned by `unpack_numpyro_pars` or `optimize`. It detects whether the
-        parameters are already in the expected format or need to be extracted.
-
-        Parameters
-        ----------
-        pars
-            A dictionary of parameters that may be in one of two formats:
-            1. Already extracted: {"output_name": {...} or [...], ...}
-            2. Nested format: {"output_name": {"data": ..., "err": ...}, ...}
-        transform_type
-            Either "data" or "err" to specify which transform parameters to extract.
-
-        Returns
-        -------
-        dict
-            A dictionary mapping output names to their transform parameters.
-        """
-        extracted_pars = {}
-
-        for output_name in self.outputs:
-            if output_name not in pars:
-                continue
-
-            par_value = pars[output_name]
-
-            # Check if this is already in the extracted format (dict or list/tuple)
-            # vs. the nested format with "data" and "err" keys
-            if isinstance(par_value, dict) and transform_type in par_value:
-                # Nested format: extract the specified transform type
-                extracted_pars[output_name] = par_value[transform_type]
-            else:
-                # Already extracted format: use as-is
-                extracted_pars[output_name] = par_value
-
-        return extracted_pars
-
-    def _validate_pars_format(
-        self, pars: dict[str, Any], context: str = "parameters"
-    ) -> bool:
-        """Validate that parameters are in the expected nested format.
-
-        The expected format is::
-
-            {
-                "output_name": {
-                    "data": {...} or [...],  # Transform parameters
-                    "err": {...}             # Error transform parameters (optional)
-                },
-                "latents": array            # Optional, not used by transforms
-            }
-
-        Parameters
-        ----------
-        pars
-            The parameters dictionary to validate.
-        context
-            A string describing the context (for error messages).
-
-        Returns
-        -------
-        bool
-            True if format is valid (nested), False if it appears to be direct format.
-
-        Raises
-        ------
-        TypeError
-            If the format is clearly invalid (not a dict where expected).
-        """
-        for output_name in self.outputs:
-            if output_name not in pars:
-                continue
-
-            output_pars = pars[output_name]
-
-            # Check if it's a dict
-            if not isinstance(output_pars, dict):
-                msg = (
-                    f"Expected dict for {context} '{output_name}', "
-                    f"got {type(output_pars).__name__}"
-                )
-                raise TypeError(msg)
-
-            # Check if it has "data" or "err" keys (nested format)
-            # vs direct parameter keys (deprecated format)
-            has_data_key = "data" in output_pars
-            has_err_key = "err" in output_pars
-
-            if not has_data_key and not has_err_key:
-                # This looks like direct format - return False to indicate
-                return False
-
-        return True
-
     def predict_outputs(
         self,
         latents: BatchedLatentsT,
@@ -335,9 +236,25 @@ class Lux(eqx.Module):
         elif isinstance(names, str):
             names = [names]
 
-        # Check parameter format and warn if using deprecated direct format
-        is_nested_format = self._validate_pars_format(pars, context="predict_outputs")
-        if not is_nested_format:
+        # Extract data parameters, handling both nested and direct formats
+        data_pars = {}
+        direct_format = False
+        for name in names:
+            output_pars = pars[name]
+            if not isinstance(output_pars, dict):
+                msg = (
+                    f"Expected dict for parameters of output '{name}', "
+                    f"got {type(output_pars).__name__}"
+                )
+                raise TypeError(msg)
+
+            if "data" in output_pars or "err" in output_pars:
+                data_pars[name] = output_pars.get("data", {})
+            else:
+                direct_format = True
+                data_pars[name] = output_pars
+
+        if direct_format:
             warnings.warn(
                 "Passing parameters in direct format (e.g., {'flux': {'A': ...}}) is "
                 "deprecated. Please use the nested format returned by optimize(): "
@@ -346,9 +263,6 @@ class Lux(eqx.Module):
                 DeprecationWarning,
                 stacklevel=2,
             )
-
-        # Extract data parameters, handling both nested and direct formats
-        data_pars = self._extract_transform_pars(pars, transform_type="data")
 
         results = {}
         for name in names:
@@ -577,11 +491,7 @@ class Lux(eqx.Module):
         partial_pars["latents_prior"] = latents_prior
         partial_pars["custom_model"] = custom_model
 
-        model: Any
-        if partial_pars:
-            model = partial(self.default_numpyro_model, **partial_pars)
-        else:
-            model = self.default_numpyro_model
+        model: Any = partial(self.default_numpyro_model, **partial_pars)
 
         # The RNG key shouldn't have a massive impact here, since it it only used
         # internally by stochastic optimizers:
