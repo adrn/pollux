@@ -18,7 +18,7 @@ from pollux.models.iterative import (
     ParameterBlock,
     _build_fixed_pars,
     _get_regularization_from_prior,
-    _latents_probe_point,
+    _latents_probe_points,
     _least_squares_blocker,
     _linearize_latents,
     _optimize_block_numpyro,
@@ -241,7 +241,7 @@ class TestLinearizeLatents:
         z0 = jnp.zeros((n_stars, n_latents))
         params = {"flux": {"data": {"A": A}, "err": {}}}
         c, jvp, _ = _linearize_latents(
-            _predict_fn(model, params, "flux"), z0, jnp.ones_like(z0)
+            _predict_fn(model, params, "flux"), z0, (jnp.ones_like(z0),)
         )
 
         columns = jnp.stack(
@@ -267,7 +267,7 @@ class TestLinearizeLatents:
 
         z0 = jnp.zeros((n_stars, n_latents))
         c, jvp, _ = _linearize_latents(
-            _predict_fn(model, params, "flux"), z0, jnp.ones_like(z0)
+            _predict_fn(model, params, "flux"), z0, (jnp.ones_like(z0),)
         )
 
         assert jnp.allclose(c, offset[:, None])
@@ -277,27 +277,51 @@ class TestLinearizeLatents:
         assert jnp.allclose(columns, A)
 
     @pytest.mark.parametrize("scale", [0.1, 1.0, 100.0])
-    def test_affine_verdict_holds_at_every_probe_scale(self, scale):
+    def test_affine_verdict_holds_at_every_latent_scale(self, scale):
         """Linear stays linear and a 1e-4 nonlinearity stays detected, at any amplitude."""
         n_stars, n_latents, n_out = 8, 3, 5
         A = jax.random.normal(jax.random.PRNGKey(1), (n_out, n_latents))
         z0 = jnp.zeros((n_stars, n_latents))
-        probe = scale * jax.random.normal(jax.random.PRNGKey(3), z0.shape)
+        probes = _latents_probe_points(jnp.full(z0.shape, scale), z0.shape)
 
-        assert _linearize_latents(lambda z: z @ A.T, z0, probe) is not None
+        assert _linearize_latents(lambda z: z @ A.T, z0, probes) is not None
         assert (
-            _linearize_latents(lambda z: z @ A.T + 1e-4 * (z**2) @ A.T, z0, probe)
+            _linearize_latents(lambda z: z @ A.T + 1e-4 * (z**2) @ A.T, z0, probes)
             is None
         )
 
-    def test_probe_point_tracks_the_current_latents(self):
-        """The probe scales with the latents, and never collapses to zero."""
+    def test_a_second_amplitude_catches_what_one_would_miss(self):
+        """A nonlinearity built to vanish at one probe is still caught by the other."""
+        n_stars, n_latents = 16, 3
+        z0 = jnp.zeros((n_stars, n_latents))
+        probes = _latents_probe_points(None, z0.shape)
+
+        # sneaky(z) = z + z**2 (z - p) has tangent plane z at the origin, so its
+        # deviation from it is z**3 - p z**2 -- engineered to vanish exactly at z = p
+        # and to be large at 10p
+        p = probes[0]
+
+        def sneaky(z):
+            return z + z**2 * (z - p)
+
+        assert (
+            _linearize_latents(sneaky, z0, probes[:1]) is not None
+        )  # one probe fooled
+        assert _linearize_latents(sneaky, z0, probes) is None  # two probes are not
+
+    def test_probe_points_track_the_current_latents(self):
+        """Probes scale with the latents, never collapse to zero, and differ in size."""
         shape = (4, 2)
-        assert jnp.abs(_latents_probe_point(None, shape)).max() > 0
-        assert jnp.abs(_latents_probe_point(jnp.zeros(shape), shape)).max() > 0
-        big = _latents_probe_point(jnp.full(shape, 50.0), shape)
-        small = _latents_probe_point(jnp.full(shape, 0.5), shape)
-        assert jnp.abs(big).max() > 10 * jnp.abs(small).max()
+        for latents in (None, jnp.zeros(shape)):
+            assert all(
+                jnp.abs(p).max() > 0 for p in _latents_probe_points(latents, shape)
+            )
+
+        big = _latents_probe_points(jnp.full(shape, 50.0), shape)
+        small = _latents_probe_points(jnp.full(shape, 0.5), shape)
+        assert jnp.abs(big[0]).max() > 10 * jnp.abs(small[0]).max()
+        # The amplitudes are spread, so a nearly-linear map is tested far from z0 too
+        assert jnp.abs(small[1]).max() > 5 * jnp.abs(small[0]).max()
 
 
 class TestSolveLatentsComposed:
