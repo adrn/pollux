@@ -37,7 +37,7 @@ def linear_model_and_data():
 
     rng = np.random.default_rng(123)
 
-    model = plx.LuxModel(latent_size=n_latents)
+    model = plx.Lux(latent_size=n_latents)
     model.register_output("flux", LinearTransform(output_size=n_flux))
 
     true_A = rng.normal(size=(n_flux, n_latents)) * 0.5
@@ -424,7 +424,7 @@ class TestOptimizeIterativeWithNonlinear:
             vmap=False,
         )
 
-        model = plx.LuxModel(latent_size=n_latents)
+        model = plx.Lux(latent_size=n_latents)
         model.register_output("flux", transform)
 
         # Generate data
@@ -532,7 +532,7 @@ class TestMixedLinearNonlinear:
 
         rng = np.random.default_rng(42)
 
-        model = plx.LuxModel(latent_size=n_latents)
+        model = plx.Lux(latent_size=n_latents)
 
         # Linear output for labels
         model.register_output("label", LinearTransform(output_size=n_labels))

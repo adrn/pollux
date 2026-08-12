@@ -26,6 +26,7 @@ from numpyro.infer.autoguide import AutoDelta
 from tqdm.auto import tqdm
 from typing_extensions import TypeIs
 
+from .._linalg import weighted_least_squares
 from ..data import OutputData, PolluxData
 from .transforms import (
     AbstractTransform,
@@ -102,6 +103,11 @@ class ParameterBlock:
     optimizer_kwargs: dict[str, Any] = field(default_factory=dict)
     num_steps: int = 1000
 
+    @property
+    def params_list(self) -> list[str]:
+        """``params`` as a list, whether one spec or several were given."""
+        return [self.params] if isinstance(self.params, str) else self.params
+
 
 @dataclass
 class IterativeOptimizationResult:
@@ -161,7 +167,6 @@ def _inverse_variance(output_data: OutputData) -> jax.Array:
 
 def _get_regularization_from_prior(
     prior: dist.Distribution,
-    fallback: float = 1e-6,
 ) -> tuple[jax.Array | float, jax.Array | float]:
     """Extract regularization parameters from a prior distribution.
 
@@ -169,9 +174,7 @@ def _get_regularization_from_prior(
     ----------
     prior
         A numpyro distribution. For Normal distributions, extracts the precision.
-        For other distributions, returns the fallback regularization.
-    fallback
-        Default regularization strength if the prior is not Normal.
+        For other distributions, returns a negligible fallback regularization.
 
     Returns
     -------
@@ -183,7 +186,7 @@ def _get_regularization_from_prior(
     Notes
     -----
     Currently only supports Normal distributions. For other priors,
-    uses the fallback regularization with zero mean.
+    uses a negligible regularization with zero mean.
     """
     if isinstance(prior, dist.Normal):
         # Normal(loc, scale): regularization is 1/scale^2
@@ -194,7 +197,7 @@ def _get_regularization_from_prior(
         # No regularization for improper uniform
         return 0.0, 0.0
     # Fallback for other distributions
-    return fallback, 0.0
+    return 1e-6, 0.0
 
 
 def _solve_latents_least_squares(
@@ -358,38 +361,22 @@ def _solve_output_params_least_squares(
     reg_strength, prior_mean = _get_regularization_from_prior(a_prior)
     reg_matrix = reg_strength * jnp.eye(latent_size)
 
-    # Prior mean for A - typically 0, but could be non-zero
-    # prior_mean could be scalar or array; handle both
-    if hasattr(prior_mean, "shape") and prior_mean.shape:
-        # Array prior mean - need to extract row for each output dim
-        # For now, assume scalar or broadcast
-        prior_mean_contrib = reg_strength * jnp.broadcast_to(
-            prior_mean, (output_size, latent_size)
-        )
-    else:
-        prior_mean_contrib = reg_strength * jnp.full(
-            (output_size, latent_size), prior_mean
-        )
+    # Prior mean for A, typically 0 but may be a scalar or an array
+    prior_mean_contrib = reg_strength * jnp.broadcast_to(
+        prior_mean, (output_size, latent_size)
+    )
 
     def fit_single_output_dim(
-        dim_data: tuple[jax.Array, jax.Array, jax.Array],
+        y_dim: jax.Array, ivar_dim: jax.Array, prior_mean_row: jax.Array
     ) -> jax.Array:
-        """Fit parameters for a single output dimension."""
-        y_dim, w_dim, prior_mean_row = dim_data  # (n_data,), (n_data,), (latent_size,)
-
-        # Weighted normal equations: (Z^T W Z + λI) @ a = Z^T W y + λ μ
-        ZtW = latents.T * w_dim  # (latent_size, n_data)
-        ZtWZ = ZtW @ latents  # (latent_size, latent_size)
-        ZtWy = ZtW @ y_dim  # (latent_size,)
-
-        # Solve with regularization and prior mean
-        result: jax.Array = jnp.linalg.solve(ZtWZ + reg_matrix, ZtWy + prior_mean_row)
-        return result
+        """Fit the latents -> output coefficients for a single output dimension."""
+        return weighted_least_squares(
+            latents, y_dim, ivar_dim, reg_matrix, prior_mean_row
+        )
 
     # Vectorize over output dimensions
-    dim_data = (y.T, output_ivar.T, prior_mean_contrib)  # (output_size, ...) each
     A: jax.Array = jax.vmap(fit_single_output_dim)(
-        dim_data
+        y.T, output_ivar.T, prior_mean_contrib
     )  # (output_size, latent_size)
 
     return {"A": A}
@@ -421,11 +408,8 @@ def _build_initial_params_from_fixed(
     """Build initial params by merging fixed_pars with zero-initialized optimized params."""
     initial: dict[str, Any] = dict(fixed_pars)
 
-    for block in blocks:
-        param_specs = block.params if isinstance(block.params, list) else [block.params]
-        for spec in param_specs:
-            if spec == "latents" and "latents" not in initial:
-                initial["latents"] = jnp.zeros((len(data), model.latent_size))
+    if "latents" not in initial and any("latents" in b.params_list for b in blocks):
+        initial["latents"] = jnp.zeros((len(data), model.latent_size))
 
     return initial
 
@@ -530,7 +514,7 @@ def optimize_iterative(
     """
     # Resolve blocks to list[ParameterBlock] | None (convert strings if needed)
     _blocks: list[ParameterBlock] | None
-    if blocks is not None and len(blocks) > 0 and isinstance(blocks[0], str):
+    if blocks and isinstance(blocks[0], str):
         _blocks = [_string_to_parameter_block(model, name) for name in blocks]  # type: ignore[arg-type]
     else:
         _blocks = blocks  # type: ignore[assignment]
@@ -671,13 +655,9 @@ def _optimize_block_least_squares(
     latents_prior: dist.Distribution | None = None,
 ) -> dict[str, Any]:
     """Optimize a parameter block using least squares."""
-    params = block.params
-    if isinstance(params, str):
-        params = [params]
-
     new_params = dict(current_params)
 
-    for param_spec in params:
+    for param_spec in block.params_list:
         if param_spec == "latents":
             new_params["latents"] = _solve_latents_least_squares(
                 model, data, current_params, latents_prior
@@ -739,12 +719,8 @@ def _optimize_block_numpyro(
     The optimizer defaults to Adam with step_size=1e-3 if not specified
     in the block.
     """
-    params = block.params
-    if isinstance(params, str):
-        params = [params]
-
     # Build fixed_pars containing everything NOT being optimized
-    fixed_pars = _build_fixed_pars(model, current_params, params)
+    fixed_pars = _build_fixed_pars(model, current_params, block.params_list)
 
     # Build the optimizer
     optimizer_cls = block.optimizer
@@ -782,7 +758,7 @@ def _optimize_block_numpyro(
 
     # Merge optimized parameters with current parameters
     new_params = dict(current_params)
-    for param_spec in params:
+    for param_spec in block.params_list:
         if param_spec == "latents" and "latents" in optimized_subset:
             new_params["latents"] = optimized_subset["latents"]
         elif ":" in param_spec:

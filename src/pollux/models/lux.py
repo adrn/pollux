@@ -1,6 +1,6 @@
 import warnings
 from collections import defaultdict
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from functools import partial
 from typing import TYPE_CHECKING, Any
 
@@ -306,35 +306,30 @@ class Lux(eqx.Module):
         """
         output_names = names or list(self.outputs.keys())
 
-        data_priors: dict[str, Mapping[str, Any]] = {}
-        err_priors: dict[str, Mapping[str, Any]] = {}
         data_pars: dict[str, dict[str, jax.Array]] = {}
         err_pars: dict[str, dict[str, jax.Array]] = {}
         for output_name in output_names:
-            # Priors for latent -> data transformation:
-            data_priors[output_name] = self.outputs[
-                output_name
-            ].data_transform.get_expanded_priors(
+            output = self.outputs[output_name]
+
+            # Priors for latent -> data transformation. Use the naming scheme
+            # "output_name:param_name"; for a TransformSequence, param_name
+            # already includes its own "{index}:{param}" prefix.
+            data_priors = output.data_transform.get_expanded_priors(
                 latent_size=self.latent_size, data_size=len(data)
             )
-            data_pars[output_name] = {}
-            for param_name, prior in data_priors[output_name].items():
-                # Use new naming scheme: "output_name:param_name"
-                # For TransformSequence, param_name already includes "{index}:{param}"
-                numpyro_name = f"{output_name}:{param_name}"
-                data_pars[output_name][param_name] = numpyro.sample(numpyro_name, prior)
+            data_pars[output_name] = {
+                param_name: numpyro.sample(f"{output_name}:{param_name}", prior)
+                for param_name, prior in data_priors.items()
+            }
 
             # Priors and parameters for transformation of the errors:
-            err_priors[output_name] = self.outputs[
-                output_name
-            ].err_transform.get_expanded_priors(
+            err_priors = output.err_transform.get_expanded_priors(
                 latent_size=self.latent_size, data_size=len(data)
             )
-            err_pars[output_name] = {}
-            for param_name, prior in err_priors[output_name].items():
-                err_pars[output_name][param_name] = numpyro.sample(
-                    f"{output_name}:err:{param_name}", prior
-                )
+            err_pars[output_name] = {
+                param_name: numpyro.sample(f"{output_name}:err:{param_name}", prior)
+                for param_name, prior in err_priors.items()
+            }
 
         # Wrap data_pars in nested format for predict_outputs
         nested_pars = {k: {"data": v} for k, v in data_pars.items()}
@@ -478,20 +473,19 @@ class Lux(eqx.Module):
         # Default to using Adam optimizer:
         optimizer = optimizer or numpyro.optim.Adam()
 
-        partial_pars: dict[str, Any] = {}
-        if fixed_pars is not None:
-            # Use ignore_missing=True since fixed_pars typically contains only a subset
-            # of parameters (the ones we want to fix during optimization)
-            packed_fixed_pars = self.pack_numpyro_pars(fixed_pars, ignore_missing=True)
-            partial_pars["fixed_pars"] = packed_fixed_pars
-
-        if names is not None:
-            partial_pars["names"] = names
-
-        partial_pars["latents_prior"] = latents_prior
-        partial_pars["custom_model"] = custom_model
-
-        model: Any = partial(self.default_numpyro_model, **partial_pars)
+        # ignore_missing=True: fixed_pars typically holds only a subset of the
+        # parameters, namely the ones to hold fixed during optimization
+        model: Any = partial(
+            self.default_numpyro_model,
+            fixed_pars=(
+                None
+                if fixed_pars is None
+                else self.pack_numpyro_pars(fixed_pars, ignore_missing=True)
+            ),
+            names=names,
+            latents_prior=latents_prior,
+            custom_model=custom_model,
+        )
 
         # The RNG key shouldn't have a massive impact here, since it it only used
         # internally by stochastic optimizers:
@@ -667,21 +661,3 @@ class Lux(eqx.Module):
                 packed[name] = jnp.array(pars[name])
 
         return packed
-
-
-class LuxModel(Lux):
-    """Deprecated alias for Lux class.
-
-    .. deprecated::
-        Use :class:`Lux` instead. ``LuxModel`` will be removed in a future version.
-    """
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        """Initialize LuxModel with deprecation warning."""
-        warnings.warn(
-            "The `LuxModel` class is deprecated and will be removed in a future "
-            "version. Please use the `Lux` class instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        super().__init__(*args, **kwargs)

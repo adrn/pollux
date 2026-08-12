@@ -4,7 +4,6 @@ __all__ = [
     "AbstractMultiTransform",
     "AbstractSingleTransform",
     "AbstractTransform",
-    "AdditiveOffsetTransform",
     "AffineTransform",
     "ConcatenateTransform",
     "EquinoxNNTransform",
@@ -22,7 +21,7 @@ __all__ = [
 
 import abc
 import inspect
-from itertools import combinations_with_replacement
+from itertools import accumulate, combinations_with_replacement
 from math import comb
 from typing import Any, TypeAlias
 
@@ -63,10 +62,25 @@ def _resolve_shape(shape: ShapeT, **dim_sizes: int | None) -> tuple[int, ...]:
     (128, 1)
     """
     sizes: dict[str, int | None] = {"one": 1, **dim_sizes}
-    return tuple(
-        sizes[d] if isinstance(d, str) and sizes[d] is not None else d  # type: ignore[misc]
-        for d in shape
-    )
+
+    resolved = []
+    for dim in shape:
+        if not isinstance(dim, str):
+            resolved.append(dim)
+            continue
+
+        size = sizes.get(dim)
+        if size is None:
+            known = sorted(name for name, value in sizes.items() if value is not None)
+            msg = (
+                f"Cannot resolve shape dimension '{dim}': no size is known for it "
+                f"here. Known dimensions: {known}. Note that 'data_size' is only "
+                "known once the transform is used with data, e.g. during "
+                "model.optimize()."
+            )
+            raise ValueError(msg)
+        resolved.append(size)
+    return tuple(resolved)
 
 
 #: Type alias for parameter priors: maps parameter names to distributions.
@@ -91,11 +105,6 @@ class AbstractTransform(eqx.Module):
 
     output_size: int
 
-    # TODO: priors and shapes must be defined on any abstract subclass, but
-    # there is no way to define an abstract class property
-    # priors: ParamPriorsT | ParamPriorsTupleT
-    # shapes: ParamShapesT | ParamShapesTupleT
-
     @abc.abstractmethod
     def apply(self, latents: BatchedLatentsT, **pars: Any) -> BatchedOutputT:
         """Apply the transform to input latent vectors.
@@ -115,6 +124,15 @@ class AbstractTransform(eqx.Module):
         for the transform, based on latent size and optional data size.
         """
         raise NotImplementedError
+
+    def get_output_size(self, input_size: int) -> int:
+        """Output size given an input size.
+
+        Fixed for most transforms; overridden by those (like
+        :class:`PolyFeatureTransform`) whose output size depends on their input.
+        """
+        del input_size
+        return self.output_size
 
 
 class AbstractSingleTransform(AbstractTransform):
@@ -411,13 +429,8 @@ class TransformSequence(AbstractMultiTransform):
                 flat_name = f"{i}:{param_name}"
                 priors[flat_name] = prior
 
-            # Update current_size for the next transform
-            # Check if transform has get_output_size method (like PolyFeatureTransform)
-            get_output_size = getattr(transform, "get_output_size", None)
-            if callable(get_output_size):
-                current_size = get_output_size(current_size)
-            else:
-                current_size = transform.output_size
+            # The next transform's "latent_size" is this one's output size
+            current_size = transform.get_output_size(current_size)
 
         return ImmutableMap(**priors)
 
@@ -513,10 +526,9 @@ class ConcatenateTransform(AbstractMultiTransform):
             Concatenated outputs of shape ``(n_samples, sum(output_sizes))``.
         """
         # Split latents by input_sizes along the last axis
-        split_indices = tuple(
-            sum(self.input_sizes[: i + 1]) for i in range(len(self.input_sizes) - 1)
+        latent_slices = jnp.split(
+            latents, tuple(accumulate(self.input_sizes[:-1])), axis=-1
         )
-        latent_slices = jnp.split(latents, split_indices, axis=-1)
 
         outputs = [
             transform.apply(slice_, **pars)
@@ -546,13 +558,7 @@ class ConcatenateTransform(AbstractMultiTransform):
         ModelValidationError
             If ``latent_size`` does not match ``sum(input_sizes)``.
         """
-        expected_total = sum(self.input_sizes)
-        if latent_size != expected_total:
-            msg = (
-                f"latent_size ({latent_size}) does not match "
-                f"sum(input_sizes) ({expected_total})"
-            )
-            raise ModelValidationError(msg)
+        self.get_output_size(latent_size)  # validates latent_size
 
         priors = {}
         for i, (transform, input_size) in enumerate(
@@ -641,6 +647,26 @@ class FunctionTransform(AbstractSingleTransform):
     The parameter ``A`` will have shape ``(128, latent_size)`` where ``latent_size``
     is determined when the transform is registered with a model.
 
+    Per-object nuisance parameters use the ``"data_size"`` named dimension and
+    ``vmap=False``, so the function sees the whole batch. For example, a distance
+    modulus — one scalar offset per object, added to every output dimension —
+    composes with any base transform:
+
+    >>> from pollux.models.transforms import LinearTransform, TransformSequence
+    >>> distance_modulus = FunctionTransform(
+    ...     output_size=3,
+    ...     transform=lambda mags, offset: mags + offset[:, None],
+    ...     priors=ImmutableMap({"offset": dist.Normal(11.0, 3.0)}),
+    ...     shapes=ImmutableMap({"offset": ("data_size",)}),
+    ...     vmap=False,
+    ... )
+    >>> apparent_mags = TransformSequence(
+    ...     (LinearTransform(output_size=3), distance_modulus)
+    ... )
+
+    The offset is sampled with shape ``(data_size,)``, so it adapts to however many
+    objects are in the dataset being fit.
+
     See also the "Inferring Continuum Model Parameters" tutorial for an example of
     using FunctionTransform with per-star parameters and ``vmap=False``.
     """
@@ -659,8 +685,6 @@ class NoOpTransform(AbstractSingleTransform):
 
     output_size: int = 0
     transform: TransformFuncT = _noop_transform
-    priors: ParamPriorsT = ImmutableMap()
-    shapes: ParamShapesT = ImmutableMap()
 
 
 # ----
@@ -804,18 +828,6 @@ class PolyFeatureTransform(AbstractTransform):
             Number of polynomial features.
         """
         return _compute_n_poly_features(input_size, self.degree, self.include_bias)
-
-    def unpack_pars(
-        self, _flat_pars: dict[str, Any], _ignore_missing: bool = False
-    ) -> dict[str, Any]:
-        """For compatibility with TransformSequence (returns empty dict)."""
-        return {}
-
-    def pack_pars(
-        self, _nested_pars: dict[str, Any], _ignore_missing: bool = False
-    ) -> dict[str, Any]:
-        """For compatibility with TransformSequence (returns empty dict)."""
-        return {}
 
 
 # ----
@@ -1013,10 +1025,10 @@ class EquinoxNNTransform(AbstractTransform):
     ...     bias_prior=dist.Normal(0, 0.01),
     ... )
 
-    Use with LuxModel:
+    Use with Lux:
 
     >>> import pollux as plx
-    >>> model = plx.LuxModel(latent_size=8)
+    >>> model = plx.Lux(latent_size=8)
     >>> model.register_output("flux", nn_trans)
     """
 
@@ -1142,7 +1154,7 @@ class EquinoxNNTransform(AbstractTransform):
     def unpack_pars(
         self, flat_pars: dict[str, Any], ignore_missing: bool = False
     ) -> dict[str, Any]:
-        """Unpack flat parameters (for compatibility with TransformSequence)."""
+        """Pack/unpack parameters (identity, keyed by NN parameter path)."""
         result = {}
         for path in self._param_paths:
             if path in flat_pars:
@@ -1152,236 +1164,10 @@ class EquinoxNNTransform(AbstractTransform):
                 raise ValueError(msg)
         return result
 
-    def pack_pars(
-        self, nested_pars: dict[str, Any], ignore_missing: bool = False
-    ) -> dict[str, Any]:
-        """Pack parameters to flat format (for compatibility with TransformSequence)."""
-        result = {}
-        for path in self._param_paths:
-            if path in nested_pars:
-                result[path] = nested_pars[path]
-            elif not ignore_missing:
-                msg = f"Missing NN parameter: {path}"
-                raise ValueError(msg)
-        return result
+    pack_pars = unpack_pars
 
 
 # ----
-
-
-class AdditiveOffsetTransform(eqx.Module):
-    """Transform that wraps a base transform and adds a per-star scalar offset.
-
-    This transform is useful for modeling per-object nuisance parameters like
-    distance modulus, where each object has its own offset that applies uniformly
-    to all output dimensions. This is a generalization of the :class:`AffineTransform`
-    and :class:`OffsetTransform` class, because here the offset can vary per object
-    instead of per output.
-
-    In other words, unlike :class:`OffsetTransform` which has a fixed offset vector of
-    shape ``(output_size,)``, this transform samples a separate scalar offset for each
-    object in the dataset, with shape ``(data_size,)``. The offset is then broadcast to
-    all output dimensions.
-
-    Parameters
-    ----------
-    base_transform
-        The underlying transform to wrap (e.g., :class:`LinearTransform`).
-    offset_prior
-        Prior distribution for the per-object offset. This will be expanded
-        to shape ``(data_size,)`` during inference.
-
-    Examples
-    --------
-    >>> import jax.numpy as jnp
-    >>> import numpyro.distributions as dist
-    >>> from pollux.models.transforms import AdditiveOffsetTransform, LinearTransform
-
-    Model apparent magnitudes as absolute magnitudes plus distance modulus:
-
-    >>> phot_trans = AdditiveOffsetTransform(
-    ...     base_transform=LinearTransform(output_size=3),  # 3 photometric bands
-    ...     offset_prior=dist.Normal(11.0, 3.0),  # Distance modulus prior
-    ... )
-
-    The offset adapts to the data size automatically:
-
-    >>> import pollux as plx
-    >>> model = plx.Lux(latent_size=8)
-    >>> model.register_output("phot", phot_trans)
-    >>> # During training with 1000 stars, offset has shape (1000,)
-    >>> # During testing with 500 stars, offset has shape (500,)
-
-    Notes
-    -----
-    The per-star offset is broadcast to all output dimensions, meaning the same
-    offset value is added to every element of the output for a given object.
-    This is appropriate for distance modulus (which shifts all magnitudes equally)
-    but may not be appropriate for other use cases.
-    """
-
-    base_transform: AbstractSingleTransform | TransformSequence
-    offset_prior: dist.Distribution = eqx.field(
-        default_factory=lambda: dist.Normal(0.0, 1.0)
-    )
-
-    @property
-    def output_size(self) -> int:
-        """Output size, inherited from the base transform."""
-        return self.base_transform.output_size
-
-    def get_expanded_priors(
-        self, latent_size: int, data_size: int | None = None
-    ) -> ParamPriorsT:
-        """Get expanded parameter priors including the per-star offset.
-
-        Parameters
-        ----------
-        latent_size
-            Size of the latent vector.
-        data_size
-            Number of objects in the dataset. Required for this transform.
-
-        Returns
-        -------
-        ParamPriorsT
-            Dictionary of priors including base transform priors (prefixed with
-            "base:") and the offset prior with shape ``(data_size,)``.
-
-        Raises
-        ------
-        ValueError
-            If ``data_size`` is None.
-        """
-        if data_size is None:
-            msg = (
-                "AdditiveOffsetTransform requires data_size to be specified. "
-                "This should be set automatically during model.optimize()."
-            )
-            raise ValueError(msg)
-
-        # Get base transform priors with "base:" prefix
-        base_priors = self.base_transform.get_expanded_priors(
-            latent_size=latent_size, data_size=data_size
-        )
-
-        priors = {}
-        for name, prior in base_priors.items():
-            priors[f"base:{name}"] = prior
-
-        # Add per-star offset prior
-        priors["offset"] = self.offset_prior.expand((data_size,))
-
-        return ImmutableMap(**priors)
-
-    def apply(self, latents: BatchedLatentsT, **params: Any) -> BatchedOutputT:
-        """Apply the base transform and add the per-star offset.
-
-        Parameters
-        ----------
-        latents
-            Input latent vectors of shape ``(n_samples, latent_size)``.
-        **params
-            Parameters including base transform parameters (prefixed with "base:")
-            and the "offset" parameter of shape ``(n_samples,)``.
-
-        Returns
-        -------
-        array
-            Output of shape ``(n_samples, output_size)``.
-        """
-        # Extract base transform parameters (strip "base:" prefix)
-        base_params = {}
-        for name, value in params.items():
-            if name.startswith("base:"):
-                base_params[name[5:]] = value
-
-        # Apply base transform
-        base_output = self.base_transform.apply(latents, **base_params)
-
-        # Add per-star offset (broadcast to all output dimensions)
-        offset = params.get("offset")
-        if offset is not None:
-            # offset shape: (n_samples,) -> (n_samples, 1) for broadcasting
-            base_output = base_output + offset[:, None]
-
-        return base_output
-
-    def unpack_pars(
-        self, flat_pars: dict[str, Any], ignore_missing: bool = False
-    ) -> dict[str, Any]:
-        """Unpack flat parameters into nested structure.
-
-        Parameters
-        ----------
-        flat_pars
-            Flat parameter dictionary with "base:..." prefixed keys and "offset".
-        ignore_missing
-            If True, skip missing parameters.
-
-        Returns
-        -------
-        dict
-            Nested parameter dictionary with "base" and "offset" keys.
-        """
-        # Extract base parameters
-        base_flat = {}
-        offset = None
-        for name, value in flat_pars.items():
-            if name.startswith("base:"):
-                base_flat[name[5:]] = value
-            elif name == "offset":
-                offset = value
-
-        # Unpack base transform parameters
-        base_nested = self.base_transform.unpack_pars(
-            base_flat, ignore_missing=ignore_missing
-        )
-
-        result: dict[str, Any] = {"base": base_nested}
-        if offset is not None:
-            result["offset"] = offset
-        elif not ignore_missing:
-            msg = "Missing parameter: offset"
-            raise ValueError(msg)
-
-        return result
-
-    def pack_pars(
-        self, nested_pars: dict[str, Any], ignore_missing: bool = False
-    ) -> dict[str, Any]:
-        """Pack nested parameters into flat structure.
-
-        Parameters
-        ----------
-        nested_pars
-            Nested parameter dictionary with "base" and "offset" keys.
-        ignore_missing
-            If True, skip missing parameters.
-
-        Returns
-        -------
-        dict
-            Flat parameter dictionary with "base:..." prefixed keys and "offset".
-        """
-        result = {}
-
-        # Pack base transform parameters
-        base_nested = nested_pars.get("base", {})
-        base_flat = self.base_transform.pack_pars(
-            base_nested, ignore_missing=ignore_missing
-        )
-        for name, value in base_flat.items():
-            result[f"base:{name}"] = value
-
-        # Add offset
-        if "offset" in nested_pars:
-            result["offset"] = nested_pars["offset"]
-        elif not ignore_missing:
-            msg = "Missing parameter: offset"
-            raise ValueError(msg)
-
-        return result
 
 
 # ----

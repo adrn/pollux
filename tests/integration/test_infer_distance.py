@@ -42,7 +42,7 @@ def test_infer_distance():
         ),
     )
 
-    model = plx.LuxModel(latent_size=n_latents)
+    model = plx.Lux(latent_size=n_latents)
     model.register_output("flux", plx.models.LinearTransform(output_size=128))
 
     trans = plx.models.TransformSequence(
