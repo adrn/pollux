@@ -40,7 +40,8 @@ The [PEP 735](https://peps.python.org/pep-0735/) dependency groups (`test`, `doc
 python -m pip install -e . --group dev
 ```
 
-See the [documentation][rtd-link] for more.
+See [DEV.md](DEV.md) for building the docs and cutting a release, and the
+[documentation][rtd-link] for everything else.
 
 <!-- prettier-ignore-start -->
 [actions-badge]:            https://github.com/adrn/pollux/workflows/CI/badge.svg
