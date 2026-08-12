@@ -1,3 +1,5 @@
+from functools import partial
+
 import equinox as eqx
 import jax.numpy as jnp
 import numpy as np
@@ -15,6 +17,13 @@ from pollux.models.transforms import (
     PolyFeatureTransform,
     TransformSequence,
 )
+
+
+def mlp_factory(in_size, out_size, key, width=16, depth=1):
+    """Network factory for the EquinoxNNTransform tests."""
+    return eqx.nn.MLP(
+        in_size=in_size, out_size=out_size, width_size=width, depth=depth, key=key
+    )
 
 
 def test_linear_transform():
@@ -259,17 +268,7 @@ def test_function_transform_in_sequence():
 
 
 def test_transform_sequence_pack_unpack_pars():
-    """Test the pack_pars and unpack_pars methods for parameter conversion.
-
-    Tests basic functionality of packing nested parameter lists into flat dictionaries
-    and vice versa. Verifies round-trip conversion (pack → unpack → original structure)
-    with a two-transform sequence (LinearTransform + OffsetTransform).
-
-    Covers:
-    - Packing: nested list → flat dict with "{index}:{param}" naming
-    - Unpacking: flat dict → nested list structure
-    - Round-trip conversion preserves all parameter data accurately
-    """
+    """Test pack/unpack round-tripping for a two-transform sequence."""
     n_latents = 8
     n_out = 4
     rng = np.random.default_rng(456)
@@ -319,17 +318,7 @@ def test_transform_sequence_pack_unpack_pars():
 
 
 def test_transform_sequence_unpack_with_missing_pars():
-    """Test unpacking parameters when some parameters are missing.
-
-    Tests behavior when only some transforms have parameters provided.
-    Ensures empty dictionaries are created for transforms without parameters,
-    demonstrating robust handling of partial parameter sets.
-
-    Covers:
-    - Graceful handling of missing parameters for some transforms
-    - Empty dictionary creation for transforms without provided parameters
-    - No errors when parameter coverage is incomplete
-    """
+    """Unpacking with ignore_missing gives empty dicts for absent parameters."""
     n_out = 4
     n_latents = 8
     rng = np.random.default_rng(123)
@@ -351,18 +340,7 @@ def test_transform_sequence_unpack_with_missing_pars():
 
 
 def test_transform_sequence_unpack_with_extra_pars():
-    """Test unpacking parameters with extra parameters that don't match any transform.
-
-    Tests robustness when invalid parameter names are provided, including parameters
-    with invalid transform indices and non-indexed parameter names. Ensures the
-    unpacking process ignores invalid parameters gracefully without errors.
-
-    Covers:
-    - Invalid transform indices (beyond sequence length) are ignored
-    - Non-indexed parameter names (missing ":") are ignored silently
-    - Only valid parameters matching existing transforms are unpacked
-    - Robust error handling for malformed parameter names
-    """
+    """Unpacking ignores out-of-range indices and non-indexed parameter names."""
     n_out = 4
     n_latents = 8
     rng = np.random.default_rng(789)
@@ -385,18 +363,7 @@ def test_transform_sequence_unpack_with_extra_pars():
 
 
 def test_transform_sequence_pack_empty_dicts():
-    """Test packing when some parameter dictionaries are empty.
-
-    Tests the packing process when some transforms in the sequence have empty
-    parameter dictionaries. Ensures that only non-empty parameters are included
-    in the flat output dictionary, demonstrating efficient handling of sparse
-    parameter sets.
-
-    Covers:
-    - Empty parameter dictionaries are handled gracefully
-    - Only non-empty parameters appear in packed output
-    - No spurious entries for transforms without parameters
-    """
+    """Packing a transform with an empty parameter dict adds no entries."""
     n_out = 4
     rng = np.random.default_rng(456)
 
@@ -420,20 +387,7 @@ def test_transform_sequence_pack_empty_dicts():
 
 
 def test_transform_sequence_three_transforms_pack_unpack():
-    """Test pack/unpack with three transforms to ensure indexing works correctly.
-
-    Tests parameter conversion with a more complex three-transform sequence including
-    a custom FunctionTransform. Verifies correct indexing with multiple transforms
-    (0:A, 1:scale, 2:b) and tests the full round-trip conversion with complex
-    parameter structures to ensure scalability.
-
-    Covers:
-    - Correct indexing scheme for sequences of any length (0, 1, 2, ...)
-    - Integration with custom FunctionTransform parameters
-    - Multiple parameter types (matrices, scalars, vectors)
-    - Full round-trip conversion preserves complex parameter structures
-    - Scalability beyond simple two-transform cases
-    """
+    """Test pack/unpack indexing (0:A, 1:scale, 2:b) with three transforms."""
     n_latents = 4
     n_out = 3
     rng = np.random.default_rng(321)
@@ -671,16 +625,6 @@ def test_equinox_nn_transform_basic():
     n_out = 8
     n_samples = 16
 
-    # Create a simple MLP factory
-    def mlp_factory(in_size, out_size, key):
-        return eqx.nn.MLP(
-            in_size=in_size,
-            out_size=out_size,
-            width_size=16,
-            depth=1,
-            key=key,
-        )
-
     nn_trans = EquinoxNNTransform(
         output_size=n_out,
         nn_factory=mlp_factory,
@@ -718,18 +662,9 @@ def test_equinox_nn_transform_param_paths():
     n_in = 4
     n_out = 8
 
-    def mlp_factory(in_size, out_size, key):
-        return eqx.nn.MLP(
-            in_size=in_size,
-            out_size=out_size,
-            width_size=16,
-            depth=2,  # 2 hidden layers
-            key=key,
-        )
-
     nn_trans = EquinoxNNTransform(
         output_size=n_out,
-        nn_factory=mlp_factory,
+        nn_factory=partial(mlp_factory, depth=2),  # 2 hidden layers
     )
 
     priors = nn_trans.get_expanded_priors(latent_size=n_in)
@@ -756,15 +691,6 @@ def test_equinox_nn_transform_prior_shapes():
     n_out = 8
     width = 16
 
-    def mlp_factory(in_size, out_size, key):
-        return eqx.nn.MLP(
-            in_size=in_size,
-            out_size=out_size,
-            width_size=width,
-            depth=1,
-            key=key,
-        )
-
     nn_trans = EquinoxNNTransform(
         output_size=n_out,
         nn_factory=mlp_factory,
@@ -786,15 +712,6 @@ def test_equinox_nn_transform_custom_priors():
     """Test that custom priors are applied correctly."""
     n_in = 4
     n_out = 8
-
-    def mlp_factory(in_size, out_size, key):
-        return eqx.nn.MLP(
-            in_size=in_size,
-            out_size=out_size,
-            width_size=16,
-            depth=1,
-            key=key,
-        )
 
     # Use distinctive priors
     weight_prior = dist.Normal(0.0, 0.5)
@@ -826,15 +743,6 @@ def test_equinox_nn_transform_deterministic():
     n_samples = 16
     rng = np.random.default_rng(42)
 
-    def mlp_factory(in_size, out_size, key):
-        return eqx.nn.MLP(
-            in_size=in_size,
-            out_size=out_size,
-            width_size=16,
-            depth=1,
-            key=key,
-        )
-
     nn_trans = EquinoxNNTransform(
         output_size=n_out,
         nn_factory=mlp_factory,
@@ -860,15 +768,6 @@ def test_equinox_nn_transform_with_lux_model():
     n_latents = 4
     n_flux = 8
     rng = np.random.default_rng(123)
-
-    def mlp_factory(in_size, out_size, key):
-        return eqx.nn.MLP(
-            in_size=in_size,
-            out_size=out_size,
-            width_size=16,
-            depth=1,
-            key=key,
-        )
 
     # Create model with NN transform
     model = plx.LuxModel(latent_size=n_latents)

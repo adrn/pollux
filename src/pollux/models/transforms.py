@@ -1,6 +1,7 @@
 """Transforms for mapping latent vectors to output quantities."""
 
 __all__ = [
+    "AbstractMultiTransform",
     "AbstractSingleTransform",
     "AbstractTransform",
     "AdditiveOffsetTransform",
@@ -245,26 +246,10 @@ class AbstractSingleTransform(AbstractTransform):
         self._param_names = tuple(sig.parameters.keys())[1:]  # skip first (latents)
 
         # Validate that parameter names don't contain colons (reserved for internal use)
-        for param_name in self._param_names:
+        for param_name in (*self._param_names, *self.priors, *self.shapes):
             if ":" in param_name:
                 msg = (
                     f"Transform parameter name '{param_name}' contains ':' which is "
-                    "reserved for internal parameter naming. Please rename this parameter."
-                )
-                raise ValueError(msg)
-
-        # Validate priors and shapes keys don't contain colons
-        for param_name in self.priors:
-            if ":" in param_name:
-                msg = (
-                    f"Parameter prior name '{param_name}' contains ':' which is "
-                    "reserved for internal parameter naming. Please rename this parameter."
-                )
-                raise ValueError(msg)
-        for param_name in self.shapes:
-            if ":" in param_name:
-                msg = (
-                    f"Parameter shape name '{param_name}' contains ':' which is "
                     "reserved for internal parameter naming. Please rename this parameter."
                 )
                 raise ValueError(msg)
@@ -320,25 +305,135 @@ class AbstractSingleTransform(AbstractTransform):
     def unpack_pars(
         self, flat_pars: dict[str, Any], ignore_missing: bool = False
     ) -> dict[str, Any]:
-        """Unpack parameters (identity for single transforms)."""
+        """Pack/unpack parameters (identity for single transforms)."""
         for param_name in self._param_names:
             if param_name not in flat_pars and not ignore_missing:
                 msg = f"Missing value in transform: {param_name}"
                 raise ValueError(msg)
         return flat_pars
 
-    def pack_pars(
-        self, nested_pars: dict[str, Any], ignore_missing: bool = False
-    ) -> dict[str, Any]:
-        """Pack parameters (identity for single transforms)."""
-        for param_name in self._param_names:
-            if param_name not in nested_pars and not ignore_missing:
-                msg = f"Missing value in transform: {param_name}"
+    pack_pars = unpack_pars
+
+
+class AbstractMultiTransform(AbstractTransform):
+    """Base class for transforms that delegate to a tuple of child transforms.
+
+    Child transform parameters are named with a flat ``"{index}:{param}"`` scheme,
+    so a parameter ``"A"`` belonging to child 0 is called ``"0:A"``. Subclasses
+    define how the children are wired together (in sequence, in parallel, ...) by
+    implementing :meth:`apply` and :meth:`get_expanded_priors`.
+    """
+
+    transforms: tuple[AbstractTransform, ...]
+
+    @property
+    def priors(self) -> ParamPriorsTupleT:
+        """Collect parameter priors from all child transforms."""
+        return tuple(
+            getattr(transform, "priors", ImmutableMap())
+            for transform in self.transforms
+        )
+
+    @property
+    def shapes(self) -> ParamShapesTupleT:
+        """Collect parameter shapes from all child transforms."""
+        return tuple(
+            getattr(transform, "shapes", ImmutableMap())
+            for transform in self.transforms
+        )
+
+    @property
+    def names_nested(self) -> tuple[tuple[str, ...], ...]:
+        """Parameter names grouped by child transform."""
+        return tuple(t._param_names for t in self.transforms)  # type: ignore[attr-defined]
+
+    @property
+    def names_flat(self) -> tuple[str, ...]:
+        """Flat parameter names using the ``{index}:{param}`` convention."""
+        return tuple(
+            f"{i}:{name}" for i, names in enumerate(self.names_nested) for name in names
+        )
+
+    @property
+    def _param_names(self) -> tuple[str, ...]:
+        """Flat parameter names, for compatibility when nested in another transform."""
+        return self.names_flat
+
+    def _child_pars(
+        self, args: tuple[dict[str, Any], ...], kwargs: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        """Resolve ``apply()`` arguments into one parameter dict per child transform.
+
+        Parameters can be passed either as one positional dictionary per child, or
+        as flat keyword arguments using the ``"{index}:{param}"`` naming scheme.
+        """
+        if args:
+            if len(args) != len(self.transforms):
+                msg = (
+                    f"Expected {len(self.transforms)} parameter dictionaries, "
+                    f"got {len(args)}"
+                )
                 raise ValueError(msg)
-        return nested_pars
+            if kwargs:
+                msg = "Cannot mix positional parameter dicts with keyword parameters"
+                raise ValueError(msg)
+            return list(args)
+
+        child_pars: list[dict[str, Any]] = [{} for _ in self.transforms]
+        for param_name, param_value in kwargs.items():
+            idx_str, sep, actual_param_name = param_name.partition(":")
+            if not sep:
+                msg = f"Unsupported parameter name format: {param_name}"
+                raise ValueError(msg)
+            transform_idx = int(idx_str)
+            if not 0 <= transform_idx < len(self.transforms):
+                msg = f"Invalid transform index: {transform_idx}"
+                raise ValueError(msg)
+            child_pars[transform_idx][actual_param_name] = param_value
+        return child_pars
+
+    def unpack_pars(
+        self, flat_pars: dict[str, Any], ignore_missing: bool = False
+    ) -> tuple[dict[str, Any], ...]:
+        """Convert flat parameter names to nested tuple structure.
+
+        Takes parameters with names like ``"0:A"``, ``"1:p1"`` and converts them to
+        a tuple of parameter dictionaries, one per child transform.
+        """
+        nested_pars: list[dict[str, Any]] = [{} for _ in self.transforms]
+
+        for param_name in self.names_flat:
+            param_value = flat_pars.get(param_name)
+
+            if param_value is None:
+                if not ignore_missing:
+                    msg = f"Missing value in transform: {param_name}"
+                    raise ValueError(msg)
+                # Skip missing parameters when ignore_missing=True
+                continue
+
+            idx_str, _, actual_param_name = param_name.partition(":")
+            nested_pars[int(idx_str)][actual_param_name] = param_value
+
+        return tuple(nested_pars)
+
+    def pack_pars(
+        self, nested_pars: list[dict[str, Any]], ignore_missing: bool = False
+    ) -> dict[str, Any]:
+        """Convert nested parameter structure to flat naming scheme.
+
+        Takes a list of parameter dictionaries, one per child transform, and
+        converts them to flat parameter names like ``"0:A"``, ``"1:p1"``.
+        """
+        _ = ignore_missing  # unused: every provided parameter is packed
+        return {
+            f"{i}:{param_name}": param_value
+            for i, transform_pars in enumerate(nested_pars)
+            for param_name, param_value in transform_pars.items()
+        }
 
 
-class TransformSequence(AbstractTransform):
+class TransformSequence(AbstractMultiTransform):
     """A sequence of transforms applied in order.
 
     Composes multiple transforms together, where the output of each transform
@@ -346,8 +441,6 @@ class TransformSequence(AbstractTransform):
 
     Parameters are stored as tuples of dictionaries, one element per transform.
     """
-
-    transforms: tuple[AbstractTransform, ...]
 
     def __init__(self, transforms: tuple[AbstractTransform, ...]):
         """Initialize a sequence of transforms."""
@@ -358,14 +451,6 @@ class TransformSequence(AbstractTransform):
         # Set output size to the final transform's output size
         self.output_size = transforms[-1].output_size
         self.transforms = transforms
-
-    @property
-    def priors(self) -> ParamPriorsTupleT:
-        """Collect parameter priors from all transforms in the sequence."""
-        return tuple(
-            getattr(transform, "priors", ImmutableMap())
-            for transform in self.transforms
-        )
 
     # --- BEGIN DEPRECATION BLOCK: param_priors -> priors ---
     # TODO(deprecation): Remove this property after deprecation period
@@ -380,14 +465,6 @@ class TransformSequence(AbstractTransform):
         return self.priors
 
     # --- END DEPRECATION BLOCK ---
-
-    @property
-    def shapes(self) -> ParamShapesTupleT:
-        """Collect parameter shapes from all transforms in the sequence."""
-        return tuple(
-            getattr(transform, "shapes", ImmutableMap())
-            for transform in self.transforms
-        )
 
     # --- BEGIN DEPRECATION BLOCK: param_shapes -> shapes ---
     # TODO(deprecation): Remove this property after deprecation period
@@ -422,132 +499,12 @@ class TransformSequence(AbstractTransform):
         **kwargs
             Flat parameters using the new naming scheme "{transform_index}:{param_name}"
         """
-        # Check if using positional parameter dictionaries
-        if args:
-            if len(args) != len(self.transforms):
-                msg = (
-                    f"Expected {len(self.transforms)} parameter dictionaries, "
-                    f"got {len(args)}"
-                )
-                raise ValueError(msg)
-
-            if kwargs:
-                msg = "Cannot mix positional parameter dicts with keyword parameters"
-                raise ValueError(msg)
-
-            output = latents
-            for transform, transform_pars in zip(self.transforms, args):
-                output = transform.apply(output, **transform_pars)
-            return output
-
-        # Handle flat format with "{index}:{param}" naming
-        transform_pars_list: list[dict[str, Any]] = [{} for _ in self.transforms]
-
-        for param_name, param_value in kwargs.items():
-            if ":" in param_name:
-                # New format: "0:A", "1:p1", etc.
-                idx_str, actual_param_name = param_name.split(":", 1)
-                transform_idx = int(idx_str)
-                if not 0 <= transform_idx < len(self.transforms):
-                    msg = f"Invalid transform index: {transform_idx}"
-                    raise ValueError(msg)
-                transform_pars_list[transform_idx][actual_param_name] = param_value
-
-            else:
-                # Handle any other parameter format as needed
-                msg = f"Unsupported parameter name format: {param_name}"
-                raise ValueError(msg)
-
         output = latents
-        for transform, transform_pars in zip(self.transforms, transform_pars_list):
+        for transform, transform_pars in zip(
+            self.transforms, self._child_pars(args, kwargs)
+        ):
             output = transform.apply(output, **transform_pars)
         return output
-
-    def unpack_pars(
-        self, flat_pars: dict[str, Any], ignore_missing: bool = False
-    ) -> tuple[dict[str, Any], ...]:
-        """Convert flat parameter names to nested tuple structure.
-
-        Takes parameters with names like "0:A", "1:p1" and converts them to
-        a list of parameter dictionaries: [{"A": value}, {"p1": value}]
-
-        Parameters
-        ----------
-        flat_pars
-            Dictionary with parameter names in format "{transform_index}:{param_name}"
-
-        Returns
-        -------
-        list
-            List of parameter dictionaries, one per transform in the sequence
-        """
-        nested_pars: list[dict[str, Any]] = [{} for _ in self.transforms]
-
-        for param_name in self.names_flat:
-            param_value = flat_pars.get(param_name)
-
-            if param_value is None:
-                if not ignore_missing:
-                    msg = f"Missing value in transform: {param_name}"
-                    raise ValueError(msg)
-                # Skip missing parameters when ignore_missing=True
-                continue
-
-            if ":" in param_name:
-                idx_str, actual_param_name = param_name.split(":", 1)
-                transform_idx = int(idx_str)
-                if 0 <= transform_idx < len(self.transforms):
-                    nested_pars[transform_idx][actual_param_name] = param_value
-
-        return tuple(nested_pars)
-
-    def pack_pars(
-        self, nested_pars: list[dict[str, Any]], ignore_missing: bool = False
-    ) -> dict[str, Any]:
-        """Convert nested parameter structure to flat naming scheme.
-
-        Takes a list of parameter dictionaries and converts them to flat
-        parameter names like "0:A", "1:p1".
-
-        Parameters
-        ----------
-        nested_pars
-            List of parameter dictionaries, one per transform in the sequence
-        ignore_missing
-            If True, skip missing parameters instead of raising an error.
-            Currently unused but kept for API consistency.
-
-        Returns
-        -------
-        dict
-            Dictionary with parameter names in format "{transform_index}:{param_name}"
-        """
-        # TODO: ignore_missing is not used here...?
-        _ = ignore_missing
-
-        flat_pars = {}
-
-        for i, transform_pars in enumerate(nested_pars):
-            for param_name, param_value in transform_pars.items():
-                flat_name = f"{i}:{param_name}"
-                flat_pars[flat_name] = param_value
-
-        return flat_pars
-
-    @property
-    def _param_names(self) -> tuple[str, ...]:
-        """Flat parameter names for TransformSequence compatibility when nested."""
-        return self.names_flat
-
-    @property
-    def names_nested(self) -> tuple[tuple[str, ...], ...]:
-        return tuple(t._param_names for t in self.transforms)  # type: ignore[attr-defined]
-
-    @property
-    def names_flat(self) -> tuple[str, ...]:
-        return tuple(
-            f"{i}:{name}" for i, names in enumerate(self.names_nested) for name in names
-        )
 
     def get_expanded_priors(
         self, latent_size: int, data_size: int | None = None
@@ -584,7 +541,7 @@ class TransformSequence(AbstractTransform):
         return ImmutableMap(**priors)
 
 
-class ConcatenateTransform(AbstractTransform):
+class ConcatenateTransform(AbstractMultiTransform):
     """Transform that splits input latents and passes slices to child transforms.
 
     Splits the input latent vector by ``input_sizes``, passes each slice to a
@@ -627,7 +584,6 @@ class ConcatenateTransform(AbstractTransform):
     the linear path producing 4 outputs, for a total output size of 14.
     """
 
-    transforms: tuple[AbstractTransform, ...]
     input_sizes: tuple[int, ...]
 
     def __init__(
@@ -650,39 +606,6 @@ class ConcatenateTransform(AbstractTransform):
         self.transforms = transforms
         self.input_sizes = tuple(input_sizes)
         self.output_size = sum(t.output_size for t in transforms)
-
-    @property
-    def _param_names(self) -> tuple[str, ...]:
-        """Flat parameter names using ``{index}:{param}`` convention."""
-        return self.names_flat
-
-    @property
-    def priors(self) -> ParamPriorsTupleT:
-        """Collect parameter priors from all transforms."""
-        return tuple(
-            getattr(transform, "priors", ImmutableMap())
-            for transform in self.transforms
-        )
-
-    @property
-    def shapes(self) -> ParamShapesTupleT:
-        """Collect parameter shapes from all transforms."""
-        return tuple(
-            getattr(transform, "shapes", ImmutableMap())
-            for transform in self.transforms
-        )
-
-    @property
-    def names_nested(self) -> tuple[tuple[str, ...], ...]:
-        """Parameter names grouped by child transform."""
-        return tuple(t._param_names for t in self.transforms)  # type: ignore[attr-defined]
-
-    @property
-    def names_flat(self) -> tuple[str, ...]:
-        """Flat parameter names using ``{index}:{param}`` convention."""
-        return tuple(
-            f"{i}:{name}" for i, names in enumerate(self.names_nested) for name in names
-        )
 
     def apply(
         self, latents: BatchedLatentsT, *args: dict[str, Any], **kwargs: Any
@@ -714,43 +637,10 @@ class ConcatenateTransform(AbstractTransform):
         )
         latent_slices = jnp.split(latents, split_indices, axis=-1)
 
-        if args:
-            if len(args) != len(self.transforms):
-                msg = (
-                    f"Expected {len(self.transforms)} parameter dictionaries, "
-                    f"got {len(args)}"
-                )
-                raise ValueError(msg)
-
-            if kwargs:
-                msg = "Cannot mix positional parameter dicts with keyword parameters"
-                raise ValueError(msg)
-
-            outputs = [
-                transform.apply(slice_, **pars)
-                for transform, slice_, pars in zip(self.transforms, latent_slices, args)
-            ]
-            return jnp.concatenate(outputs, axis=-1)
-
-        # Handle flat format with "{index}:{param}" naming
-        transform_pars_list: list[dict[str, Any]] = [{} for _ in self.transforms]
-
-        for param_name, param_value in kwargs.items():
-            if ":" in param_name:
-                idx_str, actual_param_name = param_name.split(":", 1)
-                transform_idx = int(idx_str)
-                if not 0 <= transform_idx < len(self.transforms):
-                    msg = f"Invalid transform index: {transform_idx}"
-                    raise ValueError(msg)
-                transform_pars_list[transform_idx][actual_param_name] = param_value
-            else:
-                msg = f"Unsupported parameter name format: {param_name}"
-                raise ValueError(msg)
-
         outputs = [
             transform.apply(slice_, **pars)
             for transform, slice_, pars in zip(
-                self.transforms, latent_slices, transform_pars_list
+                self.transforms, latent_slices, self._child_pars(args, kwargs)
             )
         ]
         return jnp.concatenate(outputs, axis=-1)
@@ -820,51 +710,6 @@ class ConcatenateTransform(AbstractTransform):
             )
             raise ModelValidationError(msg)
         return self.output_size
-
-    def unpack_pars(
-        self, flat_pars: dict[str, Any], ignore_missing: bool = False
-    ) -> tuple[dict[str, Any], ...]:
-        """Convert flat parameter names to nested tuple structure.
-
-        Takes parameters with names like ``"0:A"``, ``"1:p1"`` and converts to
-        a tuple of parameter dictionaries.
-        """
-        nested_pars: list[dict[str, Any]] = [{} for _ in self.transforms]
-
-        for param_name in self.names_flat:
-            param_value = flat_pars.get(param_name)
-
-            if param_value is None:
-                if not ignore_missing:
-                    msg = f"Missing value in transform: {param_name}"
-                    raise ValueError(msg)
-                continue
-
-            if ":" in param_name:
-                idx_str, actual_param_name = param_name.split(":", 1)
-                transform_idx = int(idx_str)
-                if 0 <= transform_idx < len(self.transforms):
-                    nested_pars[transform_idx][actual_param_name] = param_value
-
-        return tuple(nested_pars)
-
-    def pack_pars(
-        self, nested_pars: list[dict[str, Any]], ignore_missing: bool = False
-    ) -> dict[str, Any]:
-        """Convert nested parameter structure to flat naming scheme.
-
-        Takes a list of parameter dictionaries and converts them to flat
-        parameter names like ``"0:A"``, ``"1:p1"``.
-        """
-        _ = ignore_missing
-
-        flat_pars = {}
-        for i, transform_pars in enumerate(nested_pars):
-            for param_name, param_value in transform_pars.items():
-                flat_name = f"{i}:{param_name}"
-                flat_pars[flat_name] = param_value
-
-        return flat_pars
 
 
 class FunctionTransform(AbstractSingleTransform):
@@ -941,30 +786,11 @@ class NoOpTransform(AbstractSingleTransform):
 
 
 def _compute_n_poly_features(n_inputs: int, degree: int, include_bias: bool) -> int:
-    """Compute the number of polynomial features.
+    """Number of monomials of degree <= ``degree`` in ``n_inputs`` variables.
 
-    For n inputs with degree d, the number of features is C(n+d, d) - 1 (if no bias)
-    or C(n+d, d) (if bias included).
-
-    Parameters
-    ----------
-    n_inputs
-        Number of input features.
-    degree
-        Maximum polynomial degree.
-    include_bias
-        Whether to include a bias term (constant 1).
-
-    Returns
-    -------
-    int
-        Number of polynomial features.
+    That is C(n+d, d), minus the constant term when ``include_bias`` is False.
     """
-    # Total monomials of degree <= d with n variables is C(n+d, d)
-    n_features = comb(n_inputs + degree, degree)
-    if not include_bias:
-        n_features -= 1  # Remove the constant term
-    return n_features
+    return comb(n_inputs + degree, degree) - (0 if include_bias else 1)
 
 
 def polynomial_features(
@@ -998,25 +824,14 @@ def polynomial_features(
     Array([[ 1.,  1.,  2.,  1.,  2.,  4.],
            [ 1.,  3.,  4.,  9., 12., 16.]], dtype=float...)
     """
-    n_samples, n_features = x.shape
-
-    # Generate all monomials: for each degree d, generate all combinations
-    # of d indices (with replacement) from 0 to n_features-1
-    columns = []
-
-    for d in range(degree + 1):
-        if d == 0:
-            if include_bias:
-                columns.append(jnp.ones((n_samples, 1), dtype=x.dtype))
-        else:
-            for indices in combinations_with_replacement(range(n_features), d):
-                # Compute the product of features at these indices
-                col = jnp.ones(n_samples, dtype=x.dtype)
-                for idx in indices:
-                    col = col * x[:, idx]
-                columns.append(col[:, None])
-
-    return jnp.concatenate(columns, axis=1)
+    # Each monomial is a combination (with replacement) of column indices. The
+    # degree-0 combination is the empty tuple, whose empty product is the bias.
+    monomials = [
+        idx
+        for d in range(0 if include_bias else 1, degree + 1)
+        for idx in combinations_with_replacement(range(x.shape[1]), d)
+    ]
+    return jnp.stack([jnp.prod(x[:, list(idx)], axis=1) for idx in monomials], axis=1)
 
 
 def _poly_feature_transform(z: LatentsT, degree: int, include_bias: bool) -> OutputT:

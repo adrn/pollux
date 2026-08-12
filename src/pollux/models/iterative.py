@@ -15,7 +15,7 @@ __all__ = [
 import warnings
 from dataclasses import dataclass, field
 from functools import partial
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, TypeAlias
 
 import jax
 import jax.numpy as jnp
@@ -24,9 +24,11 @@ import numpyro.distributions as dist
 from numpyro.infer import SVI, Predictive, Trace_ELBO
 from numpyro.infer.autoguide import AutoDelta
 from tqdm.auto import tqdm
+from typing_extensions import TypeIs
 
-from ..data import PolluxData
+from ..data import OutputData, PolluxData
 from .transforms import (
+    AbstractTransform,
     AffineTransform,
     LinearTransform,
     OffsetTransform,
@@ -35,6 +37,9 @@ from .transforms import (
 
 if TYPE_CHECKING:
     from .lux import Lux
+
+#: Transforms whose least squares sub-problem has a closed-form solution
+LinearTransformT: TypeAlias = LinearTransform | AffineTransform | OffsetTransform
 
 
 @dataclass
@@ -124,15 +129,37 @@ class IterativeOptimizationResult:
     history: list[dict[str, Any]] | None = None
 
 
-def _is_linear_transform(transform: Any) -> bool:
+def _is_linear_transform(transform: Any) -> TypeIs[LinearTransformT]:
     """Check if a transform is linear (amenable to least squares).
 
     Note: TransformSequence is not supported for iterative optimization,
     even if all component transforms are linear.
     """
-    return bool(
-        isinstance(transform, (LinearTransform, AffineTransform, OffsetTransform))
-    )
+    return isinstance(transform, (LinearTransform, AffineTransform, OffsetTransform))
+
+
+def _check_least_squares_transform(
+    transform: AbstractTransform, output_name: str
+) -> LinearTransformT:
+    """Raise if a transform can't be handled by the least squares solvers."""
+    if isinstance(transform, TransformSequence):
+        msg = (
+            f"Output '{output_name}' uses a TransformSequence; "
+            "iterative least squares only supports single transforms"
+        )
+        raise ValueError(msg)
+    if not _is_linear_transform(transform):
+        msg = f"Output '{output_name}' has a non-linear transform; cannot use least squares"
+        raise ValueError(msg)
+    return transform
+
+
+def _inverse_variance(output_data: OutputData) -> jax.Array:
+    """Inverse-variance weights for an output, or ones where errors are absent."""
+    err = output_data.err
+    if not jnp.any(err > 0):
+        return jnp.ones_like(output_data.data)
+    return 1.0 / err**2
 
 
 def _get_regularization_from_prior(
@@ -225,26 +252,14 @@ def _solve_latents_least_squares(
     AtWy = jnp.zeros((n_data, latent_size))
 
     for output_name, lux_output in model.outputs.items():
-        transform = lux_output.data_transform
-        if isinstance(transform, TransformSequence):
-            msg = (
-                f"Output '{output_name}' uses a TransformSequence; "
-                "iterative least squares only supports single transforms"
-            )
-            raise ValueError(msg)
-        if not _is_linear_transform(transform):
-            msg = f"Output '{output_name}' has a non-linear transform; cannot use least squares"
-            raise ValueError(msg)
+        _check_least_squares_transform(lux_output.data_transform, output_name)
 
         if output_name not in data:
             continue
 
         output_data = data[output_name]
         y = output_data.data  # (n_data, output_size)
-        err = output_data.err
-
-        # Compute inverse variance weights
-        w = 1.0 / err**2 if err is not None and jnp.any(err > 0) else jnp.ones_like(y)
+        w = _inverse_variance(output_data)
 
         # Get the transformation matrix A from current params
         # For LinearTransform: y = A @ z, so A has shape (output_size, latent_size)
@@ -325,16 +340,9 @@ def _solve_output_params_least_squares(
         Optimized parameters for this output in nested format.
 
     """
-    transform = model.outputs[output_name].data_transform
-    if isinstance(transform, TransformSequence):
-        msg = (
-            f"Output '{output_name}' uses a TransformSequence; "
-            "iterative least squares only supports single transforms"
-        )
-        raise ValueError(msg)
-    if not _is_linear_transform(transform):
-        msg = f"Output '{output_name}' has a non-linear transform; cannot use least squares"
-        raise ValueError(msg)
+    transform = _check_least_squares_transform(
+        model.outputs[output_name].data_transform, output_name
+    )
 
     if output_name not in data:
         msg = f"No data found for output '{output_name}'"
@@ -342,12 +350,7 @@ def _solve_output_params_least_squares(
 
     output_data = data[output_name]
     y = output_data.data  # (n_data, output_size)
-    err = output_data.err
-    # Compute inverse variance weights
-    if err is not None and jnp.any(err > 0):
-        output_ivar = 1.0 / (err**2)
-    else:
-        output_ivar = jnp.ones_like(y)
+    output_ivar = _inverse_variance(output_data)
 
     latent_size = model.latent_size
     output_size = y.shape[1]
@@ -547,23 +550,9 @@ def optimize_iterative(
     # Default blocks: alternate between latents and each output
     if _blocks is None:
         _blocks = [
-            ParameterBlock(
-                name="latents",
-                params="latents",
-                optimizer="least_squares" if _all_outputs_linear(model) else None,
-            )
+            _string_to_parameter_block(model, name)
+            for name in ("latents", *(f"{o}:data" for o in model.outputs))
         ]
-        for output_name, lux_output in model.outputs.items():
-            transform = lux_output.data_transform
-            _blocks.append(
-                ParameterBlock(
-                    name=output_name,
-                    params=f"{output_name}:data",
-                    optimizer="least_squares"
-                    if _is_linear_transform(transform)
-                    else None,
-                )
-            )
 
     # Warn if any output has err_transform parameters that are neither being
     # optimized (in active blocks) nor intentionally held fixed (in fixed_pars)
@@ -622,7 +611,11 @@ def optimize_iterative(
         disable=not progress,
     )
 
+    n_cycles = 0
+    converged = False
+
     for cycle in pbar:
+        n_cycles = cycle + 1
         cycle_history: dict[str, Any] = {}
 
         for block in _blocks:
@@ -659,29 +652,22 @@ def optimize_iterative(
         )
 
         # Check convergence
-        if rel_change < tol:
+        converged = bool(rel_change < tol)
+        if converged:
             pbar.set_description("Converged")
             pbar.update(max_cycles - pbar.n)  # Complete the bar
             pbar.set_postfix(loss=f"{loss:.4g}")
-            pbar.colour = "green"
-            pbar.close()
-            return IterativeOptimizationResult(
-                params=current_params,
-                losses_per_cycle=losses_per_cycle,
-                n_cycles=cycle + 1,
-                converged=True,
-                history=history,
-            )
+            break
         prev_loss = loss
 
-    pbar.colour = "red"
+    pbar.colour = "green" if converged else "red"
     pbar.close()
 
     return IterativeOptimizationResult(
         params=current_params,
         losses_per_cycle=losses_per_cycle,
-        n_cycles=max_cycles,
-        converged=False,
+        n_cycles=n_cycles,
+        converged=converged,
         history=history,
     )
 
@@ -709,31 +695,21 @@ def _optimize_block_least_squares(
 
     for param_spec in params:
         if param_spec == "latents":
-            new_latents = _solve_latents_least_squares(
+            new_params["latents"] = _solve_latents_least_squares(
                 model, data, current_params, latents_prior
             )
-            new_params["latents"] = new_latents
+            continue
 
-        elif ":" in param_spec:
-            output_name, param_type = param_spec.split(":", 1)
-            if param_type == "data":
-                output_params = _solve_output_params_least_squares(
-                    model,
-                    data,
-                    output_name,
-                    current_params["latents"],
-                )
-                if output_name not in new_params:
-                    new_params[output_name] = {"data": {}, "err": {}}
-                new_params[output_name]["data"] = output_params
-        else:
-            # Just output name - optimize data params
-            output_params = _solve_output_params_least_squares(
-                model, data, param_spec, current_params["latents"]
-            )
-            if param_spec not in new_params:
-                new_params[param_spec] = {"data": {}, "err": {}}
-            new_params[param_spec]["data"] = output_params
+        # An output name, optionally qualified: only "data" params are solvable here
+        output_name, _, param_type = param_spec.partition(":")
+        if param_type not in ("", "data"):
+            continue
+
+        if output_name not in new_params:
+            new_params[output_name] = {"data": {}, "err": {}}
+        new_params[output_name]["data"] = _solve_output_params_least_squares(
+            model, data, output_name, current_params["latents"]
+        )
 
     return new_params
 
@@ -899,13 +875,9 @@ def _compute_loss(
         output_data = data[output_name]
         pred = predictions[output_name]
         obs = output_data.data
-        err = output_data.err
-
-        if err is None or not jnp.any(err > 0):
-            err = jnp.ones_like(obs)
 
         # Gaussian negative log likelihood (ignoring constant)
-        residuals = (pred - obs) / err
-        total_loss = float(total_loss) + float(0.5 * jnp.sum(residuals**2))
+        chi2 = (pred - obs) ** 2 * _inverse_variance(output_data)
+        total_loss = float(total_loss) + float(0.5 * jnp.sum(chi2))
 
     return total_loss

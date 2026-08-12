@@ -122,22 +122,19 @@ class OutputData(eqx.Module):
         data
             The data to unprocess. If None, the instance's data will be unprocessed.
         """
-        data = self if data is None else data
+        if data is None:
+            data = self
+        elif not isinstance(data, OutputData):
+            # A bare array is assumed to already be in processed space
+            data = OutputData(data=data, processed=True)
 
-        if not getattr(data, "processed", True):
+        if not data.processed:
             msg = "Data is not processed, so it cannot be unprocessed"
             raise ValueError(msg)
 
-        if isinstance(data, OutputData):
-            return OutputData(
-                data=self.preprocessor.inverse_transform(data.data),
-                err=self.preprocessor.inverse_transform_err(data.err),
-                preprocessor=self.preprocessor,
-                processed=False,
-            )
-
         return OutputData(
-            data=self.preprocessor.inverse_transform(data),
+            data=self.preprocessor.inverse_transform(data.data),
+            err=self.preprocessor.inverse_transform_err(data.err),
             preprocessor=self.preprocessor,
             processed=False,
         )
