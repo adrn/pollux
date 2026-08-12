@@ -10,6 +10,7 @@ import numpyro.distributions as dist
 import pytest
 
 import pollux as plx
+from pollux._linalg import weighted_least_squares
 from pollux.models.iterative import (
     IterativeOptimizationResult,
     ParameterBlock,
@@ -21,9 +22,11 @@ from pollux.models.iterative import (
     _optimize_block_numpyro,
     _solve_latents_least_squares,
     _solve_output_params_least_squares,
+    _split_param_layer,
     optimize_iterative,
 )
 from pollux.models.transforms import (
+    AffineTransform,
     FunctionTransform,
     LinearTransform,
     PolyFeatureTransform,
@@ -370,6 +373,129 @@ class TestSolveLatentsComposed:
 
         with pytest.raises(ValueError, match="not affine in the latents"):
             _solve_latents_least_squares(model, data, params)
+
+
+class TestSolveOutputParamsComposed:
+    """The output-parameter solve uses the features reaching the linear layer."""
+
+    def test_bare_linear_layer_is_unchanged(self, linear_model_and_data):
+        """Same answer as solving directly against the latents."""
+        model = linear_model_and_data["model"]
+        data = linear_model_and_data["data"]
+        latents = jnp.array(linear_model_and_data["true_latents"])
+        n_latents = linear_model_and_data["n_latents"]
+
+        solved = _solve_output_params_least_squares(model, data, "flux", latents)
+
+        w = 1.0 / data["flux"].err ** 2
+        expected = jax.vmap(
+            lambda y_dim, w_dim: weighted_least_squares(
+                latents, y_dim, w_dim, jnp.eye(n_latents)
+            )
+        )(data["flux"].data.T, w.T)
+        assert jnp.allclose(solved["A"], expected)
+
+    def test_slice_prefix_recovers_the_coefficients(self):
+        """Only the sliced latents should enter the design matrix."""
+        n_stars, n_out = 256, 8
+        rng = np.random.default_rng(3)
+        latents = jnp.array(rng.normal(size=(n_stars, 5)))
+        A = jnp.array(rng.normal(size=(n_out, 2)))
+
+        model = plx.Lux(latent_size=5)
+        model.register_output(
+            "flux",
+            TransformSequence(
+                (_latent_slice(1, 3), LinearTransform(output_size=n_out))
+            ),
+        )
+        data = plx.data.PolluxData(
+            flux=plx.data.OutputData(
+                latents[:, 1:3] @ A.T, err=jnp.full((n_stars, n_out), 1e-3)
+            )
+        )
+
+        solved = _solve_output_params_least_squares(model, data, "flux", latents)
+        # A tuple of per-child dicts, the layout a TransformSequence expects back
+        assert isinstance(solved, tuple)
+        assert solved[0] == {}
+        assert jnp.allclose(solved[1]["A"], A, atol=1e-3)
+
+    def test_polynomial_prefix_is_the_cannon(self):
+        """Labels -> polynomial features -> linear, solved in closed form."""
+        n_stars, n_out = 512, 6
+        rng = np.random.default_rng(5)
+        labels = jnp.array(rng.normal(size=(n_stars, 3)))
+        n_features = 10  # 1 + 3 + 6 monomials up to degree 2
+        coeffs = jnp.array(rng.normal(size=(n_out, n_features)))
+
+        model = plx.Lux(latent_size=3)
+        model.register_output(
+            "flux",
+            TransformSequence(
+                (PolyFeatureTransform(degree=2), LinearTransform(output_size=n_out))
+            ),
+        )
+        features = PolyFeatureTransform(degree=2).apply(labels)
+        data = plx.data.PolluxData(
+            flux=plx.data.OutputData(
+                features @ coeffs.T, err=jnp.full((n_stars, n_out), 1e-3)
+            )
+        )
+
+        solved = _solve_output_params_least_squares(model, data, "flux", labels)
+        assert solved[1]["A"].shape == (n_out, n_features)
+        assert jnp.allclose(solved[1]["A"], coeffs, atol=1e-3)
+
+    def test_affine_layer_solves_the_bias_jointly(self):
+        """The bias becomes an extra column of ones in the design matrix."""
+        n_stars, n_latents, n_out = 256, 3, 7
+        rng = np.random.default_rng(13)
+        latents = jnp.array(rng.normal(size=(n_stars, n_latents)))
+        A = jnp.array(rng.normal(size=(n_out, n_latents)))
+        b = jnp.array(rng.normal(size=n_out))
+
+        model = plx.Lux(latent_size=n_latents)
+        model.register_output("flux", AffineTransform(output_size=n_out))
+        data = plx.data.PolluxData(
+            flux=plx.data.OutputData(
+                latents @ A.T + b, err=jnp.full((n_stars, n_out), 1e-3)
+            )
+        )
+
+        solved = _solve_output_params_least_squares(model, data, "flux", latents)
+        assert jnp.allclose(solved["A"], A, atol=1e-3)
+        assert jnp.allclose(solved["b"], b, atol=1e-3)
+
+    @pytest.mark.parametrize(
+        "transform",
+        [
+            TransformSequence(
+                (LinearTransform(output_size=4), PolyFeatureTransform(degree=2))
+            ),
+            TransformSequence(
+                (LinearTransform(output_size=4), LinearTransform(output_size=4))
+            ),
+            PolyFeatureTransform(degree=2),
+        ],
+        ids=["linear-layer-not-last", "parameters-in-two-layers", "no-linear-layer"],
+    )
+    def test_unsolvable_shapes_are_declined(self, transform):
+        assert _split_param_layer(transform) is None
+
+    def test_unsolvable_output_raises_with_a_useful_message(self):
+        model = plx.Lux(latent_size=3)
+        model.register_output(
+            "flux",
+            TransformSequence(
+                (LinearTransform(output_size=4), LinearTransform(output_size=4))
+            ),
+        )
+        data = plx.data.PolluxData(
+            flux=plx.data.OutputData(jnp.ones((8, 4)), err=jnp.full((8, 4), 0.1))
+        )
+        with pytest.raises(ValueError, match="does not end in a linear layer"):
+            _solve_output_params_least_squares(model, data, "flux", jnp.zeros((8, 3)))
 
 
 class TestOptimizeIterative:

@@ -142,20 +142,35 @@ def _is_linear_transform(transform: Any) -> TypeIs[LinearTransformT]:
     return isinstance(transform, (LinearTransform, AffineTransform, OffsetTransform))
 
 
-def _check_least_squares_transform(
-    transform: AbstractTransform, output_name: str
-) -> LinearTransformT:
-    """Raise if a transform can't be handled by the least squares solvers."""
-    if isinstance(transform, TransformSequence):
-        msg = (
-            f"Output '{output_name}' uses a TransformSequence; "
-            "iterative least squares only supports single transforms"
-        )
-        raise ValueError(msg)
-    if not _is_linear_transform(transform):
-        msg = f"Output '{output_name}' has a non-linear transform; cannot use least squares"
-        raise ValueError(msg)
-    return transform
+def _split_param_layer(
+    transform: AbstractTransform,
+) -> tuple[TransformSequence | None, LinearTransform | AffineTransform] | None:
+    """Split a transform into a parameter-free prefix and a trailing linear layer.
+
+    The per-output-dimension least squares solve needs two things: the features
+    arriving at the linear layer, and the layer itself. Running the prefix forward
+    supplies the features, so it does not matter what the prefix *is* -- a latent
+    slice, polynomial features, anything -- as long as it carries no parameters of
+    its own to solve for.
+
+    Returns ``(prefix, layer)``, with ``prefix`` None when the transform is already
+    a bare linear layer, or None when the transform cannot be solved this way.
+    """
+    if isinstance(transform, (LinearTransform, AffineTransform)):
+        return None, transform
+
+    if not isinstance(transform, TransformSequence):
+        return None
+
+    *head, last = transform.transforms
+    if not head or not isinstance(last, (LinearTransform, AffineTransform)):
+        return None
+
+    # Parameters anywhere but the last layer would be silently left unoptimized
+    if any(transform.names_nested[:-1]):
+        return None
+
+    return TransformSequence(tuple(head)), last
 
 
 #: Relative tolerance for deciding that a prediction map is affine in the latents.
@@ -377,18 +392,25 @@ def _solve_output_params_least_squares(
     data: PolluxData,
     output_name: str,
     latents: jax.Array,
-) -> dict[str, Any]:
+) -> dict[str, Any] | tuple[dict[str, Any], ...]:
     """Solve for optimal output parameters using weighted least squares.
 
-    For linear model y = A @ z, solving for A (treating z as fixed):
-        vec(A) = (Z ⊗ I)^{-1} vec(Y)
+    The output is modelled as a linear layer sitting on features ``X`` derived from
+    the latents, ``y = A @ X + b``. Each output dimension j is then an independent
+    small problem,
 
-    In practice, we solve per-pixel: for each output dimension j,
-        A[j, :] = (Z^T W_j Z + λI)^{-1} Z^T W_j y[:, j]
+        A[j, :] = (X^T W_j X + λI)^{-1} X^T W_j y[:, j]
 
-    where Z is the latents matrix and W_j = diag(1/err[:, j]^2).
+    with ``W_j = diag(1/err[:, j]^2)``, which is what makes this fast: ``output_size``
+    independent ``n_features``-sized solves rather than one big system.
 
-    The regularization strength λ is extracted from the transform's prior on A.
+    ``X`` is whatever reaches the linear layer, not necessarily the latents: for a
+    bare :class:`~pollux.models.transforms.LinearTransform` it *is* the latents, but
+    for a sequence it is the prefix run forward -- a latent slice, or the polynomial
+    expansion that makes this the Cannon. A bias term, if the layer has one, is
+    solved jointly as an extra column of ones.
+
+    The regularization strengths λ come from the layer's priors on ``A`` and ``b``.
 
     Parameters
     ----------
@@ -404,12 +426,20 @@ def _solve_output_params_least_squares(
     Returns
     -------
     params
-        Optimized parameters for this output in nested format.
+        Optimized parameters for this output, in the nested format the transform
+        expects: a dict for a bare layer, a tuple of per-child dicts for a sequence.
 
     """
-    transform = _check_least_squares_transform(
-        model.outputs[output_name].data_transform, output_name
-    )
+    transform = model.outputs[output_name].data_transform
+    split = _split_param_layer(transform)
+    if split is None:
+        msg = (
+            f"Output '{output_name}' does not end in a linear layer with all of its "
+            "parameters in that layer, so its parameters cannot be solved in closed "
+            "form. Optimize this output with an SVI block instead."
+        )
+        raise ValueError(msg)
+    prefix, layer = split
 
     if output_name not in data:
         msg = f"No data found for output '{output_name}'"
@@ -418,35 +448,52 @@ def _solve_output_params_least_squares(
     output_data = data[output_name]
     y = output_data.data  # (n_data, output_size)
     output_ivar = _inverse_variance(output_data)
-
-    latent_size = model.latent_size
     output_size = y.shape[1]
 
-    # Get regularization from the transform's prior on A
-    a_prior = transform.priors.get("A", dist.Normal(0.0, 1.0))
-
-    reg_strength, prior_mean = _get_regularization_from_prior(a_prior)
-    reg_matrix = reg_strength * jnp.eye(latent_size)
-
-    # Prior mean for A, typically 0 but may be a scalar or an array
-    prior_mean_contrib = reg_strength * jnp.broadcast_to(
-        prior_mean, (output_size, latent_size)
+    # Features arriving at the linear layer. A parameter-free prefix takes no
+    # arguments, which is exactly what _split_param_layer guarantees.
+    features = latents if prefix is None else prefix.apply(latents)
+    has_bias = "b" in layer.shapes
+    design = (
+        jnp.concatenate([features, jnp.ones((len(y), 1))], axis=1)
+        if has_bias
+        else features
     )
+    n_design = design.shape[1]
+
+    # Regularization from the layer's own priors; the bias column gets its own entry
+    alpha, mu = _get_regularization_from_prior(layer.priors.get("A", dist.Normal(0, 1)))
+    reg_matrix = alpha * jnp.eye(n_design)
+    rhs_extra = alpha * jnp.broadcast_to(mu, (output_size, n_design))
+    if has_bias:
+        alpha_b, mu_b = _get_regularization_from_prior(
+            layer.priors.get("b", dist.Normal(0, 1))
+        )
+        reg_matrix = reg_matrix.at[-1, -1].set(alpha_b)
+        rhs_extra = rhs_extra.at[:, -1].set(alpha_b * mu_b)
 
     def fit_single_output_dim(
-        y_dim: jax.Array, ivar_dim: jax.Array, prior_mean_row: jax.Array
+        y_dim: jax.Array, ivar_dim: jax.Array, rhs_row: jax.Array
     ) -> jax.Array:
-        """Fit the latents -> output coefficients for a single output dimension."""
-        return weighted_least_squares(
-            latents, y_dim, ivar_dim, reg_matrix, prior_mean_row
-        )
+        """Fit the features -> output coefficients for a single output dimension."""
+        return weighted_least_squares(design, y_dim, ivar_dim, reg_matrix, rhs_row)
 
-    # Vectorize over output dimensions
-    A: jax.Array = jax.vmap(fit_single_output_dim)(
-        y.T, output_ivar.T, prior_mean_contrib
-    )  # (output_size, latent_size)
+    solution: jax.Array = jax.vmap(fit_single_output_dim)(
+        y.T, output_ivar.T, rhs_extra
+    )  # (output_size, n_design)
 
-    return {"A": A}
+    solved = (
+        {"A": solution[:, :-1], "b": solution[:, -1]} if has_bias else {"A": solution}
+    )
+    if prefix is None:
+        return solved
+
+    # Name the parameters for their position in the sequence, then let the transform
+    # put them back into its own nested layout
+    last = len(prefix.transforms)
+    return transform.unpack_pars(
+        {f"{last}:{name}": value for name, value in solved.items()}, ignore_missing=True
+    )
 
 
 def _string_to_parameter_block(model: Lux, name: str) -> ParameterBlock:
