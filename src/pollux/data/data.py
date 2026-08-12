@@ -122,22 +122,19 @@ class OutputData(eqx.Module):
         data
             The data to unprocess. If None, the instance's data will be unprocessed.
         """
-        data = self if data is None else data
+        if data is None:
+            data = self
+        elif not isinstance(data, OutputData):
+            # A bare array is assumed to already be in processed space
+            data = OutputData(data=data, processed=True)
 
-        if not getattr(data, "processed", True):
+        if not data.processed:
             msg = "Data is not processed, so it cannot be unprocessed"
             raise ValueError(msg)
 
-        if isinstance(data, OutputData):
-            return OutputData(
-                data=self.preprocessor.inverse_transform(data.data),
-                err=self.preprocessor.inverse_transform_err(data.err),
-                preprocessor=self.preprocessor,
-                processed=False,
-            )
-
         return OutputData(
-            data=self.preprocessor.inverse_transform(data),
+            data=self.preprocessor.inverse_transform(data.data),
+            err=self.preprocessor.inverse_transform_err(data.err),
             preprocessor=self.preprocessor,
             processed=False,
         )
@@ -170,7 +167,7 @@ class OutputData(eqx.Module):
         )
 
 
-class PolluxData(ImmutableMap[str, OutputData]):  # type: ignore[misc]
+class PolluxData(ImmutableMap[str, OutputData]):
     def __init__(self, **kwargs: OutputData) -> None:
         """A data container for observed outputs from a Pollux model.
 
@@ -216,31 +213,24 @@ class PolluxData(ImmutableMap[str, OutputData]):  # type: ignore[misc]
         )
 
     def unprocess(
-        self,
-        data: Union["PolluxData", dict[str, BatchedDataT], None] = None,
-        ignore_missing: bool = False,
+        self, data: Union["PolluxData", dict[str, BatchedDataT], None] = None
     ) -> "PolluxData":
         """Unprocess all output data.
 
         Parameters
         ----------
         data
-            Data to unprocess. If None, unprocess self.
-        ignore_missing
-            If True, only unprocess keys that are present in both the instance
-            and the input data. If False (default), raise an error if keys don't match.
+            Data to unprocess. If None, unprocess self. Must have the same keys
+            as this instance.
         """
         data = data or self
 
-        if not ignore_missing and set(self.keys()) != set(data.keys()):
+        if set(self.keys()) != set(data.keys()):
             msg = "Data to unprocess must have the same keys as the instance"
             raise ValueError(msg)
 
-        # Only unprocess keys present in both
-        keys_to_unprocess = set(self.keys()) & set(data.keys())
-
         return self.__class__(
-            **{name: self[name].unprocess(data[name]) for name in keys_to_unprocess}
+            **{name: self[name].unprocess(data[name]) for name in self}
         )
 
     def __len__(self) -> int:

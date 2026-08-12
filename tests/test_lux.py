@@ -36,16 +36,16 @@ def model_config():
 
 @pytest.fixture
 def single_transform_model(model_config):
-    """LuxModel with a single LinearTransform for testing basic functionality."""
-    model = plx.LuxModel(latent_size=model_config["n_latents"])
+    """Lux with a single LinearTransform for testing basic functionality."""
+    model = plx.Lux(latent_size=model_config["n_latents"])
     model.register_output("flux", LinearTransform(output_size=model_config["n_flux"]))
     return model
 
 
 @pytest.fixture
 def single_transform_with_err_model(model_config):
-    """LuxModel with LinearTransform and OffsetTransform error transform."""
-    model = plx.LuxModel(latent_size=model_config["n_latents"])
+    """Lux with LinearTransform and OffsetTransform error transform."""
+    model = plx.Lux(latent_size=model_config["n_latents"])
     model.register_output(
         "flux",
         LinearTransform(output_size=model_config["n_flux"]),
@@ -56,8 +56,8 @@ def single_transform_with_err_model(model_config):
 
 @pytest.fixture
 def transform_sequence_model(model_config):
-    """LuxModel with a TransformSequence (LinearTransform + OffsetTransform)."""
-    model = plx.LuxModel(latent_size=model_config["n_latents"])
+    """Lux with a TransformSequence (LinearTransform + OffsetTransform)."""
+    model = plx.Lux(latent_size=model_config["n_latents"])
     trans_seq = TransformSequence(
         transforms=(
             LinearTransform(output_size=model_config["n_flux"]),
@@ -70,8 +70,8 @@ def transform_sequence_model(model_config):
 
 @pytest.fixture
 def transform_sequence_with_err_model(model_config):
-    """LuxModel with TransformSequence and a FunctionTransform error transform."""
-    model = plx.LuxModel(latent_size=model_config["n_latents"])
+    """Lux with TransformSequence and a FunctionTransform error transform."""
+    model = plx.Lux(latent_size=model_config["n_latents"])
 
     # Data transform: sequence of LinearTransform + OffsetTransform
     trans_seq = TransformSequence(
@@ -99,8 +99,8 @@ def transform_sequence_with_err_model(model_config):
 
 @pytest.fixture
 def multi_output_model(model_config):
-    """LuxModel with multiple outputs: TransformSequence flux + single transform labels."""
-    model = plx.LuxModel(latent_size=model_config["n_latents"])
+    """Lux with multiple outputs: TransformSequence flux + single transform labels."""
+    model = plx.Lux(latent_size=model_config["n_latents"])
 
     # Flux output: TransformSequence
     flux_trans = TransformSequence(
@@ -118,8 +118,8 @@ def multi_output_model(model_config):
     return model
 
 
-class TestLuxModelParameterPackUnpack:
-    """Test suite for LuxModel parameter packing and unpacking functionality.
+class TestLuxParameterPackUnpack:
+    """Test suite for Lux parameter packing and unpacking functionality.
 
     These tests verify the new two-dictionary parameter structure that separates
     data transform parameters from error transform parameters. This design:
@@ -421,18 +421,18 @@ class TestLuxModelParameterPackUnpack:
         assert unpacked_skipped == {}
 
 
-class TestLuxModelValidation:
+class TestLuxValidation:
     """Tests for input validation and deprecation warnings."""
 
     def test_output_name_with_colon_raises(self):
         """Output names containing colons should raise ValueError."""
-        model = plx.LuxModel(latent_size=4)
+        model = plx.Lux(latent_size=4)
         with pytest.raises(ValueError, match="contains ':'"):
             model.register_output("flux:invalid", LinearTransform(output_size=8))
 
     def test_direct_format_deprecation_warning(self, rng, model_config):
         """Using direct parameter format should raise DeprecationWarning."""
-        model = plx.LuxModel(latent_size=model_config["n_latents"])
+        model = plx.Lux(latent_size=model_config["n_latents"])
         model.register_output(
             "flux", LinearTransform(output_size=model_config["n_flux"])
         )
@@ -447,7 +447,7 @@ class TestLuxModelValidation:
 
     def test_nested_format_no_warning(self, rng, model_config):
         """Using nested parameter format should not raise any warnings."""
-        model = plx.LuxModel(latent_size=model_config["n_latents"])
+        model = plx.Lux(latent_size=model_config["n_latents"])
         model.register_output(
             "flux", LinearTransform(output_size=model_config["n_flux"])
         )
@@ -459,6 +459,39 @@ class TestLuxModelValidation:
         nested_pars = {"flux": {"data": {"A": A}}}
         # If this raises a warning, pytest will fail due to filterwarnings=error
         model.predict_outputs(latents, nested_pars)
+
+
+class TestOptimizeDefaults:
+    """Default arguments of Lux.optimize that no test previously exercised."""
+
+    @pytest.fixture
+    def model_and_data(self):
+        rng = np.random.default_rng(42)
+        model = plx.Lux(latent_size=2)
+        model.register_output("flux", LinearTransform(output_size=3))
+        true_flux = rng.normal(size=(8, 2)) @ rng.normal(size=(3, 2)).T
+        data = plx.data.PolluxData(
+            flux=plx.data.OutputData(true_flux, err=np.full_like(true_flux, 0.1))
+        )
+        return model, data
+
+    def test_default_optimizer(self, model_and_data):
+        """optimize() works without an explicit optimizer (numpyro Adam needs a step)."""
+        model, data = model_and_data
+        pars, _ = model.optimize(data, num_steps=2, rng_key=jax.random.PRNGKey(0))
+        assert pars["latents"].shape == (8, 2)
+
+    def test_improper_uniform_latents_prior(self, model_and_data):
+        """latents_prior=False uses an improper uniform over the latents."""
+        model, data = model_and_data
+        pars, _ = model.optimize(
+            data,
+            num_steps=2,
+            rng_key=jax.random.PRNGKey(0),
+            optimizer=numpyro.optim.Adam(1e-3),
+            latents_prior=False,
+        )
+        assert pars["latents"].shape == (8, 2)
 
 
 class TestOptimizeGuide:

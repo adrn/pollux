@@ -1,5 +1,6 @@
 [build-system]
-requires = ["hatchling", "hatch-vcs"]
+# Lower bound: 1.27 is the first release with PEP 639 license metadata.
+requires = ["hatchling>=1.27", "hatch-vcs"]
 build-backend = "hatchling.build"
 
 
@@ -8,42 +9,43 @@ name = "pollux"
 authors = [
   { name = "adrn", email = "adrian.prw@gmail.com" },
 ]
-description = "JAX implementations of data-driven models for stellar spectroscopy"
+description = "A JAX framework for data-driven latent variable models, with models for stellar spectroscopy"
 readme = "README.md"
-license.file = "LICENSE"
-requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
 classifiers = [
   "Intended Audience :: Science/Research",
   "Intended Audience :: Developers",
-  "License :: OSI Approved :: MIT License",
   "Operating System :: OS Independent",
   "Programming Language :: Python",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
-  "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Topic :: Scientific/Engineering",
   "Typing :: Typed",
 ]
 dynamic = ["version"]
+# Runtime dependencies only: everything imported by pollux itself. Development
+# tooling lives in [dependency-groups] below.
 dependencies = [
-  "dataclassish>=0.8.0",
-  "equinox >=0.11.12",
+  "equinox>=0.11.12",
   "jax>=0.7.2",
-  "jaxopt>=0.8.5",
   "numpyro>=0.19.0",
-  "numpyro-ext>=0.0.4",
   "tqdm>=4.67.1",
-  "typing-extensions>=4.15.0",
+  "typing-extensions>=4.15.0",  # TypeIs; only in typing from 3.13
   "xmmutablemap>=0.2.0",
 ]
 
+# PEP 735 dependency groups. These are NOT published to PyPI: they are installed
+# from a checkout, with `uv sync --only-group test` or, on pip >= 25.1,
+# `pip install -e . --group test`.
 [dependency-groups]
 test = [
-  "pytest >=6",
-  "pytest-cov >=3",
-  "pytest-arraydiff >=0.6",
+  "pytest>=8.3",
+  "pytest-cov>=3",
 ]
 docs = [
   "astropy>=7.2.0",
@@ -76,7 +78,9 @@ dev = [
   "pre-commit",
   "twine",
   "ruff",
-  "mypy"
+  # ty is pre-1.0 and its rules still move between releases; uv.lock pins the
+  # exact version, so bump deliberately with `uv lock --upgrade-package ty`
+  "ty>=0.0.70,<0.1",
 ]
 
 [project.urls]
@@ -90,28 +94,21 @@ Changelog = "https://github.com/adrn/pollux/releases"
 version.source = "vcs"
 build.hooks.vcs.version-file = "src/pollux/_version.py"
 
-[tool.hatch.envs.default]
-features = ["test"]
-scripts.test = "pytest {args}"
-
 
 [tool.pytest.ini_options]
 minversion = "8.3"
 addopts = [
     "-ra",
-    "--arraydiff",
     "--showlocals",
     "--strict-markers",
     "--strict-config",
     "--doctest-modules",
-    "--doctest-glob='*.rst | *.py'",
   ]
 xfail_strict = true
 filterwarnings = [
   "error",
   "ignore:jax\\.core\\.call_p is deprecated:DeprecationWarning",
   "ignore:jax\\.core\\.closed_call_p is deprecated:DeprecationWarning",
-  "ignore:The `LuxModel` class is deprecated:DeprecationWarning",
 ]
 log_cli_level = "INFO"
 testpaths = ["src", "docs", "tests"]
@@ -124,27 +121,23 @@ report.exclude_also = [
   'if typing.TYPE_CHECKING:',
 ]
 
-[tool.mypy]
-# files = ["src", "tests"]  # TODO: temporary, I hope
-files = ["src"]
-exclude = [
-  '(^/)docs/',      # docs
-  '(^|/)tests/',    # tests
-  '^conftest\.py$', # nox test configuration
-]
-python_version = "3.11"
-warn_unused_configs = true
-strict = true
-enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
-warn_unreachable = true
-disallow_untyped_defs = false
-disallow_incomplete_defs = false
-ignore_missing_imports = true
+[tool.ty.src]
+include = ["src"]
 
-[[tool.mypy.overrides]]
-module = "pollux.*"
-disallow_untyped_defs = true
-disallow_incomplete_defs = true
+# numpyro ships no py.typed marker, so ty reads its source directly. That is why
+# it catches real API misuse there that mypy could not see at all -- but it also
+# means numpyro's internal TypeVars (DistributionT, ConstraintT) and the loose
+# return type of numpyro.sample surface as false positives in the module that
+# does the sampling.
+[[tool.ty.overrides]]
+include = ["src/pollux/models/lux.py"]
+rules = { invalid-argument-type = "ignore", invalid-assignment = "ignore" }
+
+# equinox's field() is a dataclass field factory; ty reads the descriptor type
+# rather than the field's declared type.
+[[tool.ty.overrides]]
+include = ["src/pollux/data/data.py"]
+rules = { invalid-assignment = "ignore" }
 
 
 [tool.ruff]
@@ -188,13 +181,12 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["T20", "F841", "RUF059"]
-"noxfile.py" = ["T20"]
 "**/__init__.py" = ["F401", "F403"]
 "docs/**" = ["T201"]
 
 
 [tool.pylint]
-py-version = "3.11"
+py-version = "3.12"
 ignore-paths = [".*/_version.py"]
 reports.output-format = "colorized"
 similarities.ignore-imports = "yes"

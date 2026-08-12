@@ -1,6 +1,6 @@
 import warnings
 from collections import defaultdict
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from functools import partial
 from typing import TYPE_CHECKING, Any
 
@@ -179,105 +179,6 @@ class Lux(eqx.Module):
             err_transform = NoOpTransform()
         self.outputs[name] = LuxOutput(data_transform, err_transform)
 
-    def _extract_transform_pars(
-        self, pars: dict[str, Any], transform_type: str = "data"
-    ) -> dict[str, Any]:
-        """Extract data or error transform parameters from nested parameter structure.
-
-        This method handles the unpacking of parameters from the nested structure
-        returned by `unpack_numpyro_pars` or `optimize`. It detects whether the
-        parameters are already in the expected format or need to be extracted.
-
-        Parameters
-        ----------
-        pars
-            A dictionary of parameters that may be in one of two formats:
-            1. Already extracted: {"output_name": {...} or [...], ...}
-            2. Nested format: {"output_name": {"data": ..., "err": ...}, ...}
-        transform_type
-            Either "data" or "err" to specify which transform parameters to extract.
-
-        Returns
-        -------
-        dict
-            A dictionary mapping output names to their transform parameters.
-        """
-        extracted_pars = {}
-
-        for output_name in self.outputs:
-            if output_name not in pars:
-                continue
-
-            par_value = pars[output_name]
-
-            # Check if this is already in the extracted format (dict or list/tuple)
-            # vs. the nested format with "data" and "err" keys
-            if isinstance(par_value, dict) and transform_type in par_value:
-                # Nested format: extract the specified transform type
-                extracted_pars[output_name] = par_value[transform_type]
-            else:
-                # Already extracted format: use as-is
-                extracted_pars[output_name] = par_value
-
-        return extracted_pars
-
-    def _validate_pars_format(
-        self, pars: dict[str, Any], context: str = "parameters"
-    ) -> bool:
-        """Validate that parameters are in the expected nested format.
-
-        The expected format is::
-
-            {
-                "output_name": {
-                    "data": {...} or [...],  # Transform parameters
-                    "err": {...}             # Error transform parameters (optional)
-                },
-                "latents": array            # Optional, not used by transforms
-            }
-
-        Parameters
-        ----------
-        pars
-            The parameters dictionary to validate.
-        context
-            A string describing the context (for error messages).
-
-        Returns
-        -------
-        bool
-            True if format is valid (nested), False if it appears to be direct format.
-
-        Raises
-        ------
-        TypeError
-            If the format is clearly invalid (not a dict where expected).
-        """
-        for output_name in self.outputs:
-            if output_name not in pars:
-                continue
-
-            output_pars = pars[output_name]
-
-            # Check if it's a dict
-            if not isinstance(output_pars, dict):
-                msg = (
-                    f"Expected dict for {context} '{output_name}', "
-                    f"got {type(output_pars).__name__}"
-                )
-                raise TypeError(msg)
-
-            # Check if it has "data" or "err" keys (nested format)
-            # vs direct parameter keys (deprecated format)
-            has_data_key = "data" in output_pars
-            has_err_key = "err" in output_pars
-
-            if not has_data_key and not has_err_key:
-                # This looks like direct format - return False to indicate
-                return False
-
-        return True
-
     def predict_outputs(
         self,
         latents: BatchedLatentsT,
@@ -335,9 +236,25 @@ class Lux(eqx.Module):
         elif isinstance(names, str):
             names = [names]
 
-        # Check parameter format and warn if using deprecated direct format
-        is_nested_format = self._validate_pars_format(pars, context="predict_outputs")
-        if not is_nested_format:
+        # Extract data parameters, handling both nested and direct formats
+        data_pars = {}
+        direct_format = False
+        for name in names:
+            output_pars = pars[name]
+            if not isinstance(output_pars, dict):
+                msg = (
+                    f"Expected dict for parameters of output '{name}', "
+                    f"got {type(output_pars).__name__}"
+                )
+                raise TypeError(msg)
+
+            if "data" in output_pars or "err" in output_pars:
+                data_pars[name] = output_pars.get("data", {})
+            else:
+                direct_format = True
+                data_pars[name] = output_pars
+
+        if direct_format:
             warnings.warn(
                 "Passing parameters in direct format (e.g., {'flux': {'A': ...}}) is "
                 "deprecated. Please use the nested format returned by optimize(): "
@@ -346,9 +263,6 @@ class Lux(eqx.Module):
                 DeprecationWarning,
                 stacklevel=2,
             )
-
-        # Extract data parameters, handling both nested and direct formats
-        data_pars = self._extract_transform_pars(pars, transform_type="data")
 
         results = {}
         for name in names:
@@ -392,35 +306,30 @@ class Lux(eqx.Module):
         """
         output_names = names or list(self.outputs.keys())
 
-        data_priors: dict[str, Mapping[str, Any]] = {}
-        err_priors: dict[str, Mapping[str, Any]] = {}
         data_pars: dict[str, dict[str, jax.Array]] = {}
         err_pars: dict[str, dict[str, jax.Array]] = {}
         for output_name in output_names:
-            # Priors for latent -> data transformation:
-            data_priors[output_name] = self.outputs[
-                output_name
-            ].data_transform.get_expanded_priors(
+            output = self.outputs[output_name]
+
+            # Priors for latent -> data transformation. Use the naming scheme
+            # "output_name:param_name"; for a TransformSequence, param_name
+            # already includes its own "{index}:{param}" prefix.
+            data_priors = output.data_transform.get_expanded_priors(
                 latent_size=self.latent_size, data_size=len(data)
             )
-            data_pars[output_name] = {}
-            for param_name, prior in data_priors[output_name].items():
-                # Use new naming scheme: "output_name:param_name"
-                # For TransformSequence, param_name already includes "{index}:{param}"
-                numpyro_name = f"{output_name}:{param_name}"
-                data_pars[output_name][param_name] = numpyro.sample(numpyro_name, prior)
+            data_pars[output_name] = {
+                param_name: numpyro.sample(f"{output_name}:{param_name}", prior)
+                for param_name, prior in data_priors.items()
+            }
 
             # Priors and parameters for transformation of the errors:
-            err_priors[output_name] = self.outputs[
-                output_name
-            ].err_transform.get_expanded_priors(
+            err_priors = output.err_transform.get_expanded_priors(
                 latent_size=self.latent_size, data_size=len(data)
             )
-            err_pars[output_name] = {}
-            for param_name, prior in err_priors[output_name].items():
-                err_pars[output_name][param_name] = numpyro.sample(
-                    f"{output_name}:err:{param_name}", prior
-                )
+            err_pars[output_name] = {
+                param_name: numpyro.sample(f"{output_name}:err:{param_name}", prior)
+                for param_name, prior in err_priors.items()
+            }
 
         # Wrap data_pars in nested format for predict_outputs
         nested_pars = {k: {"data": v} for k, v in data_pars.items()}
@@ -487,7 +396,6 @@ class Lux(eqx.Module):
                 dist.constraints.real,
                 (),
                 event_shape=(),
-                sample_shape=(n_data,),
             )
 
         elif not isinstance(latents_prior, dist.Distribution):
@@ -538,7 +446,8 @@ class Lux(eqx.Module):
         rng_key
             JAX random key for the optimization.
         optimizer
-            Numpyro optimizer to use. Defaults to ``numpyro.optim.Adam()``.
+            Numpyro optimizer to use. Defaults to
+            ``numpyro.optim.Adam(step_size=1e-3)``.
         latents_prior
             Prior distribution for the latent vectors. If ``None``, uses a unit
             Gaussian. If ``False``, uses an improper uniform prior.
@@ -561,27 +470,23 @@ class Lux(eqx.Module):
 
         """
 
-        # Default to using Adam optimizer:
-        optimizer = optimizer or numpyro.optim.Adam()
+        # Default to using Adam optimizer. numpyro's Adam has no default step
+        # size; 1e-3 matches the default used by optimize_iterative's SVI blocks.
+        optimizer = optimizer or numpyro.optim.Adam(step_size=1e-3)
 
-        partial_pars: dict[str, Any] = {}
-        if fixed_pars is not None:
-            # Use ignore_missing=True since fixed_pars typically contains only a subset
-            # of parameters (the ones we want to fix during optimization)
-            packed_fixed_pars = self.pack_numpyro_pars(fixed_pars, ignore_missing=True)
-            partial_pars["fixed_pars"] = packed_fixed_pars
-
-        if names is not None:
-            partial_pars["names"] = names
-
-        partial_pars["latents_prior"] = latents_prior
-        partial_pars["custom_model"] = custom_model
-
-        model: Any
-        if partial_pars:
-            model = partial(self.default_numpyro_model, **partial_pars)
-        else:
-            model = self.default_numpyro_model
+        # ignore_missing=True: fixed_pars typically holds only a subset of the
+        # parameters, namely the ones to hold fixed during optimization
+        model: Any = partial(
+            self.default_numpyro_model,
+            fixed_pars=(
+                None
+                if fixed_pars is None
+                else self.pack_numpyro_pars(fixed_pars, ignore_missing=True)
+            ),
+            names=names,
+            latents_prior=latents_prior,
+            custom_model=custom_model,
+        )
 
         # The RNG key shouldn't have a massive impact here, since it it only used
         # internally by stochastic optimizers:
@@ -624,102 +529,18 @@ class Lux(eqx.Module):
         initial_params: UnpackedParamsT | None = None,
         latents_prior: dist.Distribution | None = None,
         progress: bool = True,
-        record_history: bool = False,
     ) -> "IterativeOptimizationResult":
         """Optimize using iterative parameter block coordinate descent.
 
-        For models with purely linear outputs, this method exploits the linear structure
-        for faster convergence. For linear transforms, each sub-problem is solved
-        exactly using weighted least squares.
+        For models with purely linear outputs, this exploits the linear structure
+        for faster convergence: each sub-problem is solved exactly using weighted
+        least squares. The default strategy alternates between optimizing the
+        latents (with output parameters fixed) and optimizing each output's
+        parameters (with the latents fixed).
 
-        The default strategy alternates between:
-        1. Optimize latents (with output parameters fixed)
-        2. Optimize each output's parameters (with latents fixed)
-
-        Parameters
-        ----------
-        data
-            The training data.
-        blocks
-            List of :class:`~pollux.models.ParameterBlock` specifications, or a
-            list of strings naming which parameter groups to optimize (e.g.
-            ``["latents"]``). When strings are provided, :class:`ParameterBlock`
-            instances are constructed automatically with an inferred optimizer.
-            If None, uses a default strategy that alternates between latents
-            and each output.
-        fixed_pars
-            Parameters to hold fixed during optimization. When provided alongside
-            string ``blocks``, the function initializes the optimized parameters
-            (e.g. latents to zero) and merges ``fixed_pars`` with them before
-            returning, so ``result.params`` is a complete parameter dict.
-        max_cycles
-            Maximum number of full optimization cycles.
-        tol
-            Convergence tolerance. Stops when relative change in loss < tol.
-        rng_key
-            JAX random key. Required when any block uses SVI (i.e.,
-            ``optimizer != "least_squares"``). If None and ``initial_params``
-            is also None, falls back to ``jax.random.PRNGKey(0)`` for
-            initialization from priors.
-        initial_params
-            Initial parameter values. If None and ``fixed_pars`` is provided,
-            built automatically. If both are None, initialized from priors.
-        latents_prior
-            Prior distribution for latents. If None, uses Normal(0, 1).
-            Used to determine regularization strength for latent least squares.
-        progress
-            Whether to display a tqdm progress bar showing optimization progress.
-        record_history
-            Whether to record detailed per-block loss history.
-
-        Returns
-        -------
-        IterativeOptimizationResult
-            The optimization result containing:
-            - ``params``: Optimized parameters in unpacked format (includes fixed
-              params when ``fixed_pars`` is provided)
-            - ``losses_per_cycle``: Loss values at the end of each cycle
-            - ``n_cycles``: Number of cycles completed
-            - ``converged``: Whether optimization converged
-            - ``history``: Optional detailed history (if record_history=True)
-
-        Notes
-        -----
-        For blocks with linear transforms (:class:`~pollux.models.LinearTransform`,
-        :class:`~pollux.models.AffineTransform`,
-        :class:`~pollux.models.OffsetTransform`), each sub-problem is solved
-        exactly via weighted least squares. For non-linear transforms, SVI is
-        used with ``numpyro.optim.Adam`` at ``step_size=1e-3`` by default;
-        override via ``optimizer_kwargs`` on the block, e.g.
-        ``ParameterBlock(..., optimizer_kwargs={"step_size": 1e-4})``.
-
-        Regularization is automatically extracted from the priors on the
-        transform parameters.
-
-        Examples
-        --------
-        Basic usage:
-
-        >>> result = model.optimize_iterative(data, max_cycles=20)  # doctest: +SKIP
-        >>> opt_params = result.params  # doctest: +SKIP
-
-        With custom blocks:
-
-        >>> from pollux.models import ParameterBlock  # doctest: +SKIP
-        >>> blocks = [  # doctest: +SKIP
-        ...     ParameterBlock("latents", "latents", optimizer="least_squares"),
-        ...     ParameterBlock("flux", "flux:data", optimizer="least_squares"),
-        ... ]
-        >>> result = model.optimize_iterative(data, blocks=blocks)  # doctest: +SKIP
-
-        Optimizing only latents with fixed output parameters (e.g. applying a
-        trained model to test data):
-
-        >>> result = model.optimize_iterative(  # doctest: +SKIP
-        ...     test_data, blocks=["latents"], fixed_pars=trained_pars
-        ... )
-        >>> test_opt_pars = result.params  # contains fixed + optimized params  # doctest: +SKIP
-
+        See :func:`pollux.models.optimize_iterative` for the full description of
+        the parameters and of the returned result. Note that this method defaults
+        to ``max_cycles=10``.
         """
         return optimize_iterative(
             model=self,
@@ -732,7 +553,6 @@ class Lux(eqx.Module):
             initial_params=initial_params,
             latents_prior=latents_prior,
             progress=progress,
-            record_history=record_history,
         )
 
     def unpack_numpyro_pars(
@@ -860,21 +680,3 @@ class Lux(eqx.Module):
                 packed[name] = jnp.array(pars[name])
 
         return packed
-
-
-class LuxModel(Lux):
-    """Deprecated alias for Lux class.
-
-    .. deprecated::
-        Use :class:`Lux` instead. ``LuxModel`` will be removed in a future version.
-    """
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        """Initialize LuxModel with deprecation warning."""
-        warnings.warn(
-            "The `LuxModel` class is deprecated and will be removed in a future "
-            "version. Please use the `Lux` class instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        super().__init__(*args, **kwargs)

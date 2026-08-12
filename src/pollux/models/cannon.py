@@ -37,11 +37,13 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 
+from .._linalg import weighted_least_squares
 from .transforms import (
     LinearTransform,
     PolyFeatureTransform,
     TransformSequence,
     _compute_n_poly_features,
+    polynomial_features,
 )
 
 __all__ = ["Cannon"]
@@ -102,16 +104,6 @@ class Cannon(eqx.Module):
     coeffs: jax.Array | None = eqx.field(default=None, repr=False)
     scatter: jax.Array | None = eqx.field(default=None, repr=False)
 
-    # Internal transform (initialized in __post_init__)
-    _poly_transform: PolyFeatureTransform = eqx.field(init=False, repr=False)
-
-    def __post_init__(self) -> None:
-        """Initialize the polynomial feature transform."""
-        poly_transform = PolyFeatureTransform(
-            degree=self.poly_degree, include_bias=self.include_bias
-        )
-        object.__setattr__(self, "_poly_transform", poly_transform)
-
     @property
     def n_features(self) -> int:
         """Number of polynomial features."""
@@ -147,7 +139,7 @@ class Cannon(eqx.Module):
         >>> features  # doctest: +NORMALIZE_WHITESPACE, +ELLIPSIS
         Array([[1., 1., 2., 1., 2., 4.]], dtype=float...)
         """
-        return self._poly_transform.apply(labels)
+        return polynomial_features(labels, self.poly_degree, self.include_bias)
 
     def fit(
         self,
@@ -218,7 +210,7 @@ class Cannon(eqx.Module):
             raise ValueError(msg)
 
         # Expand labels to polynomial features
-        features = self._poly_transform.apply(labels)  # (n_stars, n_features)
+        features = self.get_features(labels)  # (n_stars, n_features)
 
         if output_ivar is None:
             output_ivar = jnp.ones_like(output)
@@ -226,34 +218,18 @@ class Cannon(eqx.Module):
         # Regularization matrix
         reg_matrix = regularization * jnp.eye(self.n_features)
 
-        def fit_single_pixel(
-            pixel_data: tuple[jax.Array, jax.Array],
-        ) -> tuple[jax.Array, jax.Array]:
+        def fit_single_pixel(y: jax.Array, w: jax.Array) -> tuple[jax.Array, jax.Array]:
             """Fit a single pixel using weighted least squares."""
-            y, w = pixel_data  # output and inverse variance for this pixel
-
-            # Weighted normal equations: (F.T @ W @ F + λI) @ θ = F.T @ W @ y
-            # where W = diag(w)
-            FtW = features.T * w  # (n_features, n_stars) - broadcasting
-            FtWF = FtW @ features  # (n_features, n_features)
-            FtWy = FtW @ y  # (n_features,)
-
-            # Solve with regularization
-            theta = jnp.linalg.solve(FtWF + reg_matrix, FtWy)
+            theta = weighted_least_squares(features, y, w, reg_matrix)
 
             # Compute scatter (weighted RMS of residuals)
-            pred = features @ theta
-            residuals = y - pred
-            weighted_ss = jnp.sum(w * residuals**2)
-            sum_weights = jnp.sum(w)
-            scatter_val = jnp.sqrt(weighted_ss / sum_weights)
+            residuals = y - features @ theta
+            scatter_val = jnp.sqrt(jnp.sum(w * residuals**2) / jnp.sum(w))
 
             return theta, scatter_val
 
-        # Vectorize over pixels (axis 1 of output and output_ivar)
-        # We need to transpose so pixels are the leading dimension
-        pixel_data = (output.T, output_ivar.T)  # (output_size, n_stars) each
-        coeffs, scatter = jax.vmap(fit_single_pixel)(pixel_data)
+        # Vectorize over pixels, so transpose to put pixels on the leading axis
+        coeffs, scatter = jax.vmap(fit_single_pixel)(output.T, output_ivar.T)
 
         # coeffs shape: (output_size, n_features)
         # scatter shape: (output_size,)
@@ -299,14 +275,14 @@ class Cannon(eqx.Module):
             )
             raise ValueError(msg)
 
-        features = self._poly_transform.apply(labels)  # (n_stars, n_features)
+        features = self.get_features(labels)  # (n_stars, n_features)
         assert self.coeffs is not None  # Guaranteed by is_fitted check above
         return features @ self.coeffs.T  # (n_stars, output_size)
 
     def to_transform_sequence(self) -> TransformSequence:
-        """Convert to a TransformSequence for use with LuxModel.
+        """Convert to a TransformSequence for use with Lux.
 
-        Returns a TransformSequence that can be used with LuxModel for Bayesian
+        Returns a TransformSequence that can be used with Lux for Bayesian
         inference or more complex models. The sequence consists of:
 
         1. PolyFeatureTransform: labels → polynomial features (no learnable params)
@@ -315,7 +291,7 @@ class Cannon(eqx.Module):
         Returns
         -------
         TransformSequence
-            A transform sequence that can be registered with LuxModel.
+            A transform sequence that can be registered with Lux.
 
         Notes
         -----
@@ -329,7 +305,7 @@ class Cannon(eqx.Module):
         >>> import pollux as plx
         >>> cannon = Cannon(label_size=3, output_size=128, poly_degree=2)
         >>> transform = cannon.to_transform_sequence()
-        >>> model = plx.LuxModel(latent_size=3)  # latent_size = label_size
+        >>> model = plx.Lux(latent_size=3)  # latent_size = label_size
         >>> model.register_output("flux", transform)
         """
         return TransformSequence(
@@ -347,8 +323,8 @@ class Cannon(eqx.Module):
         """Get fitted coefficients in transform parameter format.
 
         Returns the fitted coefficients in the format expected by
-        TransformSequence/LuxModel. This allows using Cannon-fitted parameters
-        as initial values or fixed parameters in LuxModel.
+        TransformSequence/Lux. This allows using Cannon-fitted parameters
+        as initial values or fixed parameters in Lux.
 
         Returns
         -------
@@ -368,7 +344,7 @@ class Cannon(eqx.Module):
         --------
         >>> cannon = cannon.fit(labels, spectra)  # doctest: +SKIP
         >>> pars = cannon.get_coeffs_as_transform_pars()  # doctest: +SKIP
-        >>> # Use with LuxModel
+        >>> # Use with Lux
         >>> model.predict_outputs(labels, {"flux": pars})  # doctest: +SKIP
         """
         if not self.is_fitted:

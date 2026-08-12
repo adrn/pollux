@@ -1,9 +1,9 @@
 """Transforms for mapping latent vectors to output quantities."""
 
 __all__ = [
+    "AbstractMultiTransform",
     "AbstractSingleTransform",
     "AbstractTransform",
-    "AdditiveOffsetTransform",
     "AffineTransform",
     "ConcatenateTransform",
     "EquinoxNNTransform",
@@ -15,21 +15,21 @@ __all__ = [
     "ParamShapesT",
     "PolyFeatureTransform",
     "QuadraticTransform",
-    "ShapeSpec",
+    "ShapeT",
     "TransformSequence",
 ]
 
 import abc
 import inspect
-import warnings
-from dataclasses import dataclass
-from itertools import combinations_with_replacement
+from collections.abc import Callable
+from itertools import accumulate, combinations_with_replacement
 from math import comb
-from typing import Any, TypeAlias
+from typing import Any
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+import jax.tree_util as jtu
 import numpyro.distributions as dist
 from xmmutablemap import ImmutableMap
 
@@ -44,89 +44,57 @@ from ..typing import (
     TransformFuncT,
 )
 
+#: Named dimensions usable in a parameter shape, resolved when the model is built:
+#: ``"output_size"`` (the transform's output dimension), ``"latent_size"`` (the
+#: latent space dimension, set when registering with a model), ``"data_size"``
+#: (the number of objects in the dataset) and ``"one"`` (always 1, for bias terms).
+type ShapeT = tuple[str | int, ...]
 
-@dataclass(frozen=True)
-class ShapeSpec:
-    """Specification for parameter shapes using named dimensions.
 
-    ShapeSpec allows you to define parameter shapes that depend on dimensions
-    only known at model construction time (like latent_size). Named dimensions
-    are resolved to concrete integers when the model is built.
-
-    Parameters
-    ----------
-    dims
-        Tuple of dimension names (strings) or concrete sizes (integers).
-
-    Available Named Dimensions
-    --------------------------
-    ``"output_size"``
-        The output dimension of the transform.
-    ``"latent_size"``
-        The latent space dimension (set when registering with a model).
-    ``"data_size"``
-        The number of samples in the batch (useful for per-sample parameters).
-    ``"one"``
-        Always resolves to 1 (useful for bias terms).
+def _resolve_shape(shape: ShapeT, **dim_sizes: int | None) -> tuple[int, ...]:
+    """Convert any named dimensions in a shape to concrete sizes.
 
     Examples
     --------
-    Define a weight matrix shape that depends on output and latent dimensions:
-
-    >>> from pollux.models.transforms import ShapeSpec
-    >>> shape = ShapeSpec(("output_size", "latent_size"))
-    >>> shape.resolve({"output_size": 128, "latent_size": 8})
+    >>> from pollux.models.transforms import _resolve_shape
+    >>> _resolve_shape(("output_size", "latent_size"), output_size=128, latent_size=8)
     (128, 8)
-
-    Define a bias vector shape using the special "one" dimension:
-
-    >>> bias_shape = ShapeSpec(("output_size", "one"))
-    >>> bias_shape.resolve({"output_size": 128})
+    >>> _resolve_shape(("output_size", "one"), output_size=128)
     (128, 1)
-
-    Use with FunctionTransform to define custom transforms:
-
-    >>> from xmmutablemap import ImmutableMap
-    >>> import numpyro.distributions as dist
-    >>> shapes = ImmutableMap({"A": ShapeSpec(("output_size", "latent_size"))})
-    >>> priors = ImmutableMap({"A": dist.Normal(0, 1)})
-
     """
+    sizes: dict[str, int | None] = {"one": 1, **dim_sizes}
 
-    dims: tuple[str | int, ...]
+    resolved = []
+    for dim in shape:
+        if not isinstance(dim, str):
+            resolved.append(dim)
+            continue
 
-    def resolve(self, dim_sizes: dict[str, int | None]) -> tuple[int, ...]:
-        """Convert named dimensions to concrete sizes.
-
-        Parameters
-        ----------
-        dim_sizes
-            Mapping from dimension names to their integer sizes.
-
-        Returns
-        -------
-        tuple[int, ...]
-            The resolved shape as a tuple of integers.
-        """
-        dim_sizes = dim_sizes.copy()
-        dim_sizes["one"] = 1
-        return tuple(
-            dim_sizes[d] if isinstance(d, str) and dim_sizes[d] is not None else d  # type: ignore[misc]
-            for d in self.dims
-        )
+        size = sizes.get(dim)
+        if size is None:
+            known = sorted(name for name, value in sizes.items() if value is not None)
+            msg = (
+                f"Cannot resolve shape dimension '{dim}': no size is known for it "
+                f"here. Known dimensions: {known}. Note that 'data_size' is only "
+                "known once the transform is used with data, e.g. during "
+                "model.optimize()."
+            )
+            raise ValueError(msg)
+        resolved.append(size)
+    return tuple(resolved)
 
 
 #: Type alias for parameter priors: maps parameter names to distributions.
 #: Used with :class:`FunctionTransform` to specify priors for learnable parameters.
-ParamPriorsT: TypeAlias = ImmutableMap[str, dist.Distribution]
+type ParamPriorsT = ImmutableMap[str, dist.Distribution]
 
-#: Type alias for parameter shapes: maps parameter names to shape specifications.
-#: Shapes can be :class:`ShapeSpec` (for named dimensions) or concrete tuples.
-ParamShapesT: TypeAlias = ImmutableMap[str, ShapeSpec | tuple[int, ...]]
+#: Type alias for parameter shapes: maps parameter names to shapes. Each shape is
+#: a tuple of concrete sizes and/or named dimensions (see :data:`ShapeT`).
+type ParamShapesT = ImmutableMap[str, ShapeT]
 
 # Internal: Tuples of parameters for TransformSequence
-ParamPriorsTupleT: TypeAlias = tuple[ParamPriorsT, ...]
-ParamShapesTupleT: TypeAlias = tuple[ParamShapesT, ...]
+type ParamPriorsTupleT = tuple[ParamPriorsT, ...]
+type ParamShapesTupleT = tuple[ParamShapesT, ...]
 
 
 class AbstractTransform(eqx.Module):
@@ -137,11 +105,6 @@ class AbstractTransform(eqx.Module):
     """
 
     output_size: int
-
-    # TODO: priors and shapes must be defined on any abstract subclass, but
-    # there is no way to define an abstract class property
-    # priors: ParamPriorsT | ParamPriorsTupleT
-    # shapes: ParamShapesT | ParamShapesTupleT
 
     @abc.abstractmethod
     def apply(self, latents: BatchedLatentsT, **pars: Any) -> BatchedOutputT:
@@ -162,6 +125,15 @@ class AbstractTransform(eqx.Module):
         for the transform, based on latent size and optional data size.
         """
         raise NotImplementedError
+
+    def get_output_size(self, input_size: int) -> int:
+        """Output size given an input size.
+
+        Fixed for most transforms; overridden by those (like
+        :class:`PolyFeatureTransform`) whose output size depends on their input.
+        """
+        del input_size
+        return self.output_size
 
 
 class AbstractSingleTransform(AbstractTransform):
@@ -188,10 +160,6 @@ class AbstractSingleTransform(AbstractTransform):
         If False, the transform function must handle batching itself. This is
         useful when parameters are per-sample (e.g., per-star nuisance parameters)
         or when the function has custom batching requirements.
-    param_priors
-        Deprecated. Use ``priors`` instead.
-    param_shapes
-        Deprecated. Use ``shapes`` instead.
     """
 
     transform: TransformFuncT
@@ -202,69 +170,20 @@ class AbstractSingleTransform(AbstractTransform):
     _transform: TransformFuncT = eqx.field(init=False, repr=False)
     vmap: bool = True
 
-    # TODO(deprecation): Remove param_priors field after deprecation period
-    param_priors: ParamPriorsT | None = eqx.field(
-        default=None, converter=lambda x: ImmutableMap(x) if x is not None else None
-    )
-    # TODO(deprecation): Remove param_shapes field after deprecation period
-    param_shapes: ParamShapesT | None = eqx.field(
-        default=None, converter=lambda x: ImmutableMap(x) if x is not None else None
-    )
-
     def __post_init__(self) -> None:
         """Initialize transform parameters after object creation.
 
         Extracts parameter names from the transform function signature and sets up
         vectorized application if requested.
         """
-        # --- BEGIN DEPRECATION BLOCK: param_priors -> priors ---
-        # TODO(deprecation): Remove this block after deprecation period
-        if self.param_priors is not None:
-            warnings.warn(
-                "The 'param_priors' parameter is deprecated. Use 'priors' instead.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            # Override priors with param_priors (user explicitly provided deprecated arg)
-            object.__setattr__(self, "priors", self.param_priors)
-        # --- END DEPRECATION BLOCK ---
-
-        # --- BEGIN DEPRECATION BLOCK: param_shapes -> shapes ---
-        # TODO(deprecation): Remove this block after deprecation period
-        if self.param_shapes is not None:
-            warnings.warn(
-                "The 'param_shapes' parameter is deprecated. Use 'shapes' instead.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            # Override shapes with param_shapes (user explicitly provided deprecated arg)
-            object.__setattr__(self, "shapes", self.param_shapes)
-        # --- END DEPRECATION BLOCK ---
-
         sig = inspect.signature(self.transform)
         self._param_names = tuple(sig.parameters.keys())[1:]  # skip first (latents)
 
         # Validate that parameter names don't contain colons (reserved for internal use)
-        for param_name in self._param_names:
+        for param_name in (*self._param_names, *self.priors, *self.shapes):
             if ":" in param_name:
                 msg = (
                     f"Transform parameter name '{param_name}' contains ':' which is "
-                    "reserved for internal parameter naming. Please rename this parameter."
-                )
-                raise ValueError(msg)
-
-        # Validate priors and shapes keys don't contain colons
-        for param_name in self.priors:
-            if ":" in param_name:
-                msg = (
-                    f"Parameter prior name '{param_name}' contains ':' which is "
-                    "reserved for internal parameter naming. Please rename this parameter."
-                )
-                raise ValueError(msg)
-        for param_name in self.shapes:
-            if ":" in param_name:
-                msg = (
-                    f"Parameter shape name '{param_name}' contains ':' which is "
                     "reserved for internal parameter naming. Please rename this parameter."
                 )
                 raise ValueError(msg)
@@ -300,17 +219,11 @@ class AbstractSingleTransform(AbstractTransform):
         expanded_priors = {}
         for name, prior in self.priors.items():
             if name in self.shapes:
-                shapespec = self.shapes[name]
-                shape = (
-                    shapespec.resolve(
-                        {
-                            "output_size": self.output_size,
-                            "latent_size": latent_size,
-                            "data_size": data_size,
-                        }
-                    )
-                    if isinstance(shapespec, ShapeSpec)
-                    else shapespec
+                shape = _resolve_shape(
+                    self.shapes[name],
+                    output_size=self.output_size,
+                    latent_size=latent_size,
+                    data_size=data_size,
                 )
                 expanded_priors[name] = prior.expand(shape)
             else:
@@ -331,14 +244,131 @@ class AbstractSingleTransform(AbstractTransform):
         self, nested_pars: dict[str, Any], ignore_missing: bool = False
     ) -> dict[str, Any]:
         """Pack parameters (identity for single transforms)."""
-        for param_name in self._param_names:
-            if param_name not in nested_pars and not ignore_missing:
-                msg = f"Missing value in transform: {param_name}"
+        return self.unpack_pars(nested_pars, ignore_missing=ignore_missing)
+
+
+class AbstractMultiTransform(AbstractTransform):
+    """Base class for transforms that delegate to a tuple of child transforms.
+
+    Child transform parameters are named with a flat ``"{index}:{param}"`` scheme,
+    so a parameter ``"A"`` belonging to child 0 is called ``"0:A"``. Subclasses
+    define how the children are wired together (in sequence, in parallel, ...) by
+    implementing :meth:`apply` and :meth:`get_expanded_priors`.
+    """
+
+    transforms: tuple[AbstractTransform, ...]
+
+    @property
+    def priors(self) -> ParamPriorsTupleT:
+        """Collect parameter priors from all child transforms."""
+        return tuple(
+            getattr(transform, "priors", ImmutableMap())
+            for transform in self.transforms
+        )
+
+    @property
+    def shapes(self) -> ParamShapesTupleT:
+        """Collect parameter shapes from all child transforms."""
+        return tuple(
+            getattr(transform, "shapes", ImmutableMap())
+            for transform in self.transforms
+        )
+
+    @property
+    def names_nested(self) -> tuple[tuple[str, ...], ...]:
+        """Parameter names grouped by child transform."""
+        # Every concrete transform defines _param_names, as a field or a
+        # property, but it cannot be declared on AbstractTransform: eqx.AbstractVar
+        # reads as a required dataclass field, which then breaks every constructor.
+        return tuple(t._param_names for t in self.transforms)  # ty: ignore[unresolved-attribute]
+
+    @property
+    def names_flat(self) -> tuple[str, ...]:
+        """Flat parameter names using the ``{index}:{param}`` convention."""
+        return tuple(
+            f"{i}:{name}" for i, names in enumerate(self.names_nested) for name in names
+        )
+
+    @property
+    def _param_names(self) -> tuple[str, ...]:
+        """Flat parameter names, for compatibility when nested in another transform."""
+        return self.names_flat
+
+    def _child_pars(
+        self, args: tuple[dict[str, Any], ...], kwargs: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        """Resolve ``apply()`` arguments into one parameter dict per child transform.
+
+        Parameters can be passed either as one positional dictionary per child, or
+        as flat keyword arguments using the ``"{index}:{param}"`` naming scheme.
+        """
+        if args:
+            if len(args) != len(self.transforms):
+                msg = (
+                    f"Expected {len(self.transforms)} parameter dictionaries, "
+                    f"got {len(args)}"
+                )
                 raise ValueError(msg)
-        return nested_pars
+            if kwargs:
+                msg = "Cannot mix positional parameter dicts with keyword parameters"
+                raise ValueError(msg)
+            return list(args)
+
+        child_pars: list[dict[str, Any]] = [{} for _ in self.transforms]
+        for param_name, param_value in kwargs.items():
+            idx_str, sep, actual_param_name = param_name.partition(":")
+            if not sep:
+                msg = f"Unsupported parameter name format: {param_name}"
+                raise ValueError(msg)
+            transform_idx = int(idx_str)
+            if not 0 <= transform_idx < len(self.transforms):
+                msg = f"Invalid transform index: {transform_idx}"
+                raise ValueError(msg)
+            child_pars[transform_idx][actual_param_name] = param_value
+        return child_pars
+
+    def unpack_pars(
+        self, flat_pars: dict[str, Any], ignore_missing: bool = False
+    ) -> tuple[dict[str, Any], ...]:
+        """Convert flat parameter names to nested tuple structure.
+
+        Takes parameters with names like ``"0:A"``, ``"1:p1"`` and converts them to
+        a tuple of parameter dictionaries, one per child transform.
+        """
+        nested_pars: list[dict[str, Any]] = [{} for _ in self.transforms]
+
+        for param_name in self.names_flat:
+            param_value = flat_pars.get(param_name)
+
+            if param_value is None:
+                if not ignore_missing:
+                    msg = f"Missing value in transform: {param_name}"
+                    raise ValueError(msg)
+                # Skip missing parameters when ignore_missing=True
+                continue
+
+            idx_str, _, actual_param_name = param_name.partition(":")
+            nested_pars[int(idx_str)][actual_param_name] = param_value
+
+        return tuple(nested_pars)
+
+    def pack_pars(
+        self, nested_pars: list[dict[str, Any]], ignore_missing: bool = False
+    ) -> dict[str, Any]:
+        """Convert nested parameter structure to flat naming scheme.
+
+        Takes a list of parameter dictionaries, one per child transform, and
+        converts them to flat parameter names like ``"0:A"``, ``"1:p1"``.
+        """
+        _ = ignore_missing  # unused: every provided parameter is packed
+        return {
+            f"{i}:{param_name}": param_value
+            for i, transform_pars in enumerate(nested_pars)
+            for param_name, param_value in transform_pars.items()
+        }
 
 
-class TransformSequence(AbstractTransform):
+class TransformSequence(AbstractMultiTransform):
     """A sequence of transforms applied in order.
 
     Composes multiple transforms together, where the output of each transform
@@ -346,8 +376,6 @@ class TransformSequence(AbstractTransform):
 
     Parameters are stored as tuples of dictionaries, one element per transform.
     """
-
-    transforms: tuple[AbstractTransform, ...]
 
     def __init__(self, transforms: tuple[AbstractTransform, ...]):
         """Initialize a sequence of transforms."""
@@ -358,50 +386,6 @@ class TransformSequence(AbstractTransform):
         # Set output size to the final transform's output size
         self.output_size = transforms[-1].output_size
         self.transforms = transforms
-
-    @property
-    def priors(self) -> ParamPriorsTupleT:
-        """Collect parameter priors from all transforms in the sequence."""
-        return tuple(
-            getattr(transform, "priors", ImmutableMap())
-            for transform in self.transforms
-        )
-
-    # --- BEGIN DEPRECATION BLOCK: param_priors -> priors ---
-    # TODO(deprecation): Remove this property after deprecation period
-    @property
-    def param_priors(self) -> ParamPriorsTupleT:
-        """Deprecated. Use ``priors`` instead."""
-        warnings.warn(
-            "The 'param_priors' property is deprecated. Use 'priors' instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self.priors
-
-    # --- END DEPRECATION BLOCK ---
-
-    @property
-    def shapes(self) -> ParamShapesTupleT:
-        """Collect parameter shapes from all transforms in the sequence."""
-        return tuple(
-            getattr(transform, "shapes", ImmutableMap())
-            for transform in self.transforms
-        )
-
-    # --- BEGIN DEPRECATION BLOCK: param_shapes -> shapes ---
-    # TODO(deprecation): Remove this property after deprecation period
-    @property
-    def param_shapes(self) -> ParamShapesTupleT:
-        """Deprecated. Use ``shapes`` instead."""
-        warnings.warn(
-            "The 'param_shapes' property is deprecated. Use 'shapes' instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self.shapes
-
-    # --- END DEPRECATION BLOCK ---
 
     def apply(
         self, latents: BatchedLatentsT, *args: dict[str, Any], **kwargs: Any
@@ -422,132 +406,12 @@ class TransformSequence(AbstractTransform):
         **kwargs
             Flat parameters using the new naming scheme "{transform_index}:{param_name}"
         """
-        # Check if using positional parameter dictionaries
-        if args:
-            if len(args) != len(self.transforms):
-                msg = (
-                    f"Expected {len(self.transforms)} parameter dictionaries, "
-                    f"got {len(args)}"
-                )
-                raise ValueError(msg)
-
-            if kwargs:
-                msg = "Cannot mix positional parameter dicts with keyword parameters"
-                raise ValueError(msg)
-
-            output = latents
-            for transform, transform_pars in zip(self.transforms, args):
-                output = transform.apply(output, **transform_pars)
-            return output
-
-        # Handle flat format with "{index}:{param}" naming
-        transform_pars_list: list[dict[str, Any]] = [{} for _ in self.transforms]
-
-        for param_name, param_value in kwargs.items():
-            if ":" in param_name:
-                # New format: "0:A", "1:p1", etc.
-                idx_str, actual_param_name = param_name.split(":", 1)
-                transform_idx = int(idx_str)
-                if not 0 <= transform_idx < len(self.transforms):
-                    msg = f"Invalid transform index: {transform_idx}"
-                    raise ValueError(msg)
-                transform_pars_list[transform_idx][actual_param_name] = param_value
-
-            else:
-                # Handle any other parameter format as needed
-                msg = f"Unsupported parameter name format: {param_name}"
-                raise ValueError(msg)
-
         output = latents
-        for transform, transform_pars in zip(self.transforms, transform_pars_list):
+        for transform, transform_pars in zip(
+            self.transforms, self._child_pars(args, kwargs)
+        ):
             output = transform.apply(output, **transform_pars)
         return output
-
-    def unpack_pars(
-        self, flat_pars: dict[str, Any], ignore_missing: bool = False
-    ) -> tuple[dict[str, Any], ...]:
-        """Convert flat parameter names to nested tuple structure.
-
-        Takes parameters with names like "0:A", "1:p1" and converts them to
-        a list of parameter dictionaries: [{"A": value}, {"p1": value}]
-
-        Parameters
-        ----------
-        flat_pars
-            Dictionary with parameter names in format "{transform_index}:{param_name}"
-
-        Returns
-        -------
-        list
-            List of parameter dictionaries, one per transform in the sequence
-        """
-        nested_pars: list[dict[str, Any]] = [{} for _ in self.transforms]
-
-        for param_name in self.names_flat:
-            param_value = flat_pars.get(param_name)
-
-            if param_value is None:
-                if not ignore_missing:
-                    msg = f"Missing value in transform: {param_name}"
-                    raise ValueError(msg)
-                # Skip missing parameters when ignore_missing=True
-                continue
-
-            if ":" in param_name:
-                idx_str, actual_param_name = param_name.split(":", 1)
-                transform_idx = int(idx_str)
-                if 0 <= transform_idx < len(self.transforms):
-                    nested_pars[transform_idx][actual_param_name] = param_value
-
-        return tuple(nested_pars)
-
-    def pack_pars(
-        self, nested_pars: list[dict[str, Any]], ignore_missing: bool = False
-    ) -> dict[str, Any]:
-        """Convert nested parameter structure to flat naming scheme.
-
-        Takes a list of parameter dictionaries and converts them to flat
-        parameter names like "0:A", "1:p1".
-
-        Parameters
-        ----------
-        nested_pars
-            List of parameter dictionaries, one per transform in the sequence
-        ignore_missing
-            If True, skip missing parameters instead of raising an error.
-            Currently unused but kept for API consistency.
-
-        Returns
-        -------
-        dict
-            Dictionary with parameter names in format "{transform_index}:{param_name}"
-        """
-        # TODO: ignore_missing is not used here...?
-        _ = ignore_missing
-
-        flat_pars = {}
-
-        for i, transform_pars in enumerate(nested_pars):
-            for param_name, param_value in transform_pars.items():
-                flat_name = f"{i}:{param_name}"
-                flat_pars[flat_name] = param_value
-
-        return flat_pars
-
-    @property
-    def _param_names(self) -> tuple[str, ...]:
-        """Flat parameter names for TransformSequence compatibility when nested."""
-        return self.names_flat
-
-    @property
-    def names_nested(self) -> tuple[tuple[str, ...], ...]:
-        return tuple(t._param_names for t in self.transforms)  # type: ignore[attr-defined]
-
-    @property
-    def names_flat(self) -> tuple[str, ...]:
-        return tuple(
-            f"{i}:{name}" for i, names in enumerate(self.names_nested) for name in names
-        )
 
     def get_expanded_priors(
         self, latent_size: int, data_size: int | None = None
@@ -573,18 +437,13 @@ class TransformSequence(AbstractTransform):
                 flat_name = f"{i}:{param_name}"
                 priors[flat_name] = prior
 
-            # Update current_size for the next transform
-            # Check if transform has get_output_size method (like PolyFeatureTransform)
-            get_output_size = getattr(transform, "get_output_size", None)
-            if callable(get_output_size):
-                current_size = get_output_size(current_size)
-            else:
-                current_size = transform.output_size
+            # The next transform's "latent_size" is this one's output size
+            current_size = transform.get_output_size(current_size)
 
         return ImmutableMap(**priors)
 
 
-class ConcatenateTransform(AbstractTransform):
+class ConcatenateTransform(AbstractMultiTransform):
     """Transform that splits input latents and passes slices to child transforms.
 
     Splits the input latent vector by ``input_sizes``, passes each slice to a
@@ -627,7 +486,6 @@ class ConcatenateTransform(AbstractTransform):
     the linear path producing 4 outputs, for a total output size of 14.
     """
 
-    transforms: tuple[AbstractTransform, ...]
     input_sizes: tuple[int, ...]
 
     def __init__(
@@ -650,39 +508,6 @@ class ConcatenateTransform(AbstractTransform):
         self.transforms = transforms
         self.input_sizes = tuple(input_sizes)
         self.output_size = sum(t.output_size for t in transforms)
-
-    @property
-    def _param_names(self) -> tuple[str, ...]:
-        """Flat parameter names using ``{index}:{param}`` convention."""
-        return self.names_flat
-
-    @property
-    def priors(self) -> ParamPriorsTupleT:
-        """Collect parameter priors from all transforms."""
-        return tuple(
-            getattr(transform, "priors", ImmutableMap())
-            for transform in self.transforms
-        )
-
-    @property
-    def shapes(self) -> ParamShapesTupleT:
-        """Collect parameter shapes from all transforms."""
-        return tuple(
-            getattr(transform, "shapes", ImmutableMap())
-            for transform in self.transforms
-        )
-
-    @property
-    def names_nested(self) -> tuple[tuple[str, ...], ...]:
-        """Parameter names grouped by child transform."""
-        return tuple(t._param_names for t in self.transforms)  # type: ignore[attr-defined]
-
-    @property
-    def names_flat(self) -> tuple[str, ...]:
-        """Flat parameter names using ``{index}:{param}`` convention."""
-        return tuple(
-            f"{i}:{name}" for i, names in enumerate(self.names_nested) for name in names
-        )
 
     def apply(
         self, latents: BatchedLatentsT, *args: dict[str, Any], **kwargs: Any
@@ -709,48 +534,14 @@ class ConcatenateTransform(AbstractTransform):
             Concatenated outputs of shape ``(n_samples, sum(output_sizes))``.
         """
         # Split latents by input_sizes along the last axis
-        split_indices = tuple(
-            sum(self.input_sizes[: i + 1]) for i in range(len(self.input_sizes) - 1)
+        latent_slices = jnp.split(
+            latents, tuple(accumulate(self.input_sizes[:-1])), axis=-1
         )
-        latent_slices = jnp.split(latents, split_indices, axis=-1)
-
-        if args:
-            if len(args) != len(self.transforms):
-                msg = (
-                    f"Expected {len(self.transforms)} parameter dictionaries, "
-                    f"got {len(args)}"
-                )
-                raise ValueError(msg)
-
-            if kwargs:
-                msg = "Cannot mix positional parameter dicts with keyword parameters"
-                raise ValueError(msg)
-
-            outputs = [
-                transform.apply(slice_, **pars)
-                for transform, slice_, pars in zip(self.transforms, latent_slices, args)
-            ]
-            return jnp.concatenate(outputs, axis=-1)
-
-        # Handle flat format with "{index}:{param}" naming
-        transform_pars_list: list[dict[str, Any]] = [{} for _ in self.transforms]
-
-        for param_name, param_value in kwargs.items():
-            if ":" in param_name:
-                idx_str, actual_param_name = param_name.split(":", 1)
-                transform_idx = int(idx_str)
-                if not 0 <= transform_idx < len(self.transforms):
-                    msg = f"Invalid transform index: {transform_idx}"
-                    raise ValueError(msg)
-                transform_pars_list[transform_idx][actual_param_name] = param_value
-            else:
-                msg = f"Unsupported parameter name format: {param_name}"
-                raise ValueError(msg)
 
         outputs = [
             transform.apply(slice_, **pars)
             for transform, slice_, pars in zip(
-                self.transforms, latent_slices, transform_pars_list
+                self.transforms, latent_slices, self._child_pars(args, kwargs)
             )
         ]
         return jnp.concatenate(outputs, axis=-1)
@@ -775,13 +566,7 @@ class ConcatenateTransform(AbstractTransform):
         ModelValidationError
             If ``latent_size`` does not match ``sum(input_sizes)``.
         """
-        expected_total = sum(self.input_sizes)
-        if latent_size != expected_total:
-            msg = (
-                f"latent_size ({latent_size}) does not match "
-                f"sum(input_sizes) ({expected_total})"
-            )
-            raise ModelValidationError(msg)
+        self.get_output_size(latent_size)  # validates latent_size
 
         priors = {}
         for i, (transform, input_size) in enumerate(
@@ -821,51 +606,6 @@ class ConcatenateTransform(AbstractTransform):
             raise ModelValidationError(msg)
         return self.output_size
 
-    def unpack_pars(
-        self, flat_pars: dict[str, Any], ignore_missing: bool = False
-    ) -> tuple[dict[str, Any], ...]:
-        """Convert flat parameter names to nested tuple structure.
-
-        Takes parameters with names like ``"0:A"``, ``"1:p1"`` and converts to
-        a tuple of parameter dictionaries.
-        """
-        nested_pars: list[dict[str, Any]] = [{} for _ in self.transforms]
-
-        for param_name in self.names_flat:
-            param_value = flat_pars.get(param_name)
-
-            if param_value is None:
-                if not ignore_missing:
-                    msg = f"Missing value in transform: {param_name}"
-                    raise ValueError(msg)
-                continue
-
-            if ":" in param_name:
-                idx_str, actual_param_name = param_name.split(":", 1)
-                transform_idx = int(idx_str)
-                if 0 <= transform_idx < len(self.transforms):
-                    nested_pars[transform_idx][actual_param_name] = param_value
-
-        return tuple(nested_pars)
-
-    def pack_pars(
-        self, nested_pars: list[dict[str, Any]], ignore_missing: bool = False
-    ) -> dict[str, Any]:
-        """Convert nested parameter structure to flat naming scheme.
-
-        Takes a list of parameter dictionaries and converts them to flat
-        parameter names like ``"0:A"``, ``"1:p1"``.
-        """
-        _ = ignore_missing
-
-        flat_pars = {}
-        for i, transform_pars in enumerate(nested_pars):
-            for param_name, param_value in transform_pars.items():
-                flat_name = f"{i}:{param_name}"
-                flat_pars[flat_name] = param_value
-
-        return flat_pars
-
 
 class FunctionTransform(AbstractSingleTransform):
     """Custom transformation using a user-defined function.
@@ -886,8 +626,8 @@ class FunctionTransform(AbstractSingleTransform):
         (an ``ImmutableMap[str, dist.Distribution]``).
     shapes
         Shape specifications for transform parameters. Use :data:`ParamShapesT`
-        (an ``ImmutableMap[str, ShapeSpec | tuple[int, ...]]``). Use
-        :class:`ShapeSpec` when shapes depend on ``latent_size`` or ``data_size``.
+        (an ``ImmutableMap[str, ShapeT]``). Shapes may name dimensions such as
+        ``"latent_size"`` or ``"data_size"`` (see :data:`ShapeT`).
     vmap
         Whether to automatically vectorize the transform over the batch dimension.
         Set to False when parameters are per-sample (e.g., per-star continuum
@@ -900,7 +640,7 @@ class FunctionTransform(AbstractSingleTransform):
     >>> import jax.numpy as jnp
     >>> import numpyro.distributions as dist
     >>> from xmmutablemap import ImmutableMap
-    >>> from pollux.models.transforms import FunctionTransform, ShapeSpec
+    >>> from pollux.models.transforms import FunctionTransform
     >>>
     >>> def my_transform(z, A):
     ...     return jnp.dot(A, z)
@@ -909,11 +649,31 @@ class FunctionTransform(AbstractSingleTransform):
     ...     output_size=128,
     ...     transform=my_transform,
     ...     priors=ImmutableMap({"A": dist.Normal(0, 1)}),
-    ...     shapes=ImmutableMap({"A": ShapeSpec(("output_size", "latent_size"))}),
+    ...     shapes=ImmutableMap({"A": ("output_size", "latent_size")}),
     ... )
 
     The parameter ``A`` will have shape ``(128, latent_size)`` where ``latent_size``
     is determined when the transform is registered with a model.
+
+    Per-object nuisance parameters use the ``"data_size"`` named dimension and
+    ``vmap=False``, so the function sees the whole batch. For example, a distance
+    modulus — one scalar offset per object, added to every output dimension —
+    composes with any base transform:
+
+    >>> from pollux.models.transforms import LinearTransform, TransformSequence
+    >>> distance_modulus = FunctionTransform(
+    ...     output_size=3,
+    ...     transform=lambda mags, offset: mags + offset[:, None],
+    ...     priors=ImmutableMap({"offset": dist.Normal(11.0, 3.0)}),
+    ...     shapes=ImmutableMap({"offset": ("data_size",)}),
+    ...     vmap=False,
+    ... )
+    >>> apparent_mags = TransformSequence(
+    ...     (LinearTransform(output_size=3), distance_modulus)
+    ... )
+
+    The offset is sampled with shape ``(data_size,)``, so it adapts to however many
+    objects are in the dataset being fit.
 
     See also the "Inferring Continuum Model Parameters" tutorial for an example of
     using FunctionTransform with per-star parameters and ``vmap=False``.
@@ -933,38 +693,17 @@ class NoOpTransform(AbstractSingleTransform):
 
     output_size: int = 0
     transform: TransformFuncT = _noop_transform
-    priors: ParamPriorsT = ImmutableMap()
-    shapes: ParamShapesT = ImmutableMap()
 
 
 # ----
 
 
 def _compute_n_poly_features(n_inputs: int, degree: int, include_bias: bool) -> int:
-    """Compute the number of polynomial features.
+    """Number of monomials of degree <= ``degree`` in ``n_inputs`` variables.
 
-    For n inputs with degree d, the number of features is C(n+d, d) - 1 (if no bias)
-    or C(n+d, d) (if bias included).
-
-    Parameters
-    ----------
-    n_inputs
-        Number of input features.
-    degree
-        Maximum polynomial degree.
-    include_bias
-        Whether to include a bias term (constant 1).
-
-    Returns
-    -------
-    int
-        Number of polynomial features.
+    That is C(n+d, d), minus the constant term when ``include_bias`` is False.
     """
-    # Total monomials of degree <= d with n variables is C(n+d, d)
-    n_features = comb(n_inputs + degree, degree)
-    if not include_bias:
-        n_features -= 1  # Remove the constant term
-    return n_features
+    return comb(n_inputs + degree, degree) - (0 if include_bias else 1)
 
 
 def polynomial_features(
@@ -998,32 +737,14 @@ def polynomial_features(
     Array([[ 1.,  1.,  2.,  1.,  2.,  4.],
            [ 1.,  3.,  4.,  9., 12., 16.]], dtype=float...)
     """
-    n_samples, n_features = x.shape
-
-    # Generate all monomials: for each degree d, generate all combinations
-    # of d indices (with replacement) from 0 to n_features-1
-    columns = []
-
-    for d in range(degree + 1):
-        if d == 0:
-            if include_bias:
-                columns.append(jnp.ones((n_samples, 1), dtype=x.dtype))
-        else:
-            for indices in combinations_with_replacement(range(n_features), d):
-                # Compute the product of features at these indices
-                col = jnp.ones(n_samples, dtype=x.dtype)
-                for idx in indices:
-                    col = col * x[:, idx]
-                columns.append(col[:, None])
-
-    return jnp.concatenate(columns, axis=1)
-
-
-def _poly_feature_transform(z: LatentsT, degree: int, include_bias: bool) -> OutputT:
-    """Transform function for polynomial features (single sample)."""
-    # This will be called via vmap, so z is shape (n_features,)
-    # We need to add a batch dimension, apply, and remove it
-    return polynomial_features(z[None, :], degree, include_bias)[0]
+    # Each monomial is a combination (with replacement) of column indices. The
+    # degree-0 combination is the empty tuple, whose empty product is the bias.
+    monomials = [
+        idx
+        for d in range(0 if include_bias else 1, degree + 1)
+        for idx in combinations_with_replacement(range(x.shape[1]), d)
+    ]
+    return jnp.stack([jnp.prod(x[:, list(idx)], axis=1) for idx in monomials], axis=1)
 
 
 class PolyFeatureTransform(AbstractTransform):
@@ -1077,34 +798,6 @@ class PolyFeatureTransform(AbstractTransform):
         """Return empty tuple (no learnable parameters)."""
         return ()
 
-    # --- BEGIN DEPRECATION BLOCK: param_priors -> priors ---
-    # TODO(deprecation): Remove this property after deprecation period
-    @property
-    def param_priors(self) -> ParamPriorsT:
-        """Deprecated. Use ``priors`` instead."""
-        warnings.warn(
-            "The 'param_priors' property is deprecated. Use 'priors' instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self.priors
-
-    # --- END DEPRECATION BLOCK ---
-
-    # --- BEGIN DEPRECATION BLOCK: param_shapes -> shapes ---
-    # TODO(deprecation): Remove this property after deprecation period
-    @property
-    def param_shapes(self) -> ParamShapesT:
-        """Deprecated. Use ``shapes`` instead."""
-        warnings.warn(
-            "The 'param_shapes' property is deprecated. Use 'shapes' instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self.shapes
-
-    # --- END DEPRECATION BLOCK ---
-
     def apply(self, latents: BatchedLatentsT, **_pars: Any) -> BatchedOutputT:
         """Apply polynomial feature expansion.
 
@@ -1144,18 +837,6 @@ class PolyFeatureTransform(AbstractTransform):
         """
         return _compute_n_poly_features(input_size, self.degree, self.include_bias)
 
-    def unpack_pars(
-        self, _flat_pars: dict[str, Any], _ignore_missing: bool = False
-    ) -> dict[str, Any]:
-        """For compatibility with TransformSequence (returns empty dict)."""
-        return {}
-
-    def pack_pars(
-        self, _nested_pars: dict[str, Any], _ignore_missing: bool = False
-    ) -> dict[str, Any]:
-        """For compatibility with TransformSequence (returns empty dict)."""
-        return {}
-
 
 # ----
 
@@ -1180,9 +861,7 @@ class LinearTransform(AbstractSingleTransform):
         default=ImmutableMap({"A": dist.Normal(0, 1)}),
         converter=ImmutableMap,
     )
-    shapes: ParamShapesT = ImmutableMap(
-        {"A": ShapeSpec(("output_size", "latent_size"))}
-    )
+    shapes: ParamShapesT = ImmutableMap({"A": ("output_size", "latent_size")})
 
 
 # ----
@@ -1207,7 +886,7 @@ class OffsetTransform(AbstractSingleTransform):
         default=ImmutableMap({"b": dist.Normal(0, 1)}),
         converter=ImmutableMap,
     )
-    shapes: ParamShapesT = ImmutableMap({"b": ShapeSpec(("output_size", "one"))})
+    shapes: ParamShapesT = ImmutableMap({"b": ("output_size", "one")})
 
 
 # ----
@@ -1235,8 +914,8 @@ class AffineTransform(AbstractSingleTransform):
     )
     shapes: ParamShapesT = ImmutableMap(
         {
-            "A": ShapeSpec(("output_size", "latent_size")),
-            "b": ShapeSpec(("output_size", "one")),
+            "A": ("output_size", "latent_size"),
+            "b": ("output_size", "one"),
         }
     )
 
@@ -1268,9 +947,9 @@ class QuadraticTransform(AbstractSingleTransform):
     )
     shapes: ParamShapesT = ImmutableMap(
         {
-            "Q": ShapeSpec(("output_size", "latent_size", "latent_size")),
-            "A": ShapeSpec(("output_size", "latent_size")),
-            "b": ShapeSpec(("output_size", "one")),
+            "Q": ("output_size", "latent_size", "latent_size"),
+            "A": ("output_size", "latent_size"),
+            "b": ("output_size", "one"),
         }
     )
 
@@ -1278,28 +957,34 @@ class QuadraticTransform(AbstractSingleTransform):
 # ----
 
 
-def _get_param_paths(
-    module: eqx.Module, prefix: str = "", separator: str = "."
-) -> tuple[str, ...]:
-    """Generate unique string paths for all array parameters in an Equinox module.
+def _param_path_key_str(key: Any) -> str:
+    """Format one JAX key path entry, e.g. ``"layers"``, ``"0"``, or a dict key."""
+    if isinstance(key, jtu.GetAttrKey):
+        return str(key.name)
+    if isinstance(key, jtu.SequenceKey):
+        return str(key.idx)
+    if isinstance(key, (jtu.DictKey, jtu.FlattenedIndexKey)):
+        return str(key.key)
+    # Custom pytree nodes may register their own key type
+    return str(key).lstrip(".")
 
-    Traverses the PyTree structure of an Equinox module and generates a unique
-    path string for each array leaf. This is used to create flat parameter names
-    for numpyro sampling.
 
-    Parameters
-    ----------
-    module
-        An Equinox module to extract parameter paths from.
-    prefix
-        Prefix to prepend to all paths (used for recursion).
-    separator
-        Separator to use between path components. Default is ".".
+def _param_path_str(path: tuple[Any, ...]) -> str:
+    """Format a JAX key path as a dotted string, e.g. ``"layers.0.weight"``.
 
-    Returns
-    -------
-    tuple[str, ...]
-        A tuple of parameter path strings, one for each array in the module.
+    Handles the standard JAX key types, so modules holding their submodules in a
+    dict (``DictKey``) or in a custom pytree node (``FlattenedIndexKey``) name
+    their parameters just as well as attributes and sequences do.
+    """
+    return ".".join(_param_path_key_str(key) for key in path)
+
+
+def _get_flat_params(module: eqx.Module) -> tuple[tuple[str, jax.Array], ...]:
+    """Path/array pairs for every array parameter in an Equinox module.
+
+    Traverses the PyTree structure of an Equinox module to generate a unique
+    path string for each array leaf, in flattening order. This is used to create
+    flat parameter names for numpyro sampling.
 
     Examples
     --------
@@ -1307,127 +992,14 @@ def _get_param_paths(
     >>> import jax
     >>> key = jax.random.PRNGKey(0)
     >>> mlp = eqx.nn.MLP(in_size=4, out_size=8, width_size=16, depth=2, key=key)
-    >>> paths = _get_param_paths(mlp)
-    >>> print(paths[:4])  # First few paths
+    >>> tuple(path for path, _ in _get_flat_params(mlp))[:4]  # First few paths
     ('layers.0.weight', 'layers.0.bias', 'layers.1.weight', 'layers.1.bias')
     """
-    paths = []
-
-    # Get the fields of the module
-    items = module.__dict__.items() if hasattr(module, "__dict__") else []
-
-    for name, value in items:
-        # Skip private attributes
-        if name.startswith("_"):
-            continue
-
-        current_path = f"{prefix}{separator}{name}" if prefix else name
-
-        if eqx.is_array(value):
-            paths.append(current_path)
-        elif isinstance(value, eqx.Module):
-            # Recursively process nested modules
-            paths.extend(_get_param_paths(value, current_path, separator))
-        elif isinstance(value, (list, tuple)):
-            # Handle lists/tuples of modules (like layers in MLP)
-            for i, item in enumerate(value):
-                item_path = f"{current_path}{separator}{i}"
-                if eqx.is_array(item):
-                    paths.append(item_path)
-                elif isinstance(item, eqx.Module):
-                    paths.extend(_get_param_paths(item, item_path, separator))
-
-    return tuple(paths)
-
-
-def _get_flat_params(module: eqx.Module) -> list[jax.Array]:
-    """Extract all array parameters from an Equinox module in a flat list.
-
-    Parameters
-    ----------
-    module
-        An Equinox module to extract parameters from.
-
-    Returns
-    -------
-    list[jax.Array]
-        A list of all array parameters in the module, in the same order as
-        _get_param_paths returns their paths.
-    """
-    params = []
-
-    items = module.__dict__.items() if hasattr(module, "__dict__") else []
-
-    for name, value in items:
-        if name.startswith("_"):
-            continue
-
-        if eqx.is_array(value):
-            params.append(value)
-        elif isinstance(value, eqx.Module):
-            params.extend(_get_flat_params(value))
-        elif isinstance(value, (list, tuple)):
-            for item in value:
-                if eqx.is_array(item):
-                    params.append(item)
-                elif isinstance(item, eqx.Module):
-                    params.extend(_get_flat_params(item))
-
-    return params
-
-
-def _set_param_by_path(
-    module: eqx.Module, path: str, value: jax.Array, separator: str = "."
-) -> eqx.Module:
-    """Set a parameter in an Equinox module by its path string.
-
-    Parameters
-    ----------
-    module
-        The Equinox module to modify.
-    path
-        The path to the parameter (e.g., "layers.0.weight").
-    value
-        The new value for the parameter.
-    separator
-        The separator used in the path. Default is ".".
-
-    Returns
-    -------
-    eqx.Module
-        A new module with the parameter updated.
-    """
-    parts = path.split(separator)
-
-    def update_nested(obj: Any, parts: list[str], val: jax.Array) -> Any:
-        if not parts:
-            return val
-
-        key = parts[0]
-        remaining = parts[1:]
-
-        if isinstance(obj, eqx.Module):
-            # Get current value
-            if hasattr(obj, key):
-                current = getattr(obj, key)
-                new_val = update_nested(current, remaining, val)
-                return eqx.tree_at(lambda m: getattr(m, key), obj, new_val)
-            msg = f"Module has no attribute '{key}'"
-            raise AttributeError(msg)
-        if isinstance(obj, (list, tuple)):
-            idx = int(key)
-            current = obj[idx]
-            new_val = update_nested(current, remaining, val)
-            if isinstance(obj, tuple):
-                return (*obj[:idx], new_val, *obj[idx + 1 :])
-            new_list = list(obj)
-            new_list[idx] = new_val
-            return new_list
-        msg = f"Cannot traverse into type {type(obj)}"
-        raise TypeError(msg)
-
-    result: eqx.Module = update_nested(module, parts, value)
-    return result
+    arrays = eqx.filter(module, eqx.is_array)
+    return tuple(
+        (_param_path_str(path), leaf)
+        for path, leaf in jtu.tree_leaves_with_path(arrays)
+    )
 
 
 class EquinoxNNTransform(AbstractTransform):
@@ -1471,10 +1043,10 @@ class EquinoxNNTransform(AbstractTransform):
     ...     bias_prior=dist.Normal(0, 0.01),
     ... )
 
-    Use with LuxModel:
+    Use with Lux:
 
     >>> import pollux as plx
-    >>> model = plx.LuxModel(latent_size=8)
+    >>> model = plx.Lux(latent_size=8)
     >>> model.register_output("flux", nn_trans)
     """
 
@@ -1500,34 +1072,6 @@ class EquinoxNNTransform(AbstractTransform):
         """Parameter names (delegated to _param_paths)."""
         return self._param_paths
 
-    # --- BEGIN DEPRECATION BLOCK: param_priors -> priors ---
-    # TODO(deprecation): Remove this property after deprecation period
-    @property
-    def param_priors(self) -> ParamPriorsT:
-        """Deprecated. Use ``priors`` instead."""
-        warnings.warn(
-            "The 'param_priors' property is deprecated. Use 'priors' instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self.priors
-
-    # --- END DEPRECATION BLOCK ---
-
-    # --- BEGIN DEPRECATION BLOCK: param_shapes -> shapes ---
-    # TODO(deprecation): Remove this property after deprecation period
-    @property
-    def param_shapes(self) -> ParamShapesT:
-        """Deprecated. Use ``shapes`` instead."""
-        warnings.warn(
-            "The 'param_shapes' property is deprecated. Use 'shapes' instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self.shapes
-
-    # --- END DEPRECATION BLOCK ---
-
     def get_expanded_priors(
         self, latent_size: int, data_size: int | None = None
     ) -> ParamPriorsT:
@@ -1551,17 +1095,16 @@ class EquinoxNNTransform(AbstractTransform):
         key = jax.random.PRNGKey(0)  # Just for structure, not actual init
         template_nn = self.nn_factory(latent_size, self.output_size, key)
 
+        flat_params = _get_flat_params(template_nn)
+
         # Store template and paths for use in apply()
         # Note: We use object.__setattr__ because eqx.Module is frozen
         object.__setattr__(self, "_template_nn", template_nn)
-        object.__setattr__(self, "_param_paths", _get_param_paths(template_nn))
-
-        # Get flat parameters to determine shapes
-        flat_params = _get_flat_params(template_nn)
+        object.__setattr__(self, "_param_paths", tuple(p for p, _ in flat_params))
 
         # Create expanded priors for each parameter
         priors = {}
-        for path, param in zip(self._param_paths, flat_params):
+        for path, param in flat_params:
             # Validate that path doesn't contain ":"
             if ":" in path:
                 msg = (
@@ -1604,24 +1147,29 @@ class EquinoxNNTransform(AbstractTransform):
             )
             raise RuntimeError(msg)
 
-        # Reconstruct the NN with the provided parameters
-        nn: eqx.Module = self._template_nn
-        for path in self._param_paths:
-            if path in params:
-                nn = _set_param_by_path(nn, path, params[path])
+        # Reconstruct the NN, swapping in whichever parameters were provided.
+        # Typed as a callable because that is what this transform requires of it.
+        arrays, static = eqx.partition(self._template_nn, eqx.is_array)
+        leaves, treedef = jtu.tree_flatten(arrays)
+        nn: Callable[[jax.Array], jax.Array] = eqx.combine(
+            jtu.tree_unflatten(
+                treedef,
+                [
+                    params.get(path, leaf)
+                    for path, leaf in zip(self._param_paths, leaves)
+                ],
+            ),
+            static,
+        )
 
         # Apply NN to each latent vector using vmap
         # The nn is an eqx.Module which is callable via __call__
-        def forward(x: jax.Array) -> jax.Array:
-            result: jax.Array = nn(x)  # type: ignore[operator]
-            return result
-
-        return jax.vmap(forward)(latents)
+        return jax.vmap(nn)(latents)
 
     def unpack_pars(
         self, flat_pars: dict[str, Any], ignore_missing: bool = False
     ) -> dict[str, Any]:
-        """Unpack flat parameters (for compatibility with TransformSequence)."""
+        """Unpack parameters (identity, keyed by NN parameter path)."""
         result = {}
         for path in self._param_paths:
             if path in flat_pars:
@@ -1634,237 +1182,11 @@ class EquinoxNNTransform(AbstractTransform):
     def pack_pars(
         self, nested_pars: dict[str, Any], ignore_missing: bool = False
     ) -> dict[str, Any]:
-        """Pack parameters to flat format (for compatibility with TransformSequence)."""
-        result = {}
-        for path in self._param_paths:
-            if path in nested_pars:
-                result[path] = nested_pars[path]
-            elif not ignore_missing:
-                msg = f"Missing NN parameter: {path}"
-                raise ValueError(msg)
-        return result
+        """Pack parameters (identity, keyed by NN parameter path)."""
+        return self.unpack_pars(nested_pars, ignore_missing=ignore_missing)
 
 
 # ----
 
 
-class AdditiveOffsetTransform(eqx.Module):
-    """Transform that wraps a base transform and adds a per-star scalar offset.
-
-    This transform is useful for modeling per-object nuisance parameters like
-    distance modulus, where each object has its own offset that applies uniformly
-    to all output dimensions. This is a generalization of the :class:`AffineTransform`
-    and :class:`OffsetTransform` class, because here the offset can vary per object
-    instead of per output.
-
-    In other words, unlike :class:`OffsetTransform` which has a fixed offset vector of
-    shape ``(output_size,)``, this transform samples a separate scalar offset for each
-    object in the dataset, with shape ``(data_size,)``. The offset is then broadcast to
-    all output dimensions.
-
-    Parameters
-    ----------
-    base_transform
-        The underlying transform to wrap (e.g., :class:`LinearTransform`).
-    offset_prior
-        Prior distribution for the per-object offset. This will be expanded
-        to shape ``(data_size,)`` during inference.
-
-    Examples
-    --------
-    >>> import jax.numpy as jnp
-    >>> import numpyro.distributions as dist
-    >>> from pollux.models.transforms import AdditiveOffsetTransform, LinearTransform
-
-    Model apparent magnitudes as absolute magnitudes plus distance modulus:
-
-    >>> phot_trans = AdditiveOffsetTransform(
-    ...     base_transform=LinearTransform(output_size=3),  # 3 photometric bands
-    ...     offset_prior=dist.Normal(11.0, 3.0),  # Distance modulus prior
-    ... )
-
-    The offset adapts to the data size automatically:
-
-    >>> import pollux as plx
-    >>> model = plx.Lux(latent_size=8)
-    >>> model.register_output("phot", phot_trans)
-    >>> # During training with 1000 stars, offset has shape (1000,)
-    >>> # During testing with 500 stars, offset has shape (500,)
-
-    Notes
-    -----
-    The per-star offset is broadcast to all output dimensions, meaning the same
-    offset value is added to every element of the output for a given object.
-    This is appropriate for distance modulus (which shifts all magnitudes equally)
-    but may not be appropriate for other use cases.
-    """
-
-    base_transform: AbstractSingleTransform | TransformSequence
-    offset_prior: dist.Distribution = eqx.field(
-        default_factory=lambda: dist.Normal(0.0, 1.0)
-    )
-
-    @property
-    def output_size(self) -> int:
-        """Output size, inherited from the base transform."""
-        return self.base_transform.output_size
-
-    def get_expanded_priors(
-        self, latent_size: int, data_size: int | None = None
-    ) -> ParamPriorsT:
-        """Get expanded parameter priors including the per-star offset.
-
-        Parameters
-        ----------
-        latent_size
-            Size of the latent vector.
-        data_size
-            Number of objects in the dataset. Required for this transform.
-
-        Returns
-        -------
-        ParamPriorsT
-            Dictionary of priors including base transform priors (prefixed with
-            "base:") and the offset prior with shape ``(data_size,)``.
-
-        Raises
-        ------
-        ValueError
-            If ``data_size`` is None.
-        """
-        if data_size is None:
-            msg = (
-                "AdditiveOffsetTransform requires data_size to be specified. "
-                "This should be set automatically during model.optimize()."
-            )
-            raise ValueError(msg)
-
-        # Get base transform priors with "base:" prefix
-        base_priors = self.base_transform.get_expanded_priors(
-            latent_size=latent_size, data_size=data_size
-        )
-
-        priors = {}
-        for name, prior in base_priors.items():
-            priors[f"base:{name}"] = prior
-
-        # Add per-star offset prior
-        priors["offset"] = self.offset_prior.expand((data_size,))
-
-        return ImmutableMap(**priors)
-
-    def apply(self, latents: BatchedLatentsT, **params: Any) -> BatchedOutputT:
-        """Apply the base transform and add the per-star offset.
-
-        Parameters
-        ----------
-        latents
-            Input latent vectors of shape ``(n_samples, latent_size)``.
-        **params
-            Parameters including base transform parameters (prefixed with "base:")
-            and the "offset" parameter of shape ``(n_samples,)``.
-
-        Returns
-        -------
-        array
-            Output of shape ``(n_samples, output_size)``.
-        """
-        # Extract base transform parameters (strip "base:" prefix)
-        base_params = {}
-        for name, value in params.items():
-            if name.startswith("base:"):
-                base_params[name[5:]] = value
-
-        # Apply base transform
-        base_output = self.base_transform.apply(latents, **base_params)
-
-        # Add per-star offset (broadcast to all output dimensions)
-        offset = params.get("offset")
-        if offset is not None:
-            # offset shape: (n_samples,) -> (n_samples, 1) for broadcasting
-            base_output = base_output + offset[:, None]
-
-        return base_output
-
-    def unpack_pars(
-        self, flat_pars: dict[str, Any], ignore_missing: bool = False
-    ) -> dict[str, Any]:
-        """Unpack flat parameters into nested structure.
-
-        Parameters
-        ----------
-        flat_pars
-            Flat parameter dictionary with "base:..." prefixed keys and "offset".
-        ignore_missing
-            If True, skip missing parameters.
-
-        Returns
-        -------
-        dict
-            Nested parameter dictionary with "base" and "offset" keys.
-        """
-        # Extract base parameters
-        base_flat = {}
-        offset = None
-        for name, value in flat_pars.items():
-            if name.startswith("base:"):
-                base_flat[name[5:]] = value
-            elif name == "offset":
-                offset = value
-
-        # Unpack base transform parameters
-        base_nested = self.base_transform.unpack_pars(
-            base_flat, ignore_missing=ignore_missing
-        )
-
-        result: dict[str, Any] = {"base": base_nested}
-        if offset is not None:
-            result["offset"] = offset
-        elif not ignore_missing:
-            msg = "Missing parameter: offset"
-            raise ValueError(msg)
-
-        return result
-
-    def pack_pars(
-        self, nested_pars: dict[str, Any], ignore_missing: bool = False
-    ) -> dict[str, Any]:
-        """Pack nested parameters into flat structure.
-
-        Parameters
-        ----------
-        nested_pars
-            Nested parameter dictionary with "base" and "offset" keys.
-        ignore_missing
-            If True, skip missing parameters.
-
-        Returns
-        -------
-        dict
-            Flat parameter dictionary with "base:..." prefixed keys and "offset".
-        """
-        result = {}
-
-        # Pack base transform parameters
-        base_nested = nested_pars.get("base", {})
-        base_flat = self.base_transform.pack_pars(
-            base_nested, ignore_missing=ignore_missing
-        )
-        for name, value in base_flat.items():
-            result[f"base:{name}"] = value
-
-        # Add offset
-        if "offset" in nested_pars:
-            result["offset"] = nested_pars["offset"]
-        elif not ignore_missing:
-            msg = "Missing parameter: offset"
-            raise ValueError(msg)
-
-        return result
-
-
 # ----
-
-# TODO: implement a Gaussian Process transform using the tinygp library. The user should specify the kernel, and parameter priors for the kernel.
-# class GaussianProcessTransform(SingleTransformMixin, AbstractTransform):
-#     transform: TransformFuncT = ...

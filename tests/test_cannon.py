@@ -245,7 +245,7 @@ class TestCannonTransformSequence:
         assert pars["data"][1]["A"].shape == (n_pixels, cannon.n_features)
 
     def test_cannon_with_lux_model(self):
-        """Test using Cannon's TransformSequence with LuxModel."""
+        """Test using Cannon's TransformSequence with Lux."""
         rng = np.random.default_rng(42)
         n_stars = 50
         n_labels = 3
@@ -260,15 +260,15 @@ class TestCannonTransformSequence:
 
         cannon = cannon.fit(labels, spectra)
 
-        # Create LuxModel with Cannon's transform
-        model = plx.LuxModel(latent_size=n_labels)
+        # Create Lux with Cannon's transform
+        model = plx.Lux(latent_size=n_labels)
         transform = cannon.to_transform_sequence()
         model.register_output("flux", transform)
 
         # Get Cannon's fitted params and use them to predict
         cannon_pars = cannon.get_coeffs_as_transform_pars()
 
-        # Predict using LuxModel with Cannon's coefficients
+        # Predict using Lux with Cannon's coefficients
         predicted = model.predict_outputs(labels, {"flux": cannon_pars})
 
         # Should match Cannon's prediction

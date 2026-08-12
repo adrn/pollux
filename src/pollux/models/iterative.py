@@ -24,9 +24,12 @@ import numpyro.distributions as dist
 from numpyro.infer import SVI, Predictive, Trace_ELBO
 from numpyro.infer.autoguide import AutoDelta
 from tqdm.auto import tqdm
+from typing_extensions import TypeIs
 
-from ..data import PolluxData
+from .._linalg import weighted_least_squares
+from ..data import OutputData, PolluxData
 from .transforms import (
+    AbstractTransform,
     AffineTransform,
     LinearTransform,
     OffsetTransform,
@@ -35,6 +38,9 @@ from .transforms import (
 
 if TYPE_CHECKING:
     from .lux import Lux
+
+#: Transforms whose least squares sub-problem has a closed-form solution
+type LinearTransformT = LinearTransform | AffineTransform | OffsetTransform
 
 
 @dataclass
@@ -97,6 +103,11 @@ class ParameterBlock:
     optimizer_kwargs: dict[str, Any] = field(default_factory=dict)
     num_steps: int = 1000
 
+    @property
+    def params_list(self) -> list[str]:
+        """``params`` as a list, whether one spec or several were given."""
+        return [self.params] if isinstance(self.params, str) else self.params
+
 
 @dataclass
 class IterativeOptimizationResult:
@@ -112,8 +123,6 @@ class IterativeOptimizationResult:
         Number of full cycles completed.
     converged
         Whether the optimization converged according to tolerance.
-    history
-        Optional detailed history of losses per block per cycle.
 
     """
 
@@ -121,23 +130,43 @@ class IterativeOptimizationResult:
     losses_per_cycle: list[float]
     n_cycles: int
     converged: bool
-    history: list[dict[str, Any]] | None = None
 
 
-def _is_linear_transform(transform: Any) -> bool:
+def _is_linear_transform(transform: Any) -> TypeIs[LinearTransformT]:
     """Check if a transform is linear (amenable to least squares).
 
     Note: TransformSequence is not supported for iterative optimization,
     even if all component transforms are linear.
     """
-    return bool(
-        isinstance(transform, (LinearTransform, AffineTransform, OffsetTransform))
-    )
+    return isinstance(transform, (LinearTransform, AffineTransform, OffsetTransform))
+
+
+def _check_least_squares_transform(
+    transform: AbstractTransform, output_name: str
+) -> LinearTransformT:
+    """Raise if a transform can't be handled by the least squares solvers."""
+    if isinstance(transform, TransformSequence):
+        msg = (
+            f"Output '{output_name}' uses a TransformSequence; "
+            "iterative least squares only supports single transforms"
+        )
+        raise ValueError(msg)
+    if not _is_linear_transform(transform):
+        msg = f"Output '{output_name}' has a non-linear transform; cannot use least squares"
+        raise ValueError(msg)
+    return transform
+
+
+def _inverse_variance(output_data: OutputData) -> jax.Array:
+    """Inverse-variance weights for an output, or ones where errors are absent."""
+    err = output_data.err
+    if jnp.all(err <= 0):
+        return jnp.ones_like(output_data.data)
+    return 1.0 / err**2
 
 
 def _get_regularization_from_prior(
     prior: dist.Distribution,
-    fallback: float = 1e-6,
 ) -> tuple[jax.Array | float, jax.Array | float]:
     """Extract regularization parameters from a prior distribution.
 
@@ -145,9 +174,7 @@ def _get_regularization_from_prior(
     ----------
     prior
         A numpyro distribution. For Normal distributions, extracts the precision.
-        For other distributions, returns the fallback regularization.
-    fallback
-        Default regularization strength if the prior is not Normal.
+        For other distributions, returns a negligible fallback regularization.
 
     Returns
     -------
@@ -159,7 +186,7 @@ def _get_regularization_from_prior(
     Notes
     -----
     Currently only supports Normal distributions. For other priors,
-    uses the fallback regularization with zero mean.
+    uses a negligible regularization with zero mean.
     """
     if isinstance(prior, dist.Normal):
         # Normal(loc, scale): regularization is 1/scale^2
@@ -170,7 +197,7 @@ def _get_regularization_from_prior(
         # No regularization for improper uniform
         return 0.0, 0.0
     # Fallback for other distributions
-    return fallback, 0.0
+    return 1e-6, 0.0
 
 
 def _solve_latents_least_squares(
@@ -225,26 +252,14 @@ def _solve_latents_least_squares(
     AtWy = jnp.zeros((n_data, latent_size))
 
     for output_name, lux_output in model.outputs.items():
-        transform = lux_output.data_transform
-        if isinstance(transform, TransformSequence):
-            msg = (
-                f"Output '{output_name}' uses a TransformSequence; "
-                "iterative least squares only supports single transforms"
-            )
-            raise ValueError(msg)
-        if not _is_linear_transform(transform):
-            msg = f"Output '{output_name}' has a non-linear transform; cannot use least squares"
-            raise ValueError(msg)
+        _check_least_squares_transform(lux_output.data_transform, output_name)
 
         if output_name not in data:
             continue
 
         output_data = data[output_name]
         y = output_data.data  # (n_data, output_size)
-        err = output_data.err
-
-        # Compute inverse variance weights
-        w = 1.0 / err**2 if err is not None and jnp.any(err > 0) else jnp.ones_like(y)
+        w = _inverse_variance(output_data)
 
         # Get the transformation matrix A from current params
         # For LinearTransform: y = A @ z, so A has shape (output_size, latent_size)
@@ -325,16 +340,9 @@ def _solve_output_params_least_squares(
         Optimized parameters for this output in nested format.
 
     """
-    transform = model.outputs[output_name].data_transform
-    if isinstance(transform, TransformSequence):
-        msg = (
-            f"Output '{output_name}' uses a TransformSequence; "
-            "iterative least squares only supports single transforms"
-        )
-        raise ValueError(msg)
-    if not _is_linear_transform(transform):
-        msg = f"Output '{output_name}' has a non-linear transform; cannot use least squares"
-        raise ValueError(msg)
+    transform = _check_least_squares_transform(
+        model.outputs[output_name].data_transform, output_name
+    )
 
     if output_name not in data:
         msg = f"No data found for output '{output_name}'"
@@ -342,12 +350,7 @@ def _solve_output_params_least_squares(
 
     output_data = data[output_name]
     y = output_data.data  # (n_data, output_size)
-    err = output_data.err
-    # Compute inverse variance weights
-    if err is not None and jnp.any(err > 0):
-        output_ivar = 1.0 / (err**2)
-    else:
-        output_ivar = jnp.ones_like(y)
+    output_ivar = _inverse_variance(output_data)
 
     latent_size = model.latent_size
     output_size = y.shape[1]
@@ -358,38 +361,22 @@ def _solve_output_params_least_squares(
     reg_strength, prior_mean = _get_regularization_from_prior(a_prior)
     reg_matrix = reg_strength * jnp.eye(latent_size)
 
-    # Prior mean for A - typically 0, but could be non-zero
-    # prior_mean could be scalar or array; handle both
-    if hasattr(prior_mean, "shape") and prior_mean.shape:
-        # Array prior mean - need to extract row for each output dim
-        # For now, assume scalar or broadcast
-        prior_mean_contrib = reg_strength * jnp.broadcast_to(
-            prior_mean, (output_size, latent_size)
-        )
-    else:
-        prior_mean_contrib = reg_strength * jnp.full(
-            (output_size, latent_size), prior_mean
-        )
+    # Prior mean for A, typically 0 but may be a scalar or an array
+    prior_mean_contrib = reg_strength * jnp.broadcast_to(
+        prior_mean, (output_size, latent_size)
+    )
 
     def fit_single_output_dim(
-        dim_data: tuple[jax.Array, jax.Array, jax.Array],
+        y_dim: jax.Array, ivar_dim: jax.Array, prior_mean_row: jax.Array
     ) -> jax.Array:
-        """Fit parameters for a single output dimension."""
-        y_dim, w_dim, prior_mean_row = dim_data  # (n_data,), (n_data,), (latent_size,)
-
-        # Weighted normal equations: (Z^T W Z + λI) @ a = Z^T W y + λ μ
-        ZtW = latents.T * w_dim  # (latent_size, n_data)
-        ZtWZ = ZtW @ latents  # (latent_size, latent_size)
-        ZtWy = ZtW @ y_dim  # (latent_size,)
-
-        # Solve with regularization and prior mean
-        result: jax.Array = jnp.linalg.solve(ZtWZ + reg_matrix, ZtWy + prior_mean_row)
-        return result
+        """Fit the latents -> output coefficients for a single output dimension."""
+        return weighted_least_squares(
+            latents, y_dim, ivar_dim, reg_matrix, prior_mean_row
+        )
 
     # Vectorize over output dimensions
-    dim_data = (y.T, output_ivar.T, prior_mean_contrib)  # (output_size, ...) each
     A: jax.Array = jax.vmap(fit_single_output_dim)(
-        dim_data
+        y.T, output_ivar.T, prior_mean_contrib
     )  # (output_size, latent_size)
 
     return {"A": A}
@@ -421,11 +408,8 @@ def _build_initial_params_from_fixed(
     """Build initial params by merging fixed_pars with zero-initialized optimized params."""
     initial: dict[str, Any] = dict(fixed_pars)
 
-    for block in blocks:
-        param_specs = block.params if isinstance(block.params, list) else [block.params]
-        for spec in param_specs:
-            if spec == "latents" and "latents" not in initial:
-                initial["latents"] = jnp.zeros((len(data), model.latent_size))
+    if "latents" not in initial and any("latents" in b.params_list for b in blocks):
+        initial["latents"] = jnp.zeros((len(data), model.latent_size))
 
     return initial
 
@@ -441,7 +425,6 @@ def optimize_iterative(
     initial_params: dict[str, Any] | None = None,
     latents_prior: dist.Distribution | None = None,
     progress: bool = True,
-    record_history: bool = False,
 ) -> IterativeOptimizationResult:
     """Optimize model using iterative block coordinate descent.
 
@@ -490,8 +473,6 @@ def optimize_iterative(
         Used to determine regularization strength for latent least squares.
     progress
         Whether to display a tqdm progress bar showing optimization progress.
-    record_history
-        Whether to record detailed per-block loss history.
 
     Returns
     -------
@@ -531,12 +512,16 @@ def optimize_iterative(
     >>> test_opt_pars = result.params  # already contains fixed + optimized  # doctest: +SKIP
 
     """
-    # Resolve blocks to list[ParameterBlock] | None (convert strings if needed)
-    _blocks: list[ParameterBlock] | None
-    if blocks is not None and len(blocks) > 0 and isinstance(blocks[0], str):
-        _blocks = [_string_to_parameter_block(model, name) for name in blocks]  # type: ignore[arg-type]
-    else:
-        _blocks = blocks  # type: ignore[assignment]
+    # Resolve blocks to list[ParameterBlock] | None, converting any string specs.
+    # Done per element rather than by sniffing blocks[0], so a mixed list works.
+    _blocks: list[ParameterBlock] | None = (
+        None
+        if blocks is None
+        else [
+            _string_to_parameter_block(model, b) if isinstance(b, str) else b
+            for b in blocks
+        ]
+    )
 
     # Build initial_params from fixed_pars if not provided
     if initial_params is None and fixed_pars is not None:
@@ -547,23 +532,9 @@ def optimize_iterative(
     # Default blocks: alternate between latents and each output
     if _blocks is None:
         _blocks = [
-            ParameterBlock(
-                name="latents",
-                params="latents",
-                optimizer="least_squares" if _all_outputs_linear(model) else None,
-            )
+            _string_to_parameter_block(model, name)
+            for name in ("latents", *(f"{o}:data" for o in model.outputs))
         ]
-        for output_name, lux_output in model.outputs.items():
-            transform = lux_output.data_transform
-            _blocks.append(
-                ParameterBlock(
-                    name=output_name,
-                    params=f"{output_name}:data",
-                    optimizer="least_squares"
-                    if _is_linear_transform(transform)
-                    else None,
-                )
-            )
 
     # Warn if any output has err_transform parameters that are neither being
     # optimized (in active blocks) nor intentionally held fixed (in fixed_pars)
@@ -611,7 +582,6 @@ def optimize_iterative(
         current_params = initial_params
 
     losses_per_cycle: list[float] = []
-    history: list[dict[str, Any]] = []
 
     prev_loss = float("inf")
 
@@ -622,8 +592,11 @@ def optimize_iterative(
         disable=not progress,
     )
 
+    n_cycles = 0
+    converged = False
+
     for cycle in pbar:
-        cycle_history: dict[str, Any] = {}
+        n_cycles = cycle + 1
 
         for block in _blocks:
             if block.optimizer == "least_squares":
@@ -640,16 +613,9 @@ def optimize_iterative(
                     model, data, block, current_params, subkey, latents_prior
                 )
 
-            if record_history:
-                # Could compute loss here per block if needed
-                cycle_history[block.name] = None
-
         # Compute loss at end of cycle
         loss = _compute_loss(model, data, current_params)
         losses_per_cycle.append(float(loss))
-
-        if record_history:
-            history.append(cycle_history)
 
         # Update progress bar with loss info
         rel_change = abs(prev_loss - loss) / (abs(prev_loss) + 1e-8)
@@ -659,30 +625,22 @@ def optimize_iterative(
         )
 
         # Check convergence
-        if rel_change < tol:
+        converged = bool(rel_change < tol)
+        if converged:
             pbar.set_description("Converged")
             pbar.update(max_cycles - pbar.n)  # Complete the bar
             pbar.set_postfix(loss=f"{loss:.4g}")
-            pbar.colour = "green"
-            pbar.close()
-            return IterativeOptimizationResult(
-                params=current_params,
-                losses_per_cycle=losses_per_cycle,
-                n_cycles=cycle + 1,
-                converged=True,
-                history=history,
-            )
+            break
         prev_loss = loss
 
-    pbar.colour = "red"
+    pbar.colour = "green" if converged else "red"
     pbar.close()
 
     return IterativeOptimizationResult(
         params=current_params,
         losses_per_cycle=losses_per_cycle,
-        n_cycles=max_cycles,
-        converged=False,
-        history=history,
+        n_cycles=n_cycles,
+        converged=converged,
     )
 
 
@@ -701,39 +659,25 @@ def _optimize_block_least_squares(
     latents_prior: dist.Distribution | None = None,
 ) -> dict[str, Any]:
     """Optimize a parameter block using least squares."""
-    params = block.params
-    if isinstance(params, str):
-        params = [params]
-
     new_params = dict(current_params)
 
-    for param_spec in params:
+    for param_spec in block.params_list:
         if param_spec == "latents":
-            new_latents = _solve_latents_least_squares(
+            new_params["latents"] = _solve_latents_least_squares(
                 model, data, current_params, latents_prior
             )
-            new_params["latents"] = new_latents
+            continue
 
-        elif ":" in param_spec:
-            output_name, param_type = param_spec.split(":", 1)
-            if param_type == "data":
-                output_params = _solve_output_params_least_squares(
-                    model,
-                    data,
-                    output_name,
-                    current_params["latents"],
-                )
-                if output_name not in new_params:
-                    new_params[output_name] = {"data": {}, "err": {}}
-                new_params[output_name]["data"] = output_params
-        else:
-            # Just output name - optimize data params
-            output_params = _solve_output_params_least_squares(
-                model, data, param_spec, current_params["latents"]
-            )
-            if param_spec not in new_params:
-                new_params[param_spec] = {"data": {}, "err": {}}
-            new_params[param_spec]["data"] = output_params
+        # An output name, optionally qualified: only "data" params are solvable here
+        output_name, _, param_type = param_spec.partition(":")
+        if param_type not in ("", "data"):
+            continue
+
+        if output_name not in new_params:
+            new_params[output_name] = {"data": {}, "err": {}}
+        new_params[output_name]["data"] = _solve_output_params_least_squares(
+            model, data, output_name, current_params["latents"]
+        )
 
     return new_params
 
@@ -779,12 +723,8 @@ def _optimize_block_numpyro(
     The optimizer defaults to Adam with step_size=1e-3 if not specified
     in the block.
     """
-    params = block.params
-    if isinstance(params, str):
-        params = [params]
-
     # Build fixed_pars containing everything NOT being optimized
-    fixed_pars = _build_fixed_pars(model, current_params, params)
+    fixed_pars = _build_fixed_pars(model, current_params, block.params_list)
 
     # Build the optimizer
     optimizer_cls = block.optimizer
@@ -803,15 +743,10 @@ def _optimize_block_numpyro(
     # Pack fixed parameters for numpyro
     packed_fixed_pars = model.pack_numpyro_pars(fixed_pars, ignore_missing=True)
 
-    # Determine which outputs to include in this optimization
-    # (by default include all outputs that have data)
-    names = None  # Use all outputs
-
-    # Create partial model with fixed parameters
+    # Create partial model with fixed parameters (names=None: all outputs)
     partial_model = partial(
         model.default_numpyro_model,
         fixed_pars=packed_fixed_pars,
-        names=names,
         latents_prior=latents_prior,
     )
 
@@ -827,7 +762,7 @@ def _optimize_block_numpyro(
 
     # Merge optimized parameters with current parameters
     new_params = dict(current_params)
-    for param_spec in params:
+    for param_spec in block.params_list:
         if param_spec == "latents" and "latents" in optimized_subset:
             new_params["latents"] = optimized_subset["latents"]
         elif ":" in param_spec:
@@ -852,32 +787,24 @@ def _build_fixed_pars(
     optimize_params: list[str],
 ) -> dict[str, Any]:
     """Build fixed_pars dict containing everything not being optimized."""
-    fixed = {}
+    fixed: dict[str, Any] = {}
 
     # Check if latents should be fixed
     if "latents" not in optimize_params:
         fixed["latents"] = current_params.get("latents")
 
-    # Check each output
+    # Check each output: hold "data" / "err" fixed unless this block optimizes them
     for output_name in model.outputs:
-        data_fixed = (
-            f"{output_name}:data" not in optimize_params
+        output_params = current_params.get(output_name, {})
+        output_fixed = {
+            key: output_params[key]
+            for key in ("data", "err")
+            if key in output_params
             and output_name not in optimize_params
-        )
-        err_fixed = (
-            f"{output_name}:err" not in optimize_params
-            and output_name not in optimize_params
-        )
-
-        if data_fixed or err_fixed:
-            output_params = current_params.get(output_name, {})
-            if output_name not in fixed:
-                fixed[output_name] = {}
-            output_fixed = dict(fixed[output_name])  # type: ignore[arg-type]
-            if data_fixed and "data" in output_params:
-                output_fixed["data"] = output_params["data"]
-            if err_fixed and "err" in output_params:
-                output_fixed["err"] = output_params["err"]
+            and f"{output_name}:{key}" not in optimize_params
+        }
+        if output_fixed:
+            fixed[output_name] = output_fixed
 
     return fixed
 
@@ -899,13 +826,9 @@ def _compute_loss(
         output_data = data[output_name]
         pred = predictions[output_name]
         obs = output_data.data
-        err = output_data.err
-
-        if err is None or not jnp.any(err > 0):
-            err = jnp.ones_like(obs)
 
         # Gaussian negative log likelihood (ignoring constant)
-        residuals = (pred - obs) / err
-        total_loss = float(total_loss) + float(0.5 * jnp.sum(residuals**2))
+        chi2 = (pred - obs) ** 2 * _inverse_variance(output_data)
+        total_loss = float(total_loss) + float(0.5 * jnp.sum(chi2))
 
     return total_loss

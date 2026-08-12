@@ -1,11 +1,25 @@
 from abc import abstractmethod
-from typing import Any
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
 
 from ..typing import BatchedDataT
+
+
+def _check_no_constant_features(scale: jax.Array) -> None:
+    """Raise if any feature has zero spread (e.g. a bad detector pixel)."""
+    constant_mask = scale == 0
+    if jnp.any(constant_mask):
+        (bad_idx,) = jnp.where(jnp.atleast_1d(constant_mask))
+        msg = (
+            f"Found {len(bad_idx)} feature(s) with identical values across all "
+            f"samples (e.g., bad detector pixels). These features have zero "
+            f"variance and cannot be normalized. Feature indices: "
+            f"{bad_idx.tolist()}. Remove or mask these features before "
+            "preprocessing."
+        )
+        raise ValueError(msg)
 
 
 class AbstractPreprocessor(eqx.Module):
@@ -32,12 +46,6 @@ class AbstractPreprocessor(eqx.Module):
     def inverse_transform_err(self, X_err: BatchedDataT) -> BatchedDataT:
         """Apply inverse preprocessing transform to the input data uncertainties."""
 
-    def __call__(self, X: BatchedDataT, inverse: bool = False) -> BatchedDataT:
-        """Apply preprocessing transform or inverse to the input data."""
-        if inverse:
-            return self.inverse_transform(X)
-        return self.transform(X)
-
 
 class NullPreprocessor(AbstractPreprocessor):
     """A preprocessor that does nothing to the input data.
@@ -54,11 +62,14 @@ class NullPreprocessor(AbstractPreprocessor):
     """
 
     def __init__(self) -> None:
+        # Explicit (rather than equinox's generated __init__) so that callers
+        # constructing a NullPreprocessor type check.
         pass
 
     @classmethod
-    def from_data(cls, *_: Any) -> "NullPreprocessor":
-        """Compute preprocessing parameters from data."""
+    def from_data(cls, data: BatchedDataT) -> "NullPreprocessor":
+        """Return a preprocessor; there is nothing to compute from the data."""
+        del data
         return cls()
 
     def transform(self, X: BatchedDataT) -> BatchedDataT:
@@ -141,17 +152,7 @@ class ShiftScalePreprocessor(AbstractPreprocessor):
             The axis along which to compute the mean and standard deviation.
         """
         scale = jnp.std(data, axis=axis)
-        constant_mask = scale == 0
-        if jnp.any(constant_mask):
-            (bad_idx,) = jnp.where(jnp.atleast_1d(constant_mask))
-            msg = (
-                f"Found {len(bad_idx)} feature(s) with identical values across all "
-                f"samples (e.g., bad detector pixels). These features have zero "
-                f"variance and cannot be normalized. Feature indices: "
-                f"{bad_idx.tolist()}. Remove or mask these features before "
-                "preprocessing."
-            )
-            raise ValueError(msg)
+        _check_no_constant_features(scale)
         return cls(jnp.mean(data, axis=axis), scale)
 
     @classmethod
@@ -186,17 +187,7 @@ class ShiftScalePreprocessor(AbstractPreprocessor):
             )
             / 2.0
         )[0]
-        constant_mask = jnp.std(data, axis=axis) == 0
-        if jnp.any(constant_mask):
-            (bad_idx,) = jnp.where(jnp.atleast_1d(constant_mask))
-            msg = (
-                f"Found {len(bad_idx)} feature(s) with identical values across all "
-                f"samples (e.g., bad detector pixels). These features have zero "
-                f"variance and cannot be normalized. Feature indices: "
-                f"{bad_idx.tolist()}. Remove or mask these features before "
-                "preprocessing."
-            )
-            raise ValueError(msg)
+        _check_no_constant_features(jnp.std(data, axis=axis))
         return cls(jnp.nanpercentile(data, loc_percentile, axis=axis), _scale)
 
     def transform(self, X: BatchedDataT) -> BatchedDataT:

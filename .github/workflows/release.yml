@@ -1,0 +1,72 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
+  release:
+    types:
+      - published
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Many color libraries just need this to be set to any value, but at least
+  # one distinguishes color depth, where "3" -> "256-bit color".
+  FORCE_COLOR: 3
+
+# Actions are pinned to commit SHAs, with the tag in a comment, so a moved tag
+# cannot change what runs here. Dependabot keeps them current.
+jobs:
+  dist:
+    name: Distribution build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # hatch-vcs derives the version from tags, and needs history for the
+          # commit distance, so shallow clones are not enough
+          fetch-depth: 0
+
+      # Builds the sdist, builds the wheel *from* that sdist, runs
+      # `twine check --strict`, lists the contents, and uploads a "Packages"
+      # artifact. v3 bundles Twine 7, which understands core metadata 2.5
+      # (pypa/twine#1327).
+      - uses: hynek/build-and-inspect-python-package@2abe76da66d0a6a4a227101f9348ee855797cfa5 # v3.0.1
+
+  publish:
+    needs: [dist]
+    name: Publish to PyPI
+    runs-on: ubuntu-latest
+    # Never attempt to publish from a fork
+    if: >-
+      github.repository_owner == 'adrn' && github.event_name == 'release' &&
+      github.event.action == 'published'
+    environment:
+      name: pypi
+      url: https://pypi.org/p/pollux
+    permissions:
+      id-token: write # mandatory for trusted publishing
+      attestations: write
+      contents: read
+
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: Packages
+          path: dist
+
+      - name: Generate artifact attestation for sdist and wheel
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: "dist/*"
+
+      # Publishes via Trusted Publishing: the project must exist on PyPI with a
+      # publisher configured for this repo, this workflow file, and the pypi
+      # environment.
+      - uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0

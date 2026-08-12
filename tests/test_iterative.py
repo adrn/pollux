@@ -1,5 +1,7 @@
 """Tests for iterative optimization."""
 
+import inspect
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -11,6 +13,7 @@ import pollux as plx
 from pollux.models.iterative import (
     IterativeOptimizationResult,
     ParameterBlock,
+    _build_fixed_pars,
     _get_regularization_from_prior,
     _is_linear_transform,
     _optimize_block_numpyro,
@@ -25,6 +28,38 @@ from pollux.models.transforms import (
 )
 
 jax.config.update("jax_enable_x64", True)
+
+
+@pytest.fixture
+def linear_model_and_data():
+    """A Lux model with a single linear output, plus matching synthetic data."""
+    n_stars = 32
+    n_latents = 4
+    n_flux = 16
+
+    rng = np.random.default_rng(123)
+
+    model = plx.Lux(latent_size=n_latents)
+    model.register_output("flux", LinearTransform(output_size=n_flux))
+
+    true_A = rng.normal(size=(n_flux, n_latents)) * 0.5
+    true_latents = rng.normal(size=(n_stars, n_latents))
+    true_flux = true_latents @ true_A.T
+    flux_err = np.full_like(true_flux, 0.1)
+
+    data = plx.data.PolluxData(
+        flux=plx.data.OutputData(true_flux + rng.normal(0, flux_err), err=flux_err),
+    )
+
+    return {
+        "model": model,
+        "data": data,
+        "true_A": true_A,
+        "true_latents": true_latents,
+        "n_stars": n_stars,
+        "n_latents": n_latents,
+        "n_flux": n_flux,
+    }
 
 
 class TestGetRegularizationFromPrior:
@@ -110,47 +145,13 @@ class TestParameterBlock:
 class TestLeastSquaresSolvers:
     """Tests for the least squares solvers."""
 
-    @pytest.fixture
-    def simple_linear_model(self):
-        """Create a simple linear model for testing."""
-        n_stars = 64
-        n_latents = 8
-        n_flux = 32
-
-        model = plx.LuxModel(latent_size=n_latents)
-        model.register_output("flux", LinearTransform(output_size=n_flux))
-
-        # Generate some synthetic data
-        rng = np.random.default_rng(42)
-        true_A = rng.normal(size=(n_flux, n_latents))
-        true_latents = rng.normal(size=(n_stars, n_latents))
-        true_flux = true_latents @ true_A.T
-        flux_err = np.abs(rng.normal(0.1, 0.02, size=true_flux.shape))
-
-        data = plx.data.PolluxData(
-            flux=plx.data.OutputData(
-                true_flux + rng.normal(0, flux_err),
-                err=flux_err,
-            ),
-        )
-
-        return {
-            "model": model,
-            "data": data,
-            "true_A": true_A,
-            "true_latents": true_latents,
-            "n_stars": n_stars,
-            "n_latents": n_latents,
-            "n_flux": n_flux,
-        }
-
-    def test_solve_latents_shape(self, simple_linear_model):
+    def test_solve_latents_shape(self, linear_model_and_data):
         """Test that latents solver returns correct shape."""
-        model = simple_linear_model["model"]
-        data = simple_linear_model["data"]
-        true_A = simple_linear_model["true_A"]
-        n_stars = simple_linear_model["n_stars"]
-        n_latents = simple_linear_model["n_latents"]
+        model = linear_model_and_data["model"]
+        data = linear_model_and_data["data"]
+        true_A = linear_model_and_data["true_A"]
+        n_stars = linear_model_and_data["n_stars"]
+        n_latents = linear_model_and_data["n_latents"]
 
         current_params = {
             "flux": {"data": {"A": jnp.array(true_A)}, "err": {}},
@@ -159,13 +160,13 @@ class TestLeastSquaresSolvers:
         latents = _solve_latents_least_squares(model, data, current_params)
         assert latents.shape == (n_stars, n_latents)
 
-    def test_solve_output_params_shape(self, simple_linear_model):
+    def test_solve_output_params_shape(self, linear_model_and_data):
         """Test that output params solver returns correct shape."""
-        model = simple_linear_model["model"]
-        data = simple_linear_model["data"]
-        true_latents = simple_linear_model["true_latents"]
-        n_flux = simple_linear_model["n_flux"]
-        n_latents = simple_linear_model["n_latents"]
+        model = linear_model_and_data["model"]
+        data = linear_model_and_data["data"]
+        true_latents = linear_model_and_data["true_latents"]
+        n_flux = linear_model_and_data["n_flux"]
+        n_latents = linear_model_and_data["n_latents"]
 
         output_params = _solve_output_params_least_squares(
             model, data, "flux", jnp.array(true_latents)
@@ -178,36 +179,10 @@ class TestLeastSquaresSolvers:
 class TestOptimizeIterative:
     """Tests for the main optimize_iterative function."""
 
-    @pytest.fixture
-    def simple_model_and_data(self):
-        """Create a simple model and data for testing."""
-        n_stars = 32
-        n_latents = 4
-        n_flux = 16
-
-        rng = np.random.default_rng(123)
-
-        model = plx.LuxModel(latent_size=n_latents)
-        model.register_output("flux", LinearTransform(output_size=n_flux))
-
-        # Generate data
-        true_A = rng.normal(size=(n_flux, n_latents)) * 0.5
-        true_latents = rng.normal(size=(n_stars, n_latents))
-        true_flux = true_latents @ true_A.T
-        flux_err = np.full_like(true_flux, 0.1)
-
-        data = plx.data.PolluxData(
-            flux=plx.data.OutputData(
-                true_flux + rng.normal(0, flux_err),
-                err=flux_err,
-            ),
-        )
-
-        return model, data, true_A, true_latents
-
-    def test_optimize_iterative_basic(self, simple_model_and_data):
+    def test_optimize_iterative_basic(self, linear_model_and_data):
         """Test basic iterative optimization."""
-        model, data, _, _ = simple_model_and_data
+        model = linear_model_and_data["model"]
+        data = linear_model_and_data["data"]
 
         result = optimize_iterative(
             model,
@@ -222,9 +197,10 @@ class TestOptimizeIterative:
         assert "latents" in result.params
         assert "flux" in result.params
 
-    def test_optimize_iterative_with_custom_blocks(self, simple_model_and_data):
+    def test_optimize_iterative_with_custom_blocks(self, linear_model_and_data):
         """Test with custom parameter blocks."""
-        model, data, _, _ = simple_model_and_data
+        model = linear_model_and_data["model"]
+        data = linear_model_and_data["data"]
 
         blocks = [
             ParameterBlock(
@@ -253,9 +229,10 @@ class TestOptimizeIterative:
         # Loss should decrease over cycles for well-conditioned problem
         assert result.losses_per_cycle[-1] <= result.losses_per_cycle[0]
 
-    def test_optimize_iterative_convergence(self, simple_model_and_data):
+    def test_optimize_iterative_convergence(self, linear_model_and_data):
         """Test that optimization can converge."""
-        model, data, _, _ = simple_model_and_data
+        model = linear_model_and_data["model"]
+        data = linear_model_and_data["data"]
 
         result = optimize_iterative(
             model,
@@ -269,9 +246,12 @@ class TestOptimizeIterative:
         # (or at least show decreasing loss)
         assert result.losses_per_cycle[-1] < result.losses_per_cycle[0]
 
-    def test_optimize_iterative_with_initial_params(self, simple_model_and_data):
+    def test_optimize_iterative_with_initial_params(self, linear_model_and_data):
         """Test optimization with initial parameters."""
-        model, data, true_A, true_latents = simple_model_and_data
+        model = linear_model_and_data["model"]
+        data = linear_model_and_data["data"]
+        true_A = linear_model_and_data["true_A"]
+        true_latents = linear_model_and_data["true_latents"]
 
         initial_params = {
             "latents": jnp.array(true_latents) + 0.1,  # Close to true
@@ -293,91 +273,61 @@ class TestOptimizeIterative:
         assert all(jnp.isfinite(loss) for loss in result.losses_per_cycle)
 
 
+class TestLuxOptimizeIterativeSignature:
+    """The Lux.optimize_iterative method's parameter order."""
+
+    def test_blocks_can_be_passed_positionally(self, linear_model_and_data):
+        """`model.optimize_iterative(data, blocks)` binds blocks, not max_cycles."""
+        model = linear_model_and_data["model"]
+        data = linear_model_and_data["data"]
+
+        result = model.optimize_iterative(
+            data,
+            ["latents"],
+            max_cycles=2,
+            rng_key=jax.random.PRNGKey(0),
+            progress=False,
+        )
+        assert isinstance(result, IterativeOptimizationResult)
+        assert result.n_cycles <= 2
+        assert "latents" in result.params
+
+    def test_defaults_to_ten_cycles(self):
+        """The method keeps its own max_cycles default, not the function's 100."""
+        sig = inspect.signature(plx.Lux.optimize_iterative)
+        assert sig.parameters["max_cycles"].default == 10
+        assert list(sig.parameters)[:4] == ["self", "data", "blocks", "fixed_pars"]
+
+
 class TestOptimizeBlockNumpyro:
     """Tests for the _optimize_block_numpyro function."""
 
-    @pytest.fixture
-    def simple_linear_model_and_data(self):
-        """Create a simple linear model for testing numpyro block optimization."""
-        n_stars = 32
-        n_latents = 4
-        n_flux = 16
+    def test_build_fixed_pars_holds_everything_else(self, linear_model_and_data):
+        """Parameters outside the optimized block are held fixed, not left free."""
+        model = linear_model_and_data["model"]
+        model.register_output("label", LinearTransform(output_size=2))
 
-        rng = np.random.default_rng(42)
-
-        model = plx.LuxModel(latent_size=n_latents)
-        model.register_output("flux", LinearTransform(output_size=n_flux))
-
-        # Generate data
-        true_A = rng.normal(size=(n_flux, n_latents)) * 0.5
-        true_latents = rng.normal(size=(n_stars, n_latents))
-        true_flux = true_latents @ true_A.T
-        flux_err = np.full_like(true_flux, 0.1)
-
-        data = plx.data.PolluxData(
-            flux=plx.data.OutputData(
-                true_flux + rng.normal(0, flux_err),
-                err=flux_err,
-            ),
-        )
-
-        return {
-            "model": model,
-            "data": data,
-            "true_A": true_A,
-            "true_latents": true_latents,
+        current_params = {
+            "latents": jnp.zeros((8, 4)),
+            "flux": {"data": {"A": jnp.ones((16, 4))}, "err": {"b": jnp.ones((16, 1))}},
+            "label": {"data": {"A": jnp.ones((2, 4))}, "err": {}},
         }
+        fixed = _build_fixed_pars(model, current_params, ["flux:data"])
 
-    @pytest.fixture
-    def nonlinear_model_and_data(self):
-        """Create a model with a non-linear FunctionTransform for testing."""
-        n_stars = 32
-        n_latents = 4
-        n_flux = 16
+        # Latents and the other output are fixed entirely...
+        assert jnp.allclose(fixed["latents"], current_params["latents"])
+        assert set(fixed["label"]) == {"data", "err"}
+        # ...as is the error transform of the output being optimized...
+        assert jnp.allclose(fixed["flux"]["err"]["b"], jnp.ones((16, 1)))
+        # ...but not the block itself
+        assert "data" not in fixed["flux"]
 
-        rng = np.random.default_rng(42)
-
-        # Create a simple non-linear transform: y = exp(latents @ A.T)
-        def exp_transform(latents, A):
-            return jnp.exp(latents @ A.T)
-
-        transform = FunctionTransform(
-            output_size=n_flux,
-            transform=jax.vmap(lambda z, A: exp_transform(z, A), in_axes=(0, None)),
-            priors={"A": dist.Normal(0.0, 0.5)},
-            shapes={"A": (n_flux, n_latents)},
-            vmap=False,
-        )
-
-        model = plx.LuxModel(latent_size=n_latents)
-        model.register_output("flux", transform)
-
-        # Generate data using the nonlinear model
-        true_A = rng.normal(size=(n_flux, n_latents)) * 0.2
-        true_latents = rng.normal(size=(n_stars, n_latents)) * 0.5
-        true_flux = np.exp(true_latents @ true_A.T)
-        flux_err = np.full_like(true_flux, 0.05)
-
-        data = plx.data.PolluxData(
-            flux=plx.data.OutputData(
-                true_flux + rng.normal(0, flux_err),
-                err=flux_err,
-            ),
-        )
-
-        return {
-            "model": model,
-            "data": data,
-            "true_A": true_A,
-            "true_latents": true_latents,
-        }
-
-    def test_optimize_block_numpyro_returns_params(self, simple_linear_model_and_data):
+    def test_optimize_block_numpyro_returns_params(self, linear_model_and_data):
         """Test that _optimize_block_numpyro returns valid parameters."""
-        model = simple_linear_model_and_data["model"]
-        data = simple_linear_model_and_data["data"]
-        true_A = simple_linear_model_and_data["true_A"]
-        true_latents = simple_linear_model_and_data["true_latents"]
+        model = linear_model_and_data["model"]
+        data = linear_model_and_data["data"]
+        true_A = linear_model_and_data["true_A"]
+        true_latents = linear_model_and_data["true_latents"]
 
         # Initial params
         current_params = {
@@ -406,12 +356,12 @@ class TestOptimizeBlockNumpyro:
         # Latents should be unchanged
         assert jnp.allclose(new_params["latents"], current_params["latents"])
 
-    def test_optimize_block_numpyro_latents(self, simple_linear_model_and_data):
+    def test_optimize_block_numpyro_latents(self, linear_model_and_data):
         """Test that _optimize_block_numpyro can optimize latents."""
-        model = simple_linear_model_and_data["model"]
-        data = simple_linear_model_and_data["data"]
-        true_A = simple_linear_model_and_data["true_A"]
-        true_latents = simple_linear_model_and_data["true_latents"]
+        model = linear_model_and_data["model"]
+        data = linear_model_and_data["data"]
+        true_A = linear_model_and_data["true_A"]
+        true_latents = linear_model_and_data["true_latents"]
 
         # Initial params with latents far from truth
         current_params = {
@@ -440,14 +390,12 @@ class TestOptimizeBlockNumpyro:
             new_params["flux"]["data"]["A"], current_params["flux"]["data"]["A"]
         )
 
-    def test_optimize_block_numpyro_with_custom_optimizer(
-        self, simple_linear_model_and_data
-    ):
+    def test_optimize_block_numpyro_with_custom_optimizer(self, linear_model_and_data):
         """Test _optimize_block_numpyro with a custom optimizer."""
-        model = simple_linear_model_and_data["model"]
-        data = simple_linear_model_and_data["data"]
-        true_A = simple_linear_model_and_data["true_A"]
-        true_latents = simple_linear_model_and_data["true_latents"]
+        model = linear_model_and_data["model"]
+        data = linear_model_and_data["data"]
+        true_A = linear_model_and_data["true_A"]
+        true_latents = linear_model_and_data["true_latents"]
 
         current_params = {
             "latents": jnp.array(true_latents),
@@ -504,7 +452,7 @@ class TestOptimizeIterativeWithNonlinear:
             vmap=False,
         )
 
-        model = plx.LuxModel(latent_size=n_latents)
+        model = plx.Lux(latent_size=n_latents)
         model.register_output("flux", transform)
 
         # Generate data
@@ -612,7 +560,7 @@ class TestMixedLinearNonlinear:
 
         rng = np.random.default_rng(42)
 
-        model = plx.LuxModel(latent_size=n_latents)
+        model = plx.Lux(latent_size=n_latents)
 
         # Linear output for labels
         model.register_output("label", LinearTransform(output_size=n_labels))

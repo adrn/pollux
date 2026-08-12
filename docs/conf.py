@@ -7,11 +7,9 @@ list see the documentation:
 
 import os
 import urllib.request
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-
-import pytz
 
 from pollux import __version__
 
@@ -33,7 +31,7 @@ for _filename, _url in _TUTORIAL_DATA.items():
 
 author = "Pollux Developers"
 project = "pollux"
-copyright = f"{datetime.now(pytz.timezone('UTC')).year}, {author}"
+copyright = f"{datetime.now(UTC).year}, {author}"
 version = __version__
 
 master_doc = "index"

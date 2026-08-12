@@ -46,7 +46,7 @@ def test_infer_error_intrinsic_scatter():
         vmap=False,
     )
 
-    model = plx.LuxModel(latent_size=n_latents)
+    model = plx.Lux(latent_size=n_latents)
     model.register_output(
         "flux", plx.models.LinearTransform(output_size=n_flux), err_trans
     )
