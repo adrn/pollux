@@ -1,7 +1,7 @@
 """
 Copyright (c) 2024-2025 adrn. All rights reserved.
 
-pollux: Data-driven models of stellar spectra.
+pollux: Data-driven latent variable models in JAX.
 """
 
 from __future__ import annotations

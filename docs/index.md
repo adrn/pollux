@@ -2,11 +2,15 @@
 
 ## Introduction
 
-Pollux is a Python library for constructing generative models of astronomical spectra
-and other kinds of data. It is built on top of [JAX][jax] and is designed for use in
-probabilistic and machine learning contexts.
+Pollux is a Python library for building data-driven latent variable models. You define a
+latent space and compose transforms from it to any number of observed outputs, which can
+be heterogeneous — spectra, photometry, stellar labels, or anything else measured for
+the same objects. Pollux keeps track of the model parameters and hands the assembled
+model to [numpyro][numpyro] for inference. It is built on [JAX][jax] and is designed for
+use in probabilistic and machine learning contexts.
 
-Two classes of models are currently supported:
+The framework is general, but it was written with stellar spectroscopy in mind, and two
+ready-made models ship with it:
 
 - [_Lux_](https://arxiv.org/abs/2502.01745): Multi-output, generative, latent variable
   models for inferring embedded representations of spectroscopic and many other kinds of
@@ -63,6 +67,7 @@ python -m pip install -e . --group test
 Then run the tests with `uv run pytest` or `pytest`.
 
 [jax]: https://jax.readthedocs.io/en/latest/
+[numpyro]: https://num.pyro.ai/
 [uv]: https://docs.astral.sh/uv/
 [pep735]: https://peps.python.org/pep-0735/
 

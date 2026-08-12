@@ -9,7 +9,7 @@ name = "pollux"
 authors = [
   { name = "adrn", email = "adrian.prw@gmail.com" },
 ]
-description = "JAX implementations of data-driven models for stellar spectroscopy"
+description = "A JAX framework for data-driven latent variable models, with models for stellar spectroscopy"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
