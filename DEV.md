@@ -52,13 +52,13 @@ edit anywhere.
 2. Tag and push: `git tag v0.1.0 && git push origin v0.1.0`
 3. Publish a GitHub Release for that tag.
 
-The `CD` workflow then builds the sdist and wheel and uploads them to PyPI with Trusted
-Publishing. To check the artifacts first, without releasing:
+The `Release` workflow then builds the sdist and wheel and uploads them to PyPI with
+Trusted Publishing. To check the artifacts first, without releasing:
 
 ```bash
 uv build && uv run --with twine twine check dist/*
 ```
 
 **Before the first release**, the `pollux` project must exist on PyPI with a Trusted
-Publisher configured for owner `adrn`, repository `pollux`, workflow `cd.yml`, and
+Publisher configured for owner `adrn`, repository `pollux`, workflow `release.yml`, and
 environment `pypi` — otherwise the publish step fails.
