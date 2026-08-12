@@ -18,22 +18,53 @@ Two classes of models are currently supported:
 
 ## Installation
 
-Install `pollux` with `pip` directly from the GitHub repository:
+`pollux` requires Python 3.12 or newer. Install the latest release with `pip`:
+
+```bash
+pip install pollux
+```
+
+or with [uv][uv]:
+
+```bash
+uv add pollux
+```
+
+To install the unreleased development version, point either tool at the repository
+instead:
 
 ```bash
 pip install git+https://github.com/adrn/pollux
+uv add git+https://github.com/adrn/pollux
 ```
 
-In the future, we plan to provide stable releases through PyPI.
+### Development installation
 
-<!-- [![PyPI version][pypi-version]][pypi-link] -->
-<!-- [![PyPI platforms][pypi-platforms]][pypi-link] -->
+Clone the repository, then set up an environment with the development dependencies — the
+test suite, the documentation build, and the linters:
+
+```bash
+uv sync                                        # everything, in .venv
+uv sync --no-default-groups --group test       # just the test dependencies
+```
+
+(`uv sync --only-group test` would install the test tools _without_ `pollux` or its
+runtime dependencies, which is rarely what you want.)
+
+The same dependency groups work with `pip` 25.1 or newer, which added support for [PEP
+735][pep735] groups:
+
+```bash
+python -m pip install -U pip
+python -m pip install -e . --group dev
+python -m pip install -e . --group test
+```
+
+Then run the tests with `uv run pytest` or `pytest`.
 
 [jax]: https://jax.readthedocs.io/en/latest/
-
-<!-- [pypi-link]: https://pypi.org/project/TODO/ -->
-<!-- [pypi-platforms]: https://img.shields.io/pypi/pyversions/TODO -->
-<!-- [pypi-version]: https://img.shields.io/pypi/v/TODO -->
+[uv]: https://docs.astral.sh/uv/
+[pep735]: https://peps.python.org/pep-0735/
 
 ## Get Started
 

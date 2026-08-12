@@ -23,7 +23,7 @@ import abc
 import inspect
 from itertools import accumulate, combinations_with_replacement
 from math import comb
-from typing import Any, TypeAlias
+from typing import Any
 
 import equinox as eqx
 import jax
@@ -47,7 +47,7 @@ from ..typing import (
 #: ``"output_size"`` (the transform's output dimension), ``"latent_size"`` (the
 #: latent space dimension, set when registering with a model), ``"data_size"``
 #: (the number of objects in the dataset) and ``"one"`` (always 1, for bias terms).
-ShapeT: TypeAlias = tuple[str | int, ...]
+type ShapeT = tuple[str | int, ...]
 
 
 def _resolve_shape(shape: ShapeT, **dim_sizes: int | None) -> tuple[int, ...]:
@@ -85,15 +85,15 @@ def _resolve_shape(shape: ShapeT, **dim_sizes: int | None) -> tuple[int, ...]:
 
 #: Type alias for parameter priors: maps parameter names to distributions.
 #: Used with :class:`FunctionTransform` to specify priors for learnable parameters.
-ParamPriorsT: TypeAlias = ImmutableMap[str, dist.Distribution]
+type ParamPriorsT = ImmutableMap[str, dist.Distribution]
 
 #: Type alias for parameter shapes: maps parameter names to shapes. Each shape is
 #: a tuple of concrete sizes and/or named dimensions (see :data:`ShapeT`).
-ParamShapesT: TypeAlias = ImmutableMap[str, ShapeT]
+type ParamShapesT = ImmutableMap[str, ShapeT]
 
 # Internal: Tuples of parameters for TransformSequence
-ParamPriorsTupleT: TypeAlias = tuple[ParamPriorsT, ...]
-ParamShapesTupleT: TypeAlias = tuple[ParamShapesT, ...]
+type ParamPriorsTupleT = tuple[ParamPriorsT, ...]
+type ParamShapesTupleT = tuple[ParamShapesT, ...]
 
 
 class AbstractTransform(eqx.Module):

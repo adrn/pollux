@@ -53,8 +53,6 @@ jobs:
         with:
           subject-path: "dist/*"
 
+      # Publishes to PyPI via Trusted Publishing: the project must exist on PyPI
+      # with a publisher configured for this repo, workflow, and environment.
       - uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          # Remember to tell (test-)pypi about this repo before publishing
-          # Remove this line to publish to PyPI
-          repository-url: https://test.pypi.org/legacy/

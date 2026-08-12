@@ -49,7 +49,7 @@ jobs:
         run: uv python install
 
       - name: Install dependencies
-        run: uv sync --group docs
+        run: uv sync --no-default-groups --group docs
 
       - name: Download APOGEE data
         uses: ethanjli/cached-download-action@v0.1.4
@@ -61,7 +61,7 @@ jobs:
         run: |
           for nb in docs/tutorials/*.ipynb; do
             echo "Executing $nb"
-            uv run jupyter nbconvert --to notebook --execute --inplace "$nb"
+            uv run --no-sync jupyter nbconvert --to notebook --execute --inplace "$nb"
           done
 
       - uses: actions/upload-artifact@v7

@@ -15,7 +15,7 @@ __all__ = [
 import warnings
 from dataclasses import dataclass, field
 from functools import partial
-from typing import TYPE_CHECKING, Any, Literal, TypeAlias
+from typing import TYPE_CHECKING, Any, Literal
 
 import jax
 import jax.numpy as jnp
@@ -40,7 +40,7 @@ if TYPE_CHECKING:
     from .lux import Lux
 
 #: Transforms whose least squares sub-problem has a closed-form solution
-LinearTransformT: TypeAlias = LinearTransform | AffineTransform | OffsetTransform
+type LinearTransformT = LinearTransform | AffineTransform | OffsetTransform
 
 
 @dataclass

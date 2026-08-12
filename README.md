@@ -12,6 +12,36 @@ _Lux_ and the _Cannon_.
 
 <!-- SPHINX-START -->
 
+## Installation
+
+`pollux` requires Python 3.12 or newer:
+
+```bash
+pip install pollux    # or: uv add pollux
+```
+
+For the unreleased development version, install from this repository:
+
+```bash
+pip install git+https://github.com/adrn/pollux
+```
+
+## Development
+
+```bash
+uv sync                    # all development dependencies, in .venv
+uv run pytest              # run the tests
+```
+
+The [PEP 735](https://peps.python.org/pep-0735/) dependency groups (`test`, `docs`,
+`dev`) also work with `pip` 25.1 or newer:
+
+```bash
+python -m pip install -e . --group dev
+```
+
+See the [documentation][rtd-link] for more.
+
 <!-- prettier-ignore-start -->
 [actions-badge]:            https://github.com/adrn/pollux/workflows/CI/badge.svg
 [actions-link]:             https://github.com/adrn/pollux/actions
