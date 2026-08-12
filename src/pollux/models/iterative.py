@@ -649,8 +649,27 @@ def optimize_iterative(
     """Optimize model using iterative block coordinate descent.
 
     This implements an alternating optimization strategy that cycles through
-    parameter blocks, optimizing each while holding others fixed. For linear
-    models, each sub-problem can be solved exactly using weighted least squares.
+    parameter blocks, optimizing each while holding others fixed. Where a block's
+    sub-problem is quadratic it is solved exactly by weighted least squares, which
+    needs no learning rate and no step count.
+
+    Which blocks those are is decided by measurement rather than by transform type,
+    so it is a property of the model rather than a list of supported classes:
+
+    - the **latents** can be solved exactly when every output with data is affine in
+      them. That covers a bare linear map, but equally a slice of the latents feeding
+      a linear branch, a ``ConcatenateTransform`` of linear children, or a linear map
+      plus a fixed per-object offset.
+    - an **output's own parameters** can be solved exactly when its transform ends in
+      a linear layer that holds all of the transform's parameters. Anything before
+      that layer is just run forward to make features -- which is what lets the
+      Cannon's polynomial expansion work.
+
+    Blocks that do not qualify fall back to SVI, and say so with a
+    :class:`~pollux.exceptions.PolluxLinearizationWarning` naming each block and the
+    reason. ``result.blocks`` reports what each block actually ran with. See the
+    "Closed-form solves, found by linearization" page in the documentation for how
+    the decision is made and what it does and does not guarantee.
 
     The default strategy alternates between:
     1. Optimize latents (with output parameters fixed)
