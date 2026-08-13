@@ -783,6 +783,37 @@ class TestLuxOptimizeIterativeSignature:
 class TestOptimizeBlockNumpyro:
     """Tests for the _optimize_block_numpyro function."""
 
+    def test_svi_block_warm_starts_from_the_current_parameters(
+        self, linear_model_and_data
+    ):
+        """A cycle must continue the previous one, not restart from the prior.
+
+        AutoDelta re-initializes from its init strategy unless told otherwise, so an
+        SVI block used to throw away every previous cycle's progress. That made the
+        overall loss free to increase between cycles, which block coordinate descent
+        must never do, and left models with a non-linear output stuck near their
+        initialization no matter how many cycles were run.
+        """
+        model = linear_model_and_data["model"]
+        data = linear_model_and_data["data"]
+        n_stars = linear_model_and_data["n_stars"]
+        n_latents = linear_model_and_data["n_latents"]
+
+        # A distinctive starting point, nowhere near any sensible initialization
+        latents = jnp.full((n_stars, n_latents), 3.0)
+        current = {
+            "latents": latents,
+            "flux": {"data": {"A": jnp.array(linear_model_and_data["true_A"])}},
+        }
+
+        block = ParameterBlock("latents", "latents", num_steps=1)
+        stepped = _optimize_block_numpyro(
+            model, data, block, current, jax.random.PRNGKey(0)
+        )
+
+        # One Adam step at the default 1e-3 can move each coordinate by ~1e-3
+        assert jnp.abs(stepped["latents"] - latents).max() < 1e-2
+
     def test_build_fixed_pars_holds_everything_else(self, linear_model_and_data):
         """Parameters outside the optimized block are held fixed, not left free."""
         model = linear_model_and_data["model"]

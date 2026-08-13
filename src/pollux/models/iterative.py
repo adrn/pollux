@@ -24,6 +24,7 @@ import numpyro
 import numpyro.distributions as dist
 from numpyro.infer import SVI, Predictive, Trace_ELBO
 from numpyro.infer.autoguide import AutoDelta
+from numpyro.infer.initialization import init_to_value
 from tqdm.auto import tqdm
 
 from .._linalg import weighted_least_squares
@@ -955,9 +956,17 @@ def _optimize_block_numpyro(
         latents_prior=latents_prior,
     )
 
-    # Run SVI optimization
+    # Run SVI optimization, warm-started from where the last cycle left this block.
+    # Without this the guide re-initializes from the prior every cycle, so the block
+    # never accumulates progress and the overall loss is free to go *up* between
+    # cycles -- which block coordinate descent must never do.
     svi_key, sample_key = jax.random.split(rng_key)
-    guide = AutoDelta(partial_model)
+    guide = AutoDelta(
+        partial_model,
+        init_loc_fn=init_to_value(
+            values=model.pack_numpyro_pars(current_params, ignore_missing=True)
+        ),
+    )
     svi = SVI(partial_model, guide, optimizer, Trace_ELBO())
     svi_results = svi.run(svi_key, block.num_steps, data, progress_bar=False)
 
