@@ -32,6 +32,7 @@ from pollux.models.transforms import (
     AffineTransform,
     FunctionTransform,
     LinearTransform,
+    NoOpTransform,
     PolyFeatureTransform,
     TransformSequence,
 )
@@ -589,6 +590,71 @@ class TestOptimizeIterativePartitionedLatents:
             predictions["labels"], latents[:, 2:] @ A_labels.T, atol=2e-2
         )
         assert result.losses_per_cycle[-1] < result.losses_per_cycle[0]
+
+
+class TestCannonAsLux:
+    """The Cannon written as a Lux model: labels are the latents, flux is poly->linear."""
+
+    @pytest.fixture
+    def cannon_model_and_data(self):
+        n_stars, n_labels, n_flux = 200, 3, 40
+        n_features = 10  # 1 + 3 + 6 monomials up to degree 2
+        rng = np.random.default_rng(0)
+        labels = jnp.array(rng.normal(size=(n_stars, n_labels)))
+        theta = jnp.array(rng.normal(size=(n_flux, n_features)))
+        flux = PolyFeatureTransform(degree=2).apply(labels) @ theta.T
+
+        model = plx.Lux(latent_size=n_labels)
+        model.register_output("label", NoOpTransform())
+        model.register_output(
+            "flux",
+            TransformSequence(
+                (PolyFeatureTransform(degree=2), LinearTransform(output_size=n_flux))
+            ),
+        )
+        data = plx.data.PolluxData(
+            label=plx.data.OutputData(labels, err=jnp.full((n_stars, n_labels), 1e-3)),
+            flux=plx.data.OutputData(flux, err=jnp.full((n_stars, n_flux), 1e-2)),
+        )
+        return model, data, labels, theta
+
+    def test_parameterless_output_gets_no_block(self, cannon_model_and_data):
+        """The NoOpTransform label output has nothing to optimize, so skip it.
+
+        It also has no entry in the parameter dict, which used to make the whole fit
+        die with KeyError inside predict_outputs.
+        """
+        model, data, _, _ = cannon_model_and_data
+
+        with pytest.warns(PolluxLinearizationWarning):
+            result = model.optimize_iterative(
+                data, max_cycles=2, rng_key=jax.random.PRNGKey(0), progress=False
+            )
+
+        assert [b.name for b in result.blocks] == ["latents", "flux:data"]
+        # Polynomial features of the latents are not affine in them, so the labels
+        # cannot be solved in closed form -- but the coefficients still can be
+        assert {b.name: b.optimizer for b in result.blocks} == {
+            "latents": None,
+            "flux:data": "least_squares",
+        }
+
+    def test_training_step_is_one_exact_solve(self, cannon_model_and_data):
+        """With the labels known, fitting the Cannon is a single closed-form solve."""
+        model, data, labels, theta = cannon_model_and_data
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")  # no fallback, and no SVI
+            result = model.optimize_iterative(
+                data,
+                blocks=["flux:data"],
+                fixed_pars={"latents": labels},
+                max_cycles=1,
+                progress=False,
+            )
+
+        assert [b.optimizer for b in result.blocks] == ["least_squares"]
+        assert jnp.allclose(result.params["flux"]["data"][1]["A"], theta, atol=1e-4)
 
 
 class TestOptimizeIterative:

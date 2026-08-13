@@ -1,6 +1,7 @@
 from functools import partial
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import numpyro
 import numpyro.distributions as dist
@@ -12,6 +13,7 @@ import pollux as plx
 from pollux.models.transforms import (
     FunctionTransform,
     LinearTransform,
+    NoOpTransform,
     OffsetTransform,
     TransformSequence,
 )
@@ -459,6 +461,26 @@ class TestLuxValidation:
         nested_pars = {"flux": {"data": {"A": A}}}
         # If this raises a warning, pytest will fail due to filterwarnings=error
         model.predict_outputs(latents, nested_pars)
+
+    def test_output_with_no_parameters_needs_no_entry(self, rng, model_config):
+        """A NoOpTransform output never appears in a parameter dict, so don't demand it.
+
+        unpack_numpyro_pars only emits entries for outputs that had sampled
+        parameters, so requiring one here made every Cannon-style model (labels
+        observed through a NoOpTransform) fail with KeyError.
+        """
+        n_latents, n_flux = model_config["n_latents"], model_config["n_flux"]
+        model = plx.Lux(latent_size=n_latents)
+        model.register_output("label", NoOpTransform())
+        model.register_output("flux", LinearTransform(output_size=n_flux))
+
+        latents = jnp.array(rng.random((model_config["n_stars"], n_latents)))
+        A = jnp.array(rng.random((n_flux, n_latents)))
+
+        # "label" is absent, and that must not warn about the direct format either
+        out = model.predict_outputs(latents, {"flux": {"data": {"A": A}}})
+        assert jnp.allclose(out["label"], latents)
+        assert out["flux"].shape == (model_config["n_stars"], n_flux)
 
 
 class TestOptimizeDefaults:

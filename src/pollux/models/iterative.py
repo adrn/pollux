@@ -715,7 +715,18 @@ def optimize_iterative(
     # Default blocks: alternate between latents and each output. String specs are
     # converted per element rather than by sniffing blocks[0], so a mixed list works.
     if blocks is None:
-        blocks = ["latents", *(f"{o}:data" for o in model.outputs)]
+        # Outputs whose transform carries no learnable parameters (NoOpTransform, a
+        # bare PolyFeatureTransform) have nothing to optimize, so they get no block
+        blocks = [
+            "latents",
+            *(
+                f"{name}:data"
+                for name, output in model.outputs.items()
+                if output.data_transform.get_expanded_priors(
+                    model.latent_size, len(data)
+                )
+            ),
+        ]
     _blocks: list[ParameterBlock] = [
         _string_to_parameter_block(model, b) if isinstance(b, str) else b
         for b in blocks

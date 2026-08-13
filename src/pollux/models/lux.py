@@ -240,7 +240,10 @@ class Lux(eqx.Module):
         data_pars = {}
         direct_format = False
         for name in names:
-            output_pars = pars[name]
+            # A transform with no learnable parameters -- NoOpTransform,
+            # PolyFeatureTransform -- never appears in a parameter dict, so a missing
+            # entry means "this output has no parameters", not "the caller forgot one"
+            output_pars = pars.get(name, {})
             if not isinstance(output_pars, dict):
                 msg = (
                     f"Expected dict for parameters of output '{name}', "
@@ -248,7 +251,7 @@ class Lux(eqx.Module):
                 )
                 raise TypeError(msg)
 
-            if "data" in output_pars or "err" in output_pars:
+            if not output_pars or "data" in output_pars or "err" in output_pars:
                 data_pars[name] = output_pars.get("data", {})
             else:
                 direct_format = True
