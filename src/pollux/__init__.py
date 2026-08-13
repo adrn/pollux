@@ -8,9 +8,10 @@ from __future__ import annotations
 
 from . import data, models
 from ._version import version as __version__
-from .models import Cannon, Lux
+from .models import LVM, Cannon, Lux
 
 __all__ = [
+    "LVM",
     "Cannon",
     "Lux",
     "__version__",

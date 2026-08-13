@@ -15,6 +15,7 @@ from pollux.models.transforms import (
     LinearTransform,
     OffsetTransform,
     PolyFeatureTransform,
+    ScatterTransform,
     TransformSequence,
 )
 
@@ -71,6 +72,56 @@ def test_offset_transform():
     assert np.allclose(result_prior, expected)
 
 
+def test_scatter_transform():
+    n_stars = 64
+    n_out = 8
+    rng = np.random.default_rng(42)
+
+    trans = ScatterTransform(output_size=n_out)
+    err = jnp.array(rng.random((n_stars, n_out)))
+    s = jnp.array(rng.random(n_out))
+
+    # Adding the scatter in quadrature can only inflate the reported errors
+    result = trans.apply(err, s=s)
+    assert np.allclose(result, np.sqrt(np.array(err) ** 2 + np.array(s) ** 2))
+    assert np.all(result >= err)
+
+    # A zero scatter leaves the errors untouched
+    assert np.allclose(trans.apply(err, s=jnp.zeros(n_out)), err)
+
+    # The prior scale is a plain field, so it can be widened at construction
+    wide = ScatterTransform(output_size=n_out, priors={"s": dist.HalfNormal(5.0)})
+    assert np.allclose(wide.apply(err, s=s), result)
+    assert wide.get_expanded_priors(latent_size=4, data_size=n_stars)[
+        "s"
+    ].batch_shape == (n_out,)
+
+
+def test_scatter_transform_as_err_transform():
+    """The point of the transform: an output whose scatter is fitted alongside it."""
+    n_stars, n_latents, n_flux = 32, 2, 6
+    rng = np.random.default_rng(0)
+
+    model = plx.LVM(latent_size=n_latents)
+    model.register_output(
+        "flux",
+        LinearTransform(output_size=n_flux),
+        err_transform=ScatterTransform(output_size=n_flux),
+    )
+
+    latents = jnp.array(rng.normal(size=(n_stars, n_latents)))
+    A = jnp.array(rng.normal(size=(n_flux, n_latents)))
+    data = plx.data.PolluxData(
+        flux=plx.data.OutputData(latents @ A.T, err=jnp.full((n_stars, n_flux), 0.05))
+    )
+
+    result = model.optimize_iterative(
+        data, max_cycles=1, rng_key=jax.random.PRNGKey(0), progress=False
+    )
+    assert result.params["flux"]["err"]["s"].shape == (n_flux,)
+    assert np.all(np.asarray(result.params["flux"]["err"]["s"]) >= 0)
+
+
 @pytest.mark.parametrize(
     ("cls", "extra_pars"),
     [
@@ -107,7 +158,7 @@ def test_bias_shape_does_not_broadcast_to_a_matrix(cls, extra_pars):
 def test_bias_transforms_run_in_a_model(cls):
     """End-to-end guard: a model containing one of these used to fail to optimize."""
     n_stars, n_out = 6, 3
-    model = plx.Lux(latent_size=4)
+    model = plx.LVM(latent_size=4)
     model.register_output("flux", cls(output_size=n_out))
     data = plx.data.PolluxData(
         flux=plx.data.OutputData(
@@ -181,15 +232,15 @@ def test_transform_sequence_priors():
     # Test nested parameter format with list of dicts
     pars = {"mags": {"data": [{"A": A}, {"b": b}]}}
 
-    model = plx.Lux(latent_size=n_latents)
+    model = plx.LVM(latent_size=n_latents)
     model.register_output("mags", trans)
-    out = model.predict_outputs(latents, pars)
+    out = model.predict_outputs(pars, latents)
 
     assert np.allclose(out["mags"], tmp)
 
     # Test nested parameter format with flat dict
     pars_flat = {"mags": {"data": {"0:A": A, "1:b": b}}}
-    out_flat = model.predict_outputs(latents, pars_flat)
+    out_flat = model.predict_outputs(pars_flat, latents)
     assert np.allclose(out_flat["mags"], tmp)
 
 
@@ -251,7 +302,7 @@ def test_numpyro_parameter_naming_integration():
     n_out = 4
 
     # Create a simple model with TransformSequence
-    model = plx.Lux(latent_size=n_latents)
+    model = plx.LVM(latent_size=n_latents)
     trans = TransformSequence(
         transforms=(
             LinearTransform(output_size=n_out),
@@ -623,7 +674,7 @@ def test_poly_feature_transform_in_sequence():
 
 
 def test_poly_feature_transform_with_lux_model():
-    """Test PolyFeatureTransform integration with Lux."""
+    """Test PolyFeatureTransform integration with LVM."""
 
     n_stars = 16
     n_labels = 3
@@ -631,7 +682,7 @@ def test_poly_feature_transform_with_lux_model():
     rng = np.random.default_rng(123)
 
     # Create model with Cannon-style transform
-    model = plx.Lux(latent_size=n_labels)
+    model = plx.LVM(latent_size=n_labels)
 
     cannon_trans = TransformSequence(
         transforms=(
@@ -664,7 +715,7 @@ def test_poly_feature_transform_with_lux_model():
 
     # Test predict_outputs
     pars = {"flux": {"data": [{}, {"A": A}]}}
-    result = model.predict_outputs(labels, pars)
+    result = model.predict_outputs(pars, labels)
     assert np.allclose(result["flux"], true_flux)
 
 
@@ -815,14 +866,14 @@ def test_equinox_nn_transform_deterministic():
 
 
 def test_equinox_nn_transform_with_lux_model():
-    """Test EquinoxNNTransform integration with Lux."""
+    """Test EquinoxNNTransform integration with LVM."""
     n_stars = 16
     n_latents = 4
     n_flux = 8
     rng = np.random.default_rng(123)
 
     # Create model with NN transform
-    model = plx.Lux(latent_size=n_latents)
+    model = plx.LVM(latent_size=n_latents)
     nn_trans = EquinoxNNTransform(
         output_size=n_flux,
         nn_factory=mlp_factory,
@@ -843,7 +894,7 @@ def test_equinox_nn_transform_with_lux_model():
 
     # Test predict_outputs
     pars = {"flux": {"data": params}}
-    result = model.predict_outputs(latents, pars)
+    result = model.predict_outputs(pars, latents)
 
     assert result["flux"].shape == (n_stars, n_flux)
 
@@ -907,14 +958,14 @@ def test_per_object_offset_requires_data_size():
 
 
 def test_per_object_offset_with_lux_model():
-    """The composed transform round-trips through a Lux model."""
+    """The composed transform round-trips through a LVM model."""
     n_stars, n_latents, n_output = 32, 8, 3
     rng = np.random.default_rng(42)
 
     trans = TransformSequence(
         (LinearTransform(output_size=n_output), per_object_offset(n_output))
     )
-    model = plx.Lux(latent_size=n_latents)
+    model = plx.LVM(latent_size=n_latents)
     model.register_output("phot", trans)
 
     latents = jnp.array(rng.random((n_stars, n_latents)))
@@ -922,7 +973,7 @@ def test_per_object_offset_with_lux_model():
     offset = jnp.array(rng.normal(11.0, 3.0, size=(n_stars,)))
 
     pars = {"phot": {"data": {"0:A": A, "1:offset": offset}}}
-    result = model.predict_outputs(latents, pars)
+    result = model.predict_outputs(pars, latents)
 
     expected = jnp.einsum("ij,nj->ni", A, latents) + offset[:, None]
     assert result["phot"].shape == (n_stars, n_output)
@@ -1225,7 +1276,7 @@ class TestConcatenateTransformInTransformSequence:
 
 
 class TestConcatenateTransformWithLux:
-    """Tests for ConcatenateTransform with Lux integration."""
+    """Tests for ConcatenateTransform with LVM integration."""
 
     def test_register_and_predict(self):
         rng = np.random.default_rng(42)
@@ -1241,7 +1292,7 @@ class TestConcatenateTransformWithLux:
             input_sizes=(in1, in2),
         )
 
-        model = plx.Lux(latent_size=n_latents)
+        model = plx.LVM(latent_size=n_latents)
         model.register_output("flux", concat)
 
         A0 = jnp.array(rng.random((5, in1)))
@@ -1249,7 +1300,7 @@ class TestConcatenateTransformWithLux:
         latents = jnp.array(rng.random((n_stars, n_latents)))
 
         pars = {"flux": {"data": {"0:A": A0, "1:A": A1}}}
-        result = model.predict_outputs(latents, pars)
+        result = model.predict_outputs(pars, latents)
         assert result["flux"].shape == (n_stars, 11)
 
 

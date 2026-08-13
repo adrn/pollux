@@ -280,9 +280,9 @@ class Cannon(eqx.Module):
         return features @ self.coeffs.T  # (n_stars, output_size)
 
     def to_transform_sequence(self) -> TransformSequence:
-        """Convert to a TransformSequence for use with Lux.
+        """Convert to a TransformSequence for use with LVM.
 
-        Returns a TransformSequence that can be used with Lux for Bayesian
+        Returns a TransformSequence that can be used with LVM for Bayesian
         inference or more complex models. The sequence consists of:
 
         1. PolyFeatureTransform: labels → polynomial features (no learnable params)
@@ -291,7 +291,7 @@ class Cannon(eqx.Module):
         Returns
         -------
         TransformSequence
-            A transform sequence that can be registered with Lux.
+            A transform sequence that can be registered with LVM.
 
         Notes
         -----
@@ -305,7 +305,7 @@ class Cannon(eqx.Module):
         >>> import pollux as plx
         >>> cannon = Cannon(label_size=3, output_size=128, poly_degree=2)
         >>> transform = cannon.to_transform_sequence()
-        >>> model = plx.Lux(latent_size=3)  # latent_size = label_size
+        >>> model = plx.LVM(latent_size=3)  # latent_size = label_size
         >>> model.register_output("flux", transform)
         """
         return TransformSequence(
@@ -323,8 +323,8 @@ class Cannon(eqx.Module):
         """Get fitted coefficients in transform parameter format.
 
         Returns the fitted coefficients in the format expected by
-        TransformSequence/Lux. This allows using Cannon-fitted parameters
-        as initial values or fixed parameters in Lux.
+        TransformSequence/LVM. This allows using Cannon-fitted parameters
+        as initial values or fixed parameters in LVM.
 
         Returns
         -------
@@ -344,7 +344,7 @@ class Cannon(eqx.Module):
         --------
         >>> cannon = cannon.fit(labels, spectra)  # doctest: +SKIP
         >>> pars = cannon.get_coeffs_as_transform_pars()  # doctest: +SKIP
-        >>> # Use with Lux
+        >>> # Use with LVM
         >>> model.predict_outputs(labels, {"flux": pars})  # doctest: +SKIP
         """
         if not self.is_fitted:

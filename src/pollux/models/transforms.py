@@ -15,6 +15,7 @@ __all__ = [
     "ParamShapesT",
     "PolyFeatureTransform",
     "QuadraticTransform",
+    "ScatterTransform",
     "ShapeT",
     "TransformSequence",
 ]
@@ -957,6 +958,43 @@ class QuadraticTransform(AbstractSingleTransform):
 # ----
 
 
+def _scatter_transform(err: OutputT, s: OutputT) -> OutputT:
+    """Add an intrinsic scatter in quadrature to the reported errors.
+
+    Computes sqrt(err^2 + s^2).
+    """
+    return jnp.sqrt(err**2 + s**2)
+
+
+class ScatterTransform(AbstractSingleTransform):
+    """Intrinsic scatter added in quadrature to the reported errors.
+
+    Implements the transformation: y = sqrt(err^2 + s^2), where ``s`` is a fitted
+    per-element scatter. This is meant to be used as the ``err_transform`` of an
+    output, where it absorbs variance the reported errors do not account for.
+
+    The prior on ``s`` is an ordinary field, so the scale that suits your data --
+    which depends on how the output was preprocessed -- can be set at construction.
+
+    Examples
+    --------
+    >>> import numpyro.distributions as dist
+    >>> from pollux.models.transforms import ScatterTransform
+    >>> trans = ScatterTransform(output_size=8)
+    >>> wider = ScatterTransform(output_size=8, priors={"s": dist.HalfNormal(5.0)})
+    """
+
+    transform: TransformFuncT = _scatter_transform
+    priors: ParamPriorsT = eqx.field(
+        default=ImmutableMap({"s": dist.HalfNormal(1.0)}),
+        converter=ImmutableMap,
+    )
+    shapes: ParamShapesT = ImmutableMap({"s": ("output_size",)})
+
+
+# ----
+
+
 def _param_path_key_str(key: Any) -> str:
     """Format one JAX key path entry, e.g. ``"layers"``, ``"0"``, or a dict key."""
     if isinstance(key, jtu.GetAttrKey):
@@ -1043,10 +1081,10 @@ class EquinoxNNTransform(AbstractTransform):
     ...     bias_prior=dist.Normal(0, 0.01),
     ... )
 
-    Use with Lux:
+    Use with LVM:
 
     >>> import pollux as plx
-    >>> model = plx.Lux(latent_size=8)
+    >>> model = plx.LVM(latent_size=8)
     >>> model.register_output("flux", nn_trans)
     """
 

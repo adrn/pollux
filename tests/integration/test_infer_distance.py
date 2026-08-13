@@ -42,7 +42,7 @@ def test_infer_distance():
         ),
     )
 
-    model = plx.Lux(latent_size=n_latents)
+    model = plx.LVM(latent_size=n_latents)
     model.register_output("flux", plx.models.LinearTransform(output_size=128))
 
     trans = plx.models.TransformSequence(
@@ -63,7 +63,7 @@ def test_infer_distance():
         "flux": {"data": {"A": truth["B"]}},
         "label": {"data": [{"A": truth["A"]}, {"b": true_dm}]},
     }
-    test_out = model.predict_outputs(truth["latents"], pars)
+    test_out = model.predict_outputs(pars, truth["latents"])
     assert jnp.allclose(test_out["flux"], truth["flux"], atol=1e-5)
     assert jnp.allclose(test_out["label"], truth["label"] + true_dm, atol=1e-5)
 
@@ -76,7 +76,7 @@ def test_infer_distance():
     res.losses.block_until_ready()
 
     # Test that we can predict the data with optimized parameters:
-    model.predict_outputs(opt_pars["latents"], opt_pars)
+    model.predict_outputs(opt_pars)
 
     d_dm = opt_pars["label"]["data"][1]["b"] - true_dm
     assert jnp.isclose(jnp.mean(d_dm), 0.0, atol=1e-1)

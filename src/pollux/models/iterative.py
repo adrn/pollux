@@ -1,7 +1,7 @@
-"""Iterative optimization strategies for Lux.
+"""Iterative optimization strategies for latent variable models.
 
 This module provides an alternating/block coordinate descent optimization scheme
-that exploits the structure of the Lux model for faster convergence.
+that exploits the structure of an LVM for faster convergence.
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ from .transforms import (
 )
 
 if TYPE_CHECKING:
-    from .lux import Lux
+    from .lvm import LVM
 
 
 @dataclass
@@ -241,12 +241,12 @@ def _linearize_latents(
 
 
 def _output_predict_fn(
-    model: Lux, output_name: str, params: dict[str, Any]
+    model: LVM, output_name: str, params: dict[str, Any]
 ) -> Callable[[jax.Array], jax.Array]:
     """One output's latents -> prediction map, via predict_outputs so it cannot drift."""
 
     def predict(latents: jax.Array) -> jax.Array:
-        return model.predict_outputs(latents, params, names=[output_name])[output_name]
+        return model.predict_outputs(params, latents, names=[output_name])[output_name]
 
     return predict
 
@@ -271,7 +271,7 @@ def _latents_probe_points(
 
 
 def _linearize_outputs(
-    model: Lux, data: PolluxData, current_params: dict[str, Any]
+    model: LVM, data: PolluxData, current_params: dict[str, Any]
 ) -> dict[str, tuple[jax.Array, Any, Any]] | str:
     """Linearize every output that has data.
 
@@ -301,7 +301,7 @@ def _has_learnable_params(
     return bool(transform.get_expanded_priors(latent_size, data_size))
 
 
-def _latents_from_data(model: Lux, data: PolluxData) -> jax.Array | None:
+def _latents_from_data(model: LVM, data: PolluxData) -> jax.Array | None:
     """Observed latents, if some output reports them directly, else None.
 
     A model can observe its own latent vectors: the Cannon does, with labels behind a
@@ -337,7 +337,7 @@ def _latents_from_data(model: Lux, data: PolluxData) -> jax.Array | None:
 
 
 def _inverse_variance(
-    model: Lux, data: PolluxData, output_name: str, params: dict[str, Any]
+    model: LVM, data: PolluxData, output_name: str, params: dict[str, Any]
 ) -> jax.Array:
     """Inverse-variance weights for an output, as the *model* sees them.
 
@@ -404,7 +404,7 @@ def _get_regularization_from_prior(
 
 
 def _solve_latents_least_squares(
-    model: Lux,
+    model: LVM,
     data: PolluxData,
     current_params: dict[str, Any],
     latents_prior: dist.Distribution | None = None,
@@ -428,7 +428,7 @@ def _solve_latents_least_squares(
     Parameters
     ----------
     model
-        The Lux instance.
+        The LVM instance.
     data
         The data to fit.
     current_params
@@ -503,7 +503,7 @@ def _solve_latents_least_squares(
 
 
 def _solve_output_params_least_squares(
-    model: Lux,
+    model: LVM,
     data: PolluxData,
     output_name: str,
     params: dict[str, Any],
@@ -530,7 +530,7 @@ def _solve_output_params_least_squares(
     Parameters
     ----------
     model
-        The Lux instance.
+        The LVM instance.
     data
         The data to fit.
     output_name
@@ -610,7 +610,7 @@ def _solve_output_params_least_squares(
     )
 
 
-def _string_to_parameter_block(model: Lux, name: str) -> ParameterBlock:
+def _string_to_parameter_block(model: LVM, name: str) -> ParameterBlock:
     """A block that asks for a closed form; :func:`_resolve_blocks` decides if it gets
     one, once there are parameters to test the transform with."""
     if name != "latents" and name.split(":", maxsplit=1)[0] not in model.outputs:
@@ -623,7 +623,7 @@ def _string_to_parameter_block(model: Lux, name: str) -> ParameterBlock:
 
 
 def _least_squares_blocker(
-    model: Lux,
+    model: LVM,
     data: PolluxData,
     current_params: dict[str, Any],
     block: ParameterBlock,
@@ -648,7 +648,7 @@ def _least_squares_blocker(
 
 
 def _resolve_blocks(
-    model: Lux,
+    model: LVM,
     data: PolluxData,
     current_params: dict[str, Any],
     blocks: list[ParameterBlock],
@@ -683,7 +683,7 @@ def _resolve_blocks(
 
 
 def _build_initial_params_from_fixed(
-    model: Lux,
+    model: LVM,
     data: PolluxData,
     fixed_pars: dict[str, Any],
     blocks: list[ParameterBlock],
@@ -701,7 +701,7 @@ def _build_initial_params_from_fixed(
 
 
 def optimize_iterative(
-    model: Lux,
+    model: LVM,
     data: PolluxData,
     blocks: list[ParameterBlock] | list[str] | None = None,
     fixed_pars: dict[str, Any] | None = None,
@@ -752,7 +752,7 @@ def optimize_iterative(
     Parameters
     ----------
     model
-        The Lux to optimize.
+        The model to optimize.
     data
         The training data.
     blocks
@@ -869,7 +869,7 @@ def optimize_iterative(
     # Warn if any output has err_transform parameters that are neither being
     # optimized (in active blocks) nor intentionally held fixed (in fixed_pars)
     active_block_params = {b.params for b in _blocks}
-    for output_name, lux_output in model.outputs.items():
+    for output_name, output in model.outputs.items():
         err_key = f"{output_name}:err"
         err_is_fixed = (
             fixed_pars is not None
@@ -880,7 +880,7 @@ def optimize_iterative(
             err_key not in active_block_params
             and not err_is_fixed
             and _has_learnable_params(
-                lux_output.err_transform, model.latent_size, len(data)
+                output.err_transform, model.latent_size, len(data)
             )
         ):
             warnings.warn(
@@ -999,7 +999,7 @@ def optimize_iterative(
 
 
 def _optimize_block_least_squares(
-    model: Lux,
+    model: LVM,
     data: PolluxData,
     block: ParameterBlock,
     current_params: dict[str, Any],
@@ -1037,7 +1037,7 @@ def _optimize_block_least_squares(
 
 
 def _optimize_block_numpyro(
-    model: Lux,
+    model: LVM,
     data: PolluxData,
     block: ParameterBlock,
     current_params: dict[str, Any],
@@ -1053,7 +1053,7 @@ def _optimize_block_numpyro(
     Parameters
     ----------
     model
-        The Lux instance.
+        The LVM instance.
     data
         The training data.
     block
@@ -1144,7 +1144,7 @@ def _optimize_block_numpyro(
 
 
 def _build_fixed_pars(
-    model: Lux,
+    model: LVM,
     current_params: dict[str, Any],
     optimize_params: list[str],
 ) -> dict[str, Any]:
@@ -1172,13 +1172,13 @@ def _build_fixed_pars(
 
 
 def _compute_loss(
-    model: Lux,
+    model: LVM,
     data: PolluxData,
     params: dict[str, Any],
 ) -> float:
     """Compute the negative log likelihood loss."""
     latents = params["latents"]
-    predictions = model.predict_outputs(latents, params)
+    predictions = model.predict_outputs(params, latents)
 
     total_loss = 0.0
     for output_name in model.outputs:
