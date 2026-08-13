@@ -81,7 +81,7 @@ The best way to get started with `pollux` is to work through the tutorials:
 
 ```{toctree}
 :maxdepth: 1
-:caption: Guides
+:caption: Technical Notes
 
 linear-solves.md
 ```
