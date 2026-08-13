@@ -138,7 +138,7 @@ design matrix and offset.
 
 So the decomposition alone doesn't prove that a given output transform is linear -- we
 have to detect that another way. We test this numerically within Pollux, which isn't
-perfect but seems to work ok in practices.
+perfect but seems to work ok in practice.
 
 In a bit more detail, a function is affine if and only if it equals its own
 linearization for all $z$ (i.e. everywhere, not just at the point of linearization):
