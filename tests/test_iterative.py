@@ -20,6 +20,7 @@ from pollux.models.iterative import (
     _compute_loss,
     _get_regularization_from_prior,
     _inverse_variance,
+    _latents_from_data,
     _latents_probe_points,
     _least_squares_blocker,
     _linearize_latents,
@@ -691,6 +692,72 @@ class TestErrTransformParticipates:
         assert large > small
 
 
+class TestLatentsFromData:
+    """Latents an output reports directly beat a draw from the prior."""
+
+    @staticmethod
+    def _data(**outputs):
+        return plx.data.PolluxData(
+            **{
+                k: plx.data.OutputData(v, err=jnp.full(v.shape, 0.1))
+                for k, v in outputs.items()
+            }
+        )
+
+    def test_passthrough_output_supplies_the_latents(self):
+        model = plx.Lux(latent_size=3)
+        model.register_output("label", NoOpTransform())
+        labels = jnp.arange(24.0).reshape(8, 3)
+        data = self._data(label=labels)
+        assert jnp.array_equal(_latents_from_data(model, data), labels)
+
+    def test_a_transform_that_is_not_the_identity_is_not_used(self):
+        """The gate is tested, not assumed: PolyFeatureTransform has no parameters
+        either, but it is emphatically not a passthrough."""
+        model = plx.Lux(latent_size=3)
+        model.register_output("poly", PolyFeatureTransform(degree=2))
+        data = self._data(poly=jnp.ones((8, 10)))
+        assert _latents_from_data(model, data) is None
+
+    def test_a_transform_with_parameters_is_not_used(self):
+        """Its output only equals the latents for particular parameter values."""
+        model = plx.Lux(latent_size=3)
+        model.register_output("flux", LinearTransform(output_size=3))
+        data = self._data(flux=jnp.ones((8, 3)))
+        assert _latents_from_data(model, data) is None
+
+    def test_a_passthrough_with_no_data_is_not_used(self):
+        model = plx.Lux(latent_size=3)
+        model.register_output("label", NoOpTransform())
+        model.register_output("flux", LinearTransform(output_size=5))
+        data = self._data(flux=jnp.ones((8, 5)))
+        assert _latents_from_data(model, data) is None
+
+    def test_default_blocks_fit_the_outputs_first_when_seeded(self):
+        """Otherwise the first latents step chases prior-sampled output parameters
+        and throws the head start away."""
+        seeded = plx.Lux(latent_size=3)
+        seeded.register_output("label", NoOpTransform())
+        seeded.register_output("flux", LinearTransform(output_size=5))
+        data = self._data(label=jnp.ones((8, 3)), flux=jnp.ones((8, 5)))
+        result = seeded.optimize_iterative(
+            data, max_cycles=1, rng_key=jax.random.PRNGKey(0), progress=False
+        )
+        assert [b.name for b in result.blocks] == ["flux:data", "latents"]
+
+        # Without a passthrough output there is nothing to seed from, so the latents
+        # keep going first
+        plain = plx.Lux(latent_size=3)
+        plain.register_output("flux", LinearTransform(output_size=5))
+        result = plain.optimize_iterative(
+            self._data(flux=jnp.ones((8, 5))),
+            max_cycles=1,
+            rng_key=jax.random.PRNGKey(0),
+            progress=False,
+        )
+        assert [b.name for b in result.blocks] == ["latents", "flux:data"]
+
+
 class TestCannonAsLux:
     """The Cannon written as a Lux model: labels are the latents, flux is poly->linear."""
 
@@ -730,7 +797,9 @@ class TestCannonAsLux:
                 data, max_cycles=2, rng_key=jax.random.PRNGKey(0), progress=False
             )
 
-        assert [b.name for b in result.blocks] == ["latents", "flux:data"]
+        # No block for "label", and the coefficients are fitted to the seeded
+        # latents before the latents themselves are touched
+        assert [b.name for b in result.blocks] == ["flux:data", "latents"]
         # Polynomial features of the latents are not affine in them, so the labels
         # cannot be solved in closed form -- but the coefficients still can be
         assert {b.name: b.optimizer for b in result.blocks} == {

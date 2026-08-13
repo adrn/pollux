@@ -270,6 +270,41 @@ def _has_learnable_params(
     return bool(transform.get_expanded_priors(latent_size, data_size))
 
 
+def _latents_from_data(model: Lux, data: PolluxData) -> jax.Array | None:
+    """Observed latents, if some output reports them directly, else None.
+
+    A model can observe its own latent vectors: the Cannon does, with labels behind a
+    :class:`~pollux.models.transforms.NoOpTransform`. Where that is so, the observed
+    values are a far better starting point than a draw from the prior -- the latents
+    are then already at the answer, and the outputs that depend on them start from
+    something meaningful rather than from noise.
+
+    Whether an output is such a passthrough is *tested*, not assumed from its type: it
+    must carry no learnable parameters, and must hand back a probe unchanged.
+    """
+    probe = jax.random.normal(jax.random.PRNGKey(0), (len(data), model.latent_size))
+
+    for name, output in model.outputs.items():
+        transform = output.data_transform
+        if name not in data or _has_learnable_params(
+            transform, model.latent_size, len(data)
+        ):
+            continue
+
+        try:
+            passthrough = transform.apply(probe)
+        except (RuntimeError, TypeError, ValueError):
+            # Takes parameters after all, or cannot accept latents of this shape
+            continue
+
+        if passthrough.shape == probe.shape and jnp.allclose(passthrough, probe):
+            observed = data[name].data
+            if jnp.all(jnp.isfinite(observed)):
+                return observed
+
+    return None
+
+
 def _inverse_variance(
     model: Lux, data: PolluxData, output_name: str, params: dict[str, Any]
 ) -> jax.Array:
@@ -627,11 +662,14 @@ def _build_initial_params_from_fixed(
     fixed_pars: dict[str, Any],
     blocks: list[ParameterBlock],
 ) -> dict[str, Any]:
-    """Build initial params by merging fixed_pars with zero-initialized optimized params."""
+    """Build initial params by merging fixed_pars with initialized optimized params."""
     initial: dict[str, Any] = dict(fixed_pars)
 
     if "latents" not in initial and any("latents" in b.params_list for b in blocks):
-        initial["latents"] = jnp.zeros((len(data), model.latent_size))
+        observed = _latents_from_data(model, data)
+        initial["latents"] = (
+            jnp.zeros((len(data), model.latent_size)) if observed is None else observed
+        )
 
     return initial
 
@@ -672,6 +710,14 @@ def optimize_iterative(
     reason. ``result.blocks`` reports what each block actually ran with. See the
     "Closed-form solves, found by linearization" page in the documentation for how
     the decision is made and what it does and does not guarantee.
+
+    Initialization matters at least as much as any of that. Where an output reports
+    the latents directly -- labels behind a
+    :class:`~pollux.models.transforms.NoOpTransform`, as in the Cannon -- that
+    output's data is used to start the latents instead of a draw from the prior, and
+    the default block order flips so the outputs are fitted to those latents before
+    the latents are touched. Otherwise the first latents step spends itself chasing
+    prior-sampled output parameters. Pass ``initial_params`` to override.
 
     The default strategy alternates between:
     1. Optimize latents (with output parameters fixed)
@@ -753,13 +799,16 @@ def optimize_iterative(
     >>> test_opt_pars = result.params  # already contains fixed + optimized  # doctest: +SKIP
 
     """
-    # Default blocks: the latents, then every transform that has something to fit --
+    # Latents the data reports directly beat a draw from the prior, and also decide
+    # which end of the model it makes sense to start from
+    observed_latents = _latents_from_data(model, data)
+
+    # Default blocks: the latents and every transform that has something to fit --
     # error transforms included, since their parameters are as much a part of the
     # model as the data transforms'. A transform carrying no learnable parameters
     # (NoOpTransform, a bare PolyFeatureTransform) gets no block.
     if blocks is None:
-        blocks = ["latents"]
-        blocks += [
+        output_blocks = [
             f"{name}:{kind}"
             for name, output in model.outputs.items()
             for kind, transform in (
@@ -768,6 +817,15 @@ def optimize_iterative(
             )
             if _has_learnable_params(transform, model.latent_size, len(data))
         ]
+        # Start from whichever end the data pins down. With the latents already at
+        # their observed values, fit the outputs to them first: going the other way
+        # would spend the first latents step chasing prior-sampled output parameters
+        # and undo the head start.
+        blocks = (
+            [*output_blocks, "latents"]
+            if observed_latents is not None
+            else ["latents", *output_blocks]
+        )
 
     # String specs are converted per element rather than by sniffing blocks[0], so a
     # mixed list works.
@@ -822,6 +880,9 @@ def optimize_iterative(
             k: v[0] for k, v in packed_samples.items() if not k.startswith("obs:")
         }
         current_params = model.unpack_numpyro_pars(packed_samples)
+
+        if observed_latents is not None:
+            current_params["latents"] = observed_latents
     else:
         current_params = initial_params
 
