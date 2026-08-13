@@ -870,6 +870,8 @@ def optimize_iterative(
     # optimized (in active blocks) nor intentionally held fixed (in fixed_pars)
     active_block_params = {b.params for b in _blocks}
     for output_name, output in model.outputs.items():
+        if output_name not in data:
+            continue  # not part of this fit at all, so nothing to warn about
         err_key = f"{output_name}:err"
         err_is_fixed = (
             fixed_pars is not None
@@ -1097,11 +1099,15 @@ def _optimize_block_numpyro(
     # Pack fixed parameters for numpyro
     packed_fixed_pars = model.pack_numpyro_pars(fixed_pars, ignore_missing=True)
 
-    # Create partial model with fixed parameters (names=None: all outputs)
+    # Only model the outputs the data actually carries. Every closed-form path here
+    # already skips absent outputs, and an SVI block has to agree with them: applying a
+    # trained model to data holding only some of its outputs -- inferring labels from
+    # spectra alone, say -- otherwise dies in setup_numpyro looking for the rest.
     partial_model = partial(
         model.default_numpyro_model,
         fixed_pars=packed_fixed_pars,
         latents_prior=latents_prior,
+        names=[name for name in model.outputs if name in data],
     )
 
     # Run SVI optimization, warm-started from where the last cycle left this block.

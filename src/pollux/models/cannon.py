@@ -1,46 +1,36 @@
 """The Cannon: a data-driven model for stellar spectra.
 
-The Cannon (Ness et al. 2015) learns a polynomial relationship between stellar
-labels (like Teff, logg, [Fe/H]) and spectra. Given reference stars with known
-labels and spectra, it fits a per-pixel polynomial model that can then predict
-spectra for new labels or infer labels from new spectra.
+The Cannon (Ness et al. 2015) learns a polynomial relationship between stellar labels
+(like Teff, logg, [Fe/H]) and spectra. Given reference stars with known labels and
+spectra, it fits a per-pixel polynomial model that can then predict spectra for new
+labels, or infer labels for new spectra.
 
-This implementation provides:
-- A simple `fit()`/`predict()` interface for the traditional Cannon workflow
-- Integration with the pollux transform system via `PolyFeatureTransform` + `LinearTransform`
+In this package the Cannon is an architecture built on :class:`~pollux.models.LVM`: the
+latent vectors *are* the stellar labels, observed through a
+:class:`~pollux.models.transforms.NoOpTransform`, and the spectrum is generated from
+them by a polynomial feature expansion followed by a linear map. Training and label
+inference are then the framework's ordinary fitting methods, and the per-pixel
+coefficient solve is the closed-form weighted least squares that
+:func:`~pollux.models.optimize_iterative` already recognizes.
 
 References
 ----------
 Ness, M., Hogg, D. W., Rix, H.-W., Ho, A. Y. Q., & Zasowski, G. 2015, ApJ, 808, 16
-
-Examples
---------
->>> import jax.numpy as jnp
->>> from pollux.models import Cannon
-
-Create and fit a Cannon model:
-
->>> labels = jnp.array([[5000., 4.0, -0.5], [5500., 3.5, 0.0]])  # doctest: +SKIP
->>> spectra = jnp.array([[1.0, 2.0], [3.0, 4.0]])  # doctest: +SKIP
->>> cannon = Cannon(label_size=3, output_size=2, poly_degree=2)  # doctest: +SKIP
->>> cannon = cannon.fit(labels, spectra)  # doctest: +SKIP
-
-Predict spectra for new labels:
-
->>> new_labels = jnp.array([[5200., 3.8, -0.2]])  # doctest: +SKIP
->>> predicted = cannon.predict(new_labels)  # doctest: +SKIP
 """
 
 from __future__ import annotations
 
-import equinox as eqx
-import jax
-import jax.numpy as jnp
+from collections.abc import Mapping, Sequence
 
-from .._linalg import weighted_least_squares
+import jax
+import numpyro.distributions as dist
+
+from .lvm import LVM, select_outputs
 from .transforms import (
     LinearTransform,
+    NoOpTransform,
     PolyFeatureTransform,
+    ScatterTransform,
     TransformSequence,
     _compute_n_poly_features,
     polynomial_features,
@@ -49,72 +39,186 @@ from .transforms import (
 __all__ = ["Cannon"]
 
 
-class Cannon(eqx.Module):
+class Cannon(LVM):
     """The Cannon: a data-driven model for stellar spectra.
 
-    Learns a polynomial relationship between stellar labels and spectra (or other
-    outputs). For each output pixel, the model fits:
+    For each output element (e.g. each spectral pixel) the model is
 
-        output_λ = Σ_j θ_{λj} · feature_j(labels)
+    .. math::
 
-    where the features are polynomial combinations of the labels up to the
-    specified degree.
+        y_\\lambda = \\sum_j \\theta_{\\lambda j} \\, f_j(\\ell)
+
+    where :math:`\\ell` are the stellar labels and :math:`f_j` are the polynomial
+    combinations of them up to ``poly_degree``. The coefficients :math:`\\theta` appear
+    in the parameter dictionary as the ``"A"`` matrix of the output's linear transform.
+
+    Two outputs are registered: the labels, observed directly through a
+    :class:`~pollux.models.transforms.NoOpTransform` (which is what makes the latents
+    the labels), and the spectrum, generated through a
+    :class:`~pollux.models.transforms.PolyFeatureTransform` followed by a
+    :class:`~pollux.models.transforms.LinearTransform`.
 
     Parameters
     ----------
     label_size
-        Number of input labels (e.g., 3 for Teff, logg, [Fe/H]).
+        Number of stellar labels (e.g. 3 for Teff, logg, [Fe/H]). This is also the
+        model's ``latent_size``.
     output_size
-        Number of output dimensions (e.g., number of spectral pixels).
+        Number of output elements (e.g. the number of spectral pixels).
     poly_degree
-        Maximum polynomial degree for feature expansion. Default is 2.
+        Maximum polynomial degree of the label feature expansion. Default is 2.
     include_bias
-        Whether to include a bias term in the polynomial features. Default is True.
+        Whether the polynomial features include a constant term. Default is True.
+    label_name, output_name
+        The output names to register, which should match the keys of the
+        :class:`~pollux.data.PolluxData` you intend to fit.
+    intrinsic_scatter
+        Which outputs get a fitted per-element scatter added in quadrature to their
+        reported errors: ``True`` for both (default), ``False`` for neither, a sequence
+        of output names, or a mapping from output name to the scale of the
+        ``HalfNormal`` prior on the scatter. The scatter on the spectrum is the
+        Cannon's per-pixel :math:`s_\\lambda`.
+    coeff_prior
+        Prior on the polynomial coefficients. Regularization enters here: a narrower
+        prior shrinks the coefficients harder, and
+        :func:`~pollux.models.optimize_iterative` turns it into the ridge term of the
+        closed-form solve. Defaults to the standard unit Gaussian.
 
     Attributes
     ----------
-    coeffs
-        Fitted coefficients, shape ``(output_size, n_features)``. None before fitting.
-    scatter
-        Fitted per-pixel scatter, shape ``(output_size,)``. None before fitting.
     n_features
-        Number of polynomial features (computed from label_size and poly_degree).
+        Number of polynomial features, computed from ``label_size``, ``poly_degree``
+        and ``include_bias``.
 
     Examples
     --------
-    >>> import jax.numpy as jnp
-    >>> from pollux.models import Cannon
+    A Cannon for 3 labels and 100 spectral pixels:
 
-    Create a Cannon model for 3 labels and 100 spectral pixels:
-
-    >>> cannon = Cannon(label_size=3, output_size=100, poly_degree=2)
+    >>> import pollux as plx
+    >>> cannon = plx.Cannon(label_size=3, output_size=100, poly_degree=2)
     >>> cannon.n_features  # 1 + 3 + 6 = 10 for degree 2 with 3 labels
     10
+    >>> sorted(cannon.outputs)
+    ['flux', 'label']
+    >>> cannon.latent_size  # the latents are the labels
+    3
 
-    The number of features follows the formula for combinations with replacement:
-    C(n_labels + degree, degree) = C(3 + 2, 2) = 10
+    The feature count is the number of combinations with replacement,
+    ``C(n_labels + degree, degree) = C(3 + 2, 2) = 10``.
+
+    Training is the classic Cannon step: pin the latents to the observed labels and
+    solve the coefficients exactly, which costs one linear solve.
+
+    >>> res = cannon.optimize_iterative(  # doctest: +SKIP
+    ...     train_data,
+    ...     blocks=["flux:data"],
+    ...     fixed_pars={"latents": train_data["label"].data},
+    ...     max_cycles=1,
+    ... )
+
+    From there you can let the latents and the scatters float too, by running the
+    default blocks from that starting point with ``initial_params=res.params``.
+
+    To infer labels for stars with only a spectrum, optimize the latents with the
+    trained output parameters held fixed:
+
+    >>> test_res = cannon.optimize_iterative(  # doctest: +SKIP
+    ...     test_data,
+    ...     blocks=["latents"],
+    ...     fixed_pars=cannon.output_pars(res.params),
+    ... )
+    >>> labels = test_res.params["latents"]  # doctest: +SKIP
+
+    A Cannon is an :class:`~pollux.models.LVM`, so it is fitted and used the same way:
+
+    >>> isinstance(cannon, plx.LVM)
+    True
+
+    Notes
+    -----
+    Solving for the labels is not a closed-form problem here, and
+    :func:`~pollux.models.optimize_iterative` will say so: with ``poly_degree`` above 1
+    the spectrum is not affine in the labels, so any block containing ``"latents"`` is
+    downgraded from a linear solve to gradient descent. That warning is expected for a
+    Cannon, not a sign of a misspecified model. Fitting the *coefficients* stays exact,
+    because they enter linearly.
+
+    The same non-convexity means label inference has more than one local optimum. Most
+    stars land in the right one from a cold start, but a minority will not, so pass
+    ``initial_params`` with a reasonable first guess at the labels when accuracy for
+    every star matters.
     """
 
-    label_size: int
-    output_size: int
     poly_degree: int = 2
     include_bias: bool = True
 
-    # Fitted parameters (None before fitting)
-    coeffs: jax.Array | None = eqx.field(default=None, repr=False)
-    scatter: jax.Array | None = eqx.field(default=None, repr=False)
+    def __init__(
+        self,
+        label_size: int,
+        output_size: int,
+        poly_degree: int = 2,
+        include_bias: bool = True,
+        label_name: str = "label",
+        output_name: str = "flux",
+        intrinsic_scatter: bool | Sequence[str] | Mapping[str, float] = True,
+        coeff_prior: dist.Distribution | None = None,
+    ) -> None:
+        super().__init__(latent_size=label_size)
+        self.poly_degree = poly_degree
+        self.include_bias = include_bias
+
+        if label_name == output_name:
+            msg = (
+                f"label_name and output_name are both '{label_name}', but the Cannon "
+                "registers them as two separate outputs."
+            )
+            raise ValueError(msg)
+
+        scatter_scales = select_outputs(
+            intrinsic_scatter, [label_name, output_name], "intrinsic_scatter"
+        )
+
+        def scatter_for(name: str, size: int) -> ScatterTransform | None:
+            if name not in scatter_scales:
+                return None
+            scale = scatter_scales[name]
+            # No scale given means keep the transform's own default prior
+            if scale is None:
+                return ScatterTransform(output_size=size)
+            return ScatterTransform(
+                output_size=size, priors={"s": dist.HalfNormal(scale)}
+            )
+
+        # The labels are the latents, observed directly. optimize_iterative detects
+        # this passthrough and warm-starts the latents from the observed labels.
+        self.register_output(
+            label_name,
+            NoOpTransform(output_size=label_size),
+            err_transform=scatter_for(label_name, label_size),
+        )
+
+        linear = (
+            LinearTransform(output_size=output_size)
+            if coeff_prior is None
+            else LinearTransform(output_size=output_size, priors={"A": coeff_prior})
+        )
+        self.register_output(
+            output_name,
+            TransformSequence(
+                transforms=(
+                    PolyFeatureTransform(degree=poly_degree, include_bias=include_bias),
+                    linear,
+                )
+            ),
+            err_transform=scatter_for(output_name, output_size),
+        )
 
     @property
     def n_features(self) -> int:
         """Number of polynomial features."""
         return _compute_n_poly_features(
-            self.label_size, self.poly_degree, self.include_bias
+            self.latent_size, self.poly_degree, self.include_bias
         )
-
-    @property
-    def is_fitted(self) -> bool:
-        """Whether the model has been fitted."""
-        return self.coeffs is not None
 
     def get_features(self, labels: jax.Array) -> jax.Array:
         """Expand labels into polynomial features.
@@ -131,8 +235,10 @@ class Cannon(eqx.Module):
 
         Examples
         --------
+        >>> import jax.numpy as jnp
+        >>> import pollux as plx
         >>> labels = jnp.array([[1.0, 2.0]])  # 1 star, 2 labels
-        >>> cannon = Cannon(label_size=2, output_size=10, poly_degree=2)
+        >>> cannon = plx.Cannon(label_size=2, output_size=10, poly_degree=2)
         >>> features = cannon.get_features(labels)
         >>> features.shape
         (1, 6)
@@ -140,218 +246,3 @@ class Cannon(eqx.Module):
         Array([[1., 1., 2., 1., 2., 4.]], dtype=float...)
         """
         return polynomial_features(labels, self.poly_degree, self.include_bias)
-
-    def fit(
-        self,
-        labels: jax.Array,
-        output: jax.Array,
-        output_ivar: jax.Array | None = None,
-        regularization: float = 0.0,
-    ) -> Cannon:
-        """Fit the Cannon using weighted least squares.
-
-        For each output pixel, solves the weighted least squares problem:
-
-            argmin_θ Σ_i w_i (y_i - f_i @ θ)^2 + λ ||θ||^2
-
-        Parameters
-        ----------
-        labels
-            Training stellar labels, shape ``(n_stars, label_size)``.
-        output
-            Training output (e.g., spectra), shape ``(n_stars, output_size)``.
-        output_ivar
-            Inverse variance of the output. Shape ``(n_stars, output_size)``.
-            If None, uniform weights (1.0) are used.
-        regularization
-            L2 regularization strength (λ). Default is 0.0 (no regularization).
-            Larger values shrink coefficients toward zero.
-
-        Returns
-        -------
-        Cannon
-            A new Cannon instance with fitted coefficients and scatter.
-
-        Notes
-        -----
-        This method uses JAX's vmap for efficient vectorized fitting across all
-        pixels. The solution for each pixel is:
-
-            θ = (F.T @ W @ F + λI)^{-1} @ F.T @ W @ y
-
-        where F is the design matrix (polynomial features), W is a diagonal
-        weight matrix, and y is the output vector.
-
-        Examples
-        --------
-        >>> labels = jnp.array([[5000., 4.0], [5500., 3.5], [6000., 4.5]])
-        >>> spectra = jnp.array([[1.0, 2.0], [1.5, 2.5], [2.0, 3.0]])
-        >>> cannon = Cannon(label_size=2, output_size=2, poly_degree=1)
-        >>> cannon = cannon.fit(labels, spectra)
-        >>> cannon.is_fitted
-        True
-        """
-        n_stars = labels.shape[0]
-
-        # Validate shapes
-        if labels.shape[1] != self.label_size:
-            msg = (
-                f"Expected labels with {self.label_size} columns, got {labels.shape[1]}"
-            )
-            raise ValueError(msg)
-        if output.shape[0] != n_stars:
-            msg = f"labels has {n_stars} stars but output has {output.shape[0]} stars"
-            raise ValueError(msg)
-        if output.shape[1] != self.output_size:
-            msg = (
-                f"Expected output with {self.output_size} columns, "
-                f"got {output.shape[1]}"
-            )
-            raise ValueError(msg)
-
-        # Expand labels to polynomial features
-        features = self.get_features(labels)  # (n_stars, n_features)
-
-        if output_ivar is None:
-            output_ivar = jnp.ones_like(output)
-
-        # Regularization matrix
-        reg_matrix = regularization * jnp.eye(self.n_features)
-
-        def fit_single_pixel(y: jax.Array, w: jax.Array) -> tuple[jax.Array, jax.Array]:
-            """Fit a single pixel using weighted least squares."""
-            theta = weighted_least_squares(features, y, w, reg_matrix)
-
-            # Compute scatter (weighted RMS of residuals)
-            residuals = y - features @ theta
-            scatter_val = jnp.sqrt(jnp.sum(w * residuals**2) / jnp.sum(w))
-
-            return theta, scatter_val
-
-        # Vectorize over pixels, so transpose to put pixels on the leading axis
-        coeffs, scatter = jax.vmap(fit_single_pixel)(output.T, output_ivar.T)
-
-        # coeffs shape: (output_size, n_features)
-        # scatter shape: (output_size,)
-
-        new_self: Cannon = eqx.tree_at(
-            lambda c: (c.coeffs, c.scatter),
-            self,
-            (coeffs, scatter),
-            is_leaf=lambda x: x is None,
-        )
-        return new_self
-
-    def predict(self, labels: jax.Array) -> jax.Array:
-        """Predict output for given labels.
-
-        Parameters
-        ----------
-        labels
-            Stellar labels, shape ``(n_stars, label_size)``.
-
-        Returns
-        -------
-        array
-            Predicted output, shape ``(n_stars, output_size)``.
-
-        Raises
-        ------
-        RuntimeError
-            If the model has not been fitted.
-
-        Examples
-        --------
-        >>> cannon = cannon.fit(train_labels, train_spectra)  # doctest: +SKIP
-        >>> predicted = cannon.predict(test_labels)  # doctest: +SKIP
-        """
-        if not self.is_fitted:
-            msg = "Cannon must be fitted before prediction. Call fit() first."
-            raise RuntimeError(msg)
-
-        if labels.shape[1] != self.label_size:
-            msg = (
-                f"Expected labels with {self.label_size} columns, got {labels.shape[1]}"
-            )
-            raise ValueError(msg)
-
-        features = self.get_features(labels)  # (n_stars, n_features)
-        assert self.coeffs is not None  # Guaranteed by is_fitted check above
-        return features @ self.coeffs.T  # (n_stars, output_size)
-
-    def to_transform_sequence(self) -> TransformSequence:
-        """Convert to a TransformSequence for use with LVM.
-
-        Returns a TransformSequence that can be used with LVM for Bayesian
-        inference or more complex models. The sequence consists of:
-
-        1. PolyFeatureTransform: labels → polynomial features (no learnable params)
-        2. LinearTransform: features → output (learnable A matrix)
-
-        Returns
-        -------
-        TransformSequence
-            A transform sequence that can be registered with LVM.
-
-        Notes
-        -----
-        This method creates a new TransformSequence where the LinearTransform's
-        A matrix will be sampled from priors during numpyro inference. If the
-        Cannon has been fitted, you can use the fitted coefficients as initial
-        values or fixed parameters.
-
-        Examples
-        --------
-        >>> import pollux as plx
-        >>> cannon = Cannon(label_size=3, output_size=128, poly_degree=2)
-        >>> transform = cannon.to_transform_sequence()
-        >>> model = plx.LVM(latent_size=3)  # latent_size = label_size
-        >>> model.register_output("flux", transform)
-        """
-        return TransformSequence(
-            transforms=(
-                PolyFeatureTransform(
-                    degree=self.poly_degree, include_bias=self.include_bias
-                ),
-                LinearTransform(output_size=self.output_size),
-            )
-        )
-
-    def get_coeffs_as_transform_pars(
-        self,
-    ) -> dict[str, list[dict[str, jax.Array | None]]]:
-        """Get fitted coefficients in transform parameter format.
-
-        Returns the fitted coefficients in the format expected by
-        TransformSequence/LVM. This allows using Cannon-fitted parameters
-        as initial values or fixed parameters in LVM.
-
-        Returns
-        -------
-        dict
-            Parameter dictionary in the format:
-            ``{"data": [{"A": coeffs.T}]}``
-
-            The coefficients are transposed because LinearTransform expects
-            shape ``(output_size, latent_size)`` where latent_size = n_features.
-
-        Raises
-        ------
-        RuntimeError
-            If the model has not been fitted.
-
-        Examples
-        --------
-        >>> cannon = cannon.fit(labels, spectra)  # doctest: +SKIP
-        >>> pars = cannon.get_coeffs_as_transform_pars()  # doctest: +SKIP
-        >>> # Use with LVM
-        >>> model.predict_outputs(labels, {"flux": pars})  # doctest: +SKIP
-        """
-        if not self.is_fitted:
-            msg = "Cannon must be fitted to get coefficients."
-            raise RuntimeError(msg)
-
-        # PolyFeatureTransform has no parameters (index 0)
-        # LinearTransform has A matrix (index 1)
-        # TransformSequence expects a list of dicts
-        return {"data": [{}, {"A": self.coeffs}]}
