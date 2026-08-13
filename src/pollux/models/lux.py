@@ -240,7 +240,10 @@ class Lux(eqx.Module):
         data_pars = {}
         direct_format = False
         for name in names:
-            output_pars = pars[name]
+            # A transform with no learnable parameters -- NoOpTransform,
+            # PolyFeatureTransform -- never appears in a parameter dict, so a missing
+            # entry means "this output has no parameters", not "the caller forgot one"
+            output_pars = pars.get(name, {})
             if not isinstance(output_pars, dict):
                 msg = (
                     f"Expected dict for parameters of output '{name}', "
@@ -248,7 +251,7 @@ class Lux(eqx.Module):
                 )
                 raise TypeError(msg)
 
-            if "data" in output_pars or "err" in output_pars:
+            if not output_pars or "data" in output_pars or "err" in output_pars:
                 data_pars[name] = output_pars.get("data", {})
             else:
                 direct_format = True
@@ -532,11 +535,13 @@ class Lux(eqx.Module):
     ) -> "IterativeOptimizationResult":
         """Optimize using iterative parameter block coordinate descent.
 
-        For models with purely linear outputs, this exploits the linear structure
-        for faster convergence: each sub-problem is solved exactly using weighted
-        least squares. The default strategy alternates between optimizing the
-        latents (with output parameters fixed) and optimizing each output's
-        parameters (with the latents fixed).
+        Wherever a sub-problem turns out to be quadratic, this solves it exactly with
+        weighted least squares instead of running SVI on it. Whether it is quadratic
+        is established by linearizing the transform, so composed models count too --
+        a slice of the latents feeding a linear branch, polynomial features feeding a
+        linear layer, a linear map plus a fixed offset. The default strategy
+        alternates between optimizing the latents (with output parameters fixed) and
+        optimizing each output's parameters (with the latents fixed).
 
         See :func:`pollux.models.optimize_iterative` for the full description of
         the parameters and of the returned result. Note that this method defaults

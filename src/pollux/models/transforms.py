@@ -915,7 +915,7 @@ class AffineTransform(AbstractSingleTransform):
     shapes: ParamShapesT = ImmutableMap(
         {
             "A": ("output_size", "latent_size"),
-            "b": ("output_size", "one"),
+            "b": ("output_size",),
         }
     )
 
@@ -949,7 +949,7 @@ class QuadraticTransform(AbstractSingleTransform):
         {
             "Q": ("output_size", "latent_size", "latent_size"),
             "A": ("output_size", "latent_size"),
-            "b": ("output_size", "one"),
+            "b": ("output_size",),
         }
     )
 

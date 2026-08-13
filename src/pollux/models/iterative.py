@@ -13,7 +13,8 @@ __all__ = [
 ]
 
 import warnings
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace
 from functools import partial
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -23,24 +24,21 @@ import numpyro
 import numpyro.distributions as dist
 from numpyro.infer import SVI, Predictive, Trace_ELBO
 from numpyro.infer.autoguide import AutoDelta
+from numpyro.infer.initialization import init_to_value
 from tqdm.auto import tqdm
-from typing_extensions import TypeIs
 
 from .._linalg import weighted_least_squares
-from ..data import OutputData, PolluxData
+from ..data import PolluxData
+from ..exceptions import PolluxLinearizationWarning
 from .transforms import (
     AbstractTransform,
     AffineTransform,
     LinearTransform,
-    OffsetTransform,
     TransformSequence,
 )
 
 if TYPE_CHECKING:
     from .lux import Lux
-
-#: Transforms whose least squares sub-problem has a closed-form solution
-type LinearTransformT = LinearTransform | AffineTransform | OffsetTransform
 
 
 @dataclass
@@ -123,6 +121,10 @@ class IterativeOptimizationResult:
         Number of full cycles completed.
     converged
         Whether the optimization converged according to tolerance.
+    blocks
+        The parameter blocks as they were actually run, after checking which ones
+        could use a closed-form solve. Inspect ``block.optimizer`` to see what each
+        block got: ``"least_squares"`` for the exact solve, anything else for SVI.
 
     """
 
@@ -130,36 +132,237 @@ class IterativeOptimizationResult:
     losses_per_cycle: list[float]
     n_cycles: int
     converged: bool
+    blocks: list[ParameterBlock] = field(default_factory=list)
 
 
-def _is_linear_transform(transform: Any) -> TypeIs[LinearTransformT]:
-    """Check if a transform is linear (amenable to least squares).
+def _split_param_layer(
+    transform: AbstractTransform,
+) -> tuple[TransformSequence | None, LinearTransform | AffineTransform] | None:
+    """Split a transform into a parameter-free prefix and a trailing linear layer.
 
-    Note: TransformSequence is not supported for iterative optimization,
-    even if all component transforms are linear.
+    The per-output-dimension least squares solve needs two things: the features
+    arriving at the linear layer, and the layer itself. Running the prefix forward
+    supplies the features, so it does not matter what the prefix *is* -- a latent
+    slice, polynomial features, anything -- as long as it carries no parameters of
+    its own to solve for.
+
+    Returns ``(prefix, layer)``, with ``prefix`` None when the transform is already
+    a bare linear layer, or None when the transform cannot be solved this way.
     """
-    return isinstance(transform, (LinearTransform, AffineTransform, OffsetTransform))
+    if isinstance(transform, (LinearTransform, AffineTransform)):
+        return None, transform
+
+    if not isinstance(transform, TransformSequence):
+        return None
+
+    *head, last = transform.transforms
+    if not head or not isinstance(last, (LinearTransform, AffineTransform)):
+        return None
+
+    # Parameters anywhere but the last layer would be silently left unoptimized
+    if any(transform.names_nested[:-1]):
+        return None
+
+    return TransformSequence(tuple(head)), last
 
 
-def _check_least_squares_transform(
-    transform: AbstractTransform, output_name: str
-) -> LinearTransformT:
-    """Raise if a transform can't be handled by the least squares solvers."""
-    if isinstance(transform, TransformSequence):
-        msg = (
-            f"Output '{output_name}' uses a TransformSequence; "
-            "iterative least squares only supports single transforms"
+#: Relative tolerance for deciding that a prediction map is affine in the latents.
+#: A composition of linear primitives reproduces its own linearization bitwise, while
+#: a nonlinearity contributing 1e-4 of the signal shows up at ~1e-4, so anything in
+#: 1e-6..1e-5 separates the two by orders of magnitude.
+_AFFINE_RTOL = 1e-6
+
+
+def _rows_are_independent(jvp: Callable[[jax.Array], jax.Array], shape: tuple) -> bool:
+    """Whether each object's prediction depends only on its own latents.
+
+    The per-object normal equations assume a block-diagonal Jacobian, one block per
+    object. A transform written with ``vmap=False`` can quietly break that:
+    ``z - z.mean(axis=0)`` is perfectly affine and passes every affineness probe, but
+    couples every object to every other, and the solve would then return confident
+    nonsense rather than refusing.
+
+    Push a tangent supported on every other object through the Jacobian. If the rows
+    are independent the response is supported on the same rows; any global reduction
+    -- a mean, a sum, a normalization -- leaks outside them and is caught. A coupling
+    between two objects that happen to fall on the same side of the split would slip
+    through, but transforms couple objects globally or not at all in practice.
+    """
+    inside = (jnp.arange(shape[0]) % 2 == 0)[:, None]
+    tangent = jnp.where(inside, jax.random.normal(jax.random.PRNGKey(2), shape), 0.0)
+    response = jvp(tangent)
+    leaked = jnp.abs(jnp.where(inside, 0.0, response)).max()
+    return bool(leaked <= _AFFINE_RTOL * jnp.abs(response).max())
+
+
+def _linearize_latents(
+    f: Callable[[jax.Array], jax.Array],
+    z0: jax.Array,
+    probes: tuple[jax.Array, ...],
+) -> tuple[jax.Array, Any, Any] | str:
+    """Linearize a prediction map in the latents, or say why it cannot be used.
+
+    Returns ``(c, jvp, vjpT)`` with ``f(z) == jvp(z) + c``, where ``jvp`` applies the
+    effective design matrix ``J`` and ``vjpT`` applies its transpose, or a string
+    describing why this map is not usable for a closed-form solve. ``J`` is never
+    materialized: for spectra-sized outputs it would be ``latent_size`` copies of the
+    data, while ``jvp``/``vjpT`` keep every temporary the size of one output array.
+
+    :func:`jax.linearize` never fails -- handed a nonlinear function it returns the
+    tangent plane, which would be silently wrong to use as a design matrix. So the
+    verdict comes from testing the defining property, ``f(z) == f(0) + J z``, at the
+    given probe points. That is one-sided: an affine map reproduces its linearization
+    exactly and can never be wrongly refused, while a nonlinear one could in principle
+    slip through by touching its tangent plane exactly where we look. See the
+    "Closed-form solves, found by linearization" page in the documentation for why
+    that is unlikely enough to rely on.
+
+    Affine is necessary but not sufficient: the solve also needs each object's
+    prediction to depend only on its own latents, which :func:`_rows_are_independent`
+    checks. Being affine says nothing about that -- centering the latents across
+    objects is affine and violates it.
+
+    Note that both verdicts are properties of ``f``, which has the *current*
+    parameters bound into it. A transform can be affine in the latents at one set of
+    parameter values and not at another, so neither answer is settled for good.
+    """
+    c, jvp = jax.linearize(f, z0)
+
+    for probe in probes:
+        pred = f(probe)
+        residual = jnp.abs(pred - (c + jvp(probe))).max()
+        if residual > _AFFINE_RTOL * jnp.abs(pred).max():
+            return "is not affine in the latents"
+
+    if not _rows_are_independent(jvp, z0.shape):
+        return "couples objects to one another, so there is no per-object solve to make"
+
+    return c, jvp, jax.linear_transpose(jvp, z0)
+
+
+def _output_predict_fn(
+    model: Lux, output_name: str, params: dict[str, Any]
+) -> Callable[[jax.Array], jax.Array]:
+    """One output's latents -> prediction map, via predict_outputs so it cannot drift."""
+
+    def predict(latents: jax.Array) -> jax.Array:
+        return model.predict_outputs(latents, params, names=[output_name])[output_name]
+
+    return predict
+
+
+def _latents_probe_points(
+    latents: jax.Array | None, shape: tuple[int, ...]
+) -> tuple[jax.Array, ...]:
+    """Points to test affineness at, scaled to the latents we are actually fitting.
+
+    Each array is ``(n_data, latent_size)``, so it is ``n_data`` independent probe
+    points rather than one -- the transform is applied per object. The second is an
+    order of magnitude further out: a smooth nonlinearity's deviation from its tangent
+    plane grows quadratically with amplitude, so it is ~100x more sensitive to a map
+    that is only slightly non-affine. Fixed keys, so the verdict does not depend on
+    when it is asked.
+    """
+    scale = 1.0 if latents is None else jnp.maximum(jnp.abs(latents).max(), 1.0)
+    return (
+        scale * jax.random.normal(jax.random.PRNGKey(0), shape),
+        10 * scale * jax.random.normal(jax.random.PRNGKey(1), shape),
+    )
+
+
+def _linearize_outputs(
+    model: Lux, data: PolluxData, current_params: dict[str, Any]
+) -> dict[str, tuple[jax.Array, Any, Any]] | str:
+    """Linearize every output that has data.
+
+    Returns ``{output_name: (c, jvp, vjpT)}``, or a sentence naming the first output
+    that cannot be used for a closed-form latent solve and saying why.
+    """
+    z0 = jnp.zeros((len(data), model.latent_size))
+    probes = _latents_probe_points(current_params.get("latents"), z0.shape)
+
+    linearized = {}
+    for output_name in model.outputs:
+        if output_name not in data:
+            continue
+        result = _linearize_latents(
+            _output_predict_fn(model, output_name, current_params), z0, probes
         )
-        raise ValueError(msg)
-    if not _is_linear_transform(transform):
-        msg = f"Output '{output_name}' has a non-linear transform; cannot use least squares"
-        raise ValueError(msg)
-    return transform
+        if isinstance(result, str):
+            return f"output '{output_name}' {result}"
+        linearized[output_name] = result
+    return linearized
 
 
-def _inverse_variance(output_data: OutputData) -> jax.Array:
-    """Inverse-variance weights for an output, or ones where errors are absent."""
-    err = output_data.err
+def _has_learnable_params(
+    transform: AbstractTransform, latent_size: int, data_size: int
+) -> bool:
+    """Whether a transform contributes any parameters to sample or solve for."""
+    return bool(transform.get_expanded_priors(latent_size, data_size))
+
+
+def _latents_from_data(model: Lux, data: PolluxData) -> jax.Array | None:
+    """Observed latents, if some output reports them directly, else None.
+
+    A model can observe its own latent vectors: the Cannon does, with labels behind a
+    :class:`~pollux.models.transforms.NoOpTransform`. Where that is so, the observed
+    values are a far better starting point than a draw from the prior -- the latents
+    are then already at the answer, and the outputs that depend on them start from
+    something meaningful rather than from noise.
+
+    Whether an output is such a passthrough is *tested*, not assumed from its type: it
+    must carry no learnable parameters, and must hand back a probe unchanged.
+    """
+    probe = jax.random.normal(jax.random.PRNGKey(0), (len(data), model.latent_size))
+
+    for name, output in model.outputs.items():
+        transform = output.data_transform
+        if name not in data or _has_learnable_params(
+            transform, model.latent_size, len(data)
+        ):
+            continue
+
+        try:
+            passthrough = transform.apply(probe)
+        except (RuntimeError, TypeError, ValueError):
+            # Takes parameters after all, or cannot accept latents of this shape
+            continue
+
+        if passthrough.shape == probe.shape and jnp.allclose(passthrough, probe):
+            observed = data[name].data
+            if jnp.all(jnp.isfinite(observed)):
+                return observed
+
+    return None
+
+
+def _inverse_variance(
+    model: Lux, data: PolluxData, output_name: str, params: dict[str, Any]
+) -> jax.Array:
+    """Inverse-variance weights for an output, as the *model* sees them.
+
+    The err_transform is part of the model -- intrinsic scatter added in quadrature,
+    a scale factor on reported uncertainties -- so the weights have to come through
+    it rather than from the raw error column. Weighting by the raw errors while
+    another block fits the scatter would leave the two blocks minimizing different
+    objectives, and block coordinate descent only converges when they share one.
+
+    Falls back to ones where no uncertainties were given at all.
+    """
+    output_data = data[output_name]
+    err_pars = params.get(output_name, {}).get("err", {})
+    err_transform = model.outputs[output_name].err_transform
+    try:
+        err = (
+            err_transform.apply(output_data.err, **err_pars)
+            if isinstance(err_pars, dict)
+            else err_transform.apply(output_data.err, *err_pars)
+        )
+    except RuntimeError:
+        # The err parameters are not available yet -- e.g. initial_params supplied
+        # without them -- so the reported uncertainties are the best guess to hand
+        err = output_data.err
+
     if jnp.all(err <= 0):
         return jnp.ones_like(output_data.data)
     return 1.0 / err**2
@@ -205,18 +408,22 @@ def _solve_latents_least_squares(
     data: PolluxData,
     current_params: dict[str, Any],
     latents_prior: dist.Distribution | None = None,
-) -> jax.Array:
+) -> jax.Array | str:
     """Solve for optimal latents using weighted least squares.
 
-    For linear models: y = A @ z, we solve for z using the normal equations:
-        z = (A^T W A + λI)^{-1} A^T W y
+    Each output contributes a prediction ``y ≈ J z + c``, where ``J`` is whatever
+    effective design matrix the output's transform amounts to. Summing the outputs'
+    contributions gives one normal-equation system per object::
 
-    When there are multiple outputs, we combine them into a block-diagonal system:
-        [y1]   [A1  0 ]       [A1^T W1 A1 + ... ] z = [A1^T W1 y1 + ...]
-        [y2] = [0  A2 ] z  →
-        ...
+        (sum_o Jo^T Wo Jo + λI) z = sum_o Jo^T Wo (yo - co) + λ μ
 
-    This sums the contributions from each output to form a single linear system.
+    ``J`` and ``c`` come from linearizing the transform (see
+    :func:`_linearize_latents`), not from looking up a parameter by name, so any
+    composition that happens to be affine in the latents works: a slice feeding a
+    linear map, a :class:`~pollux.models.transforms.ConcatenateTransform` of linear
+    children, a linear map plus a fixed per-object offset. Compositions that are not
+    affine, like polynomial features of the latents, are rejected here and belong in
+    an SVI block.
 
     Parameters
     ----------
@@ -225,7 +432,7 @@ def _solve_latents_least_squares(
     data
         The data to fit.
     current_params
-        Current parameter estimates (used for A matrices).
+        Current parameter estimates. Everything except the latents is held fixed.
     latents_prior
         Prior distribution for latents. If None, uses Normal(0, 1).
         The regularization strength is extracted from this prior.
@@ -233,58 +440,48 @@ def _solve_latents_least_squares(
     Returns
     -------
     latents
-        Optimal latent vectors of shape (n_stars, latent_size).
+        Optimal latent vectors of shape (n_stars, latent_size), or a sentence saying
+        why no closed-form solve applies at these parameter values. It is a caller's
+        job to fall back to SVI on that: whether the solve applies can change from
+        cycle to cycle, because it is a property of the parameters as much as of the
+        model.
 
     Notes
     -----
-    Memory considerations: Rather than forming a large block-diagonal matrix,
-    we accumulate the contributions to the normal equations from each output.
-    This is O(n_latents^2) memory rather than O(n_outputs * n_output_size * n_latents).
+    Memory: no design matrix is ever formed. The largest temporaries are one output
+    array, ``(n_data, output_size)``, and the accumulated ``(n_data, latent_size,
+    latent_size)`` system -- the same footprint as the explicit-``A`` version this
+    replaces, and independent of how the transform is composed.
 
     """
     n_data = len(data)
     latent_size = model.latent_size
 
-    # Initialize normal equations: sum over outputs
-    # AtWA shape: (n_data, latent_size, latent_size)
-    # AtWy shape: (n_data, latent_size)
+    linearized = _linearize_outputs(model, data, current_params)
+    if isinstance(linearized, str):
+        return linearized
+
+    # Sum the per-output contributions to the normal equations
     AtWA = jnp.zeros((n_data, latent_size, latent_size))
     AtWy = jnp.zeros((n_data, latent_size))
 
-    for output_name, lux_output in model.outputs.items():
-        _check_least_squares_transform(lux_output.data_transform, output_name)
-
-        if output_name not in data:
-            continue
-
+    for output_name, (c, jvp, vjpT) in linearized.items():
         output_data = data[output_name]
-        y = output_data.data  # (n_data, output_size)
-        w = _inverse_variance(output_data)
+        w = _inverse_variance(model, data, output_name, current_params)
 
-        # Get the transformation matrix A from current params
-        # For LinearTransform: y = A @ z, so A has shape (output_size, latent_size)
-        output_params = current_params.get(output_name, {}).get("data", {})
-        A = output_params.get("A")
+        # J^T W (y - c), one VJP
+        AtWy = AtWy + vjpT(w * (output_data.data - c))[0]
 
-        if A is None:
-            msg = f"Could not find matrix 'A' for output '{output_name}'"
-            raise ValueError(msg)
-
-        # Accumulate contributions to normal equations
-        # A: (output_size, latent_size)
-        # y: (n_data, output_size)
-        # w: (n_data, output_size) inverse variances
-
-        # For each data point i:
-        #   AtWA[i] += A.T @ diag(w[i]) @ A
-        #   AtWy[i] += A.T @ (w[i] * y[i])
-
-        # AtWA[i] = A.T @ diag(w[i]) @ A = sum_j w[i,j] * A[j,:].T @ A[j,:]
-        AtWA = AtWA + jnp.einsum("nj,jk,jl->nkl", w, A, A)
-
-        # A.T @ (w * y) for each data point
-        # (w * y): (n_data, output_size)
-        AtWy = AtWy + jnp.einsum("nj,jk,nj->nk", w, A, y)
+        # J^T W J column by column: push a basis vector through J, weight it, pull it
+        # back. Column k costs one JVP and one VJP, and no (n, output_size, latent_size)
+        # intermediate is built.
+        AtWA = AtWA + jnp.stack(
+            [
+                vjpT(w * jvp(jnp.broadcast_to(e, (n_data, latent_size))))[0]
+                for e in jnp.eye(latent_size)
+            ],
+            axis=-1,
+        )
 
     # Get regularization from latents prior
     if latents_prior is None:
@@ -309,19 +506,26 @@ def _solve_output_params_least_squares(
     model: Lux,
     data: PolluxData,
     output_name: str,
-    latents: jax.Array,
-) -> dict[str, Any]:
+    params: dict[str, Any],
+) -> dict[str, Any] | tuple[dict[str, Any], ...]:
     """Solve for optimal output parameters using weighted least squares.
 
-    For linear model y = A @ z, solving for A (treating z as fixed):
-        vec(A) = (Z ⊗ I)^{-1} vec(Y)
+    The output is modelled as a linear layer sitting on features ``X`` derived from
+    the latents, ``y = A @ X + b``. Each output dimension j is then an independent
+    small problem,
 
-    In practice, we solve per-pixel: for each output dimension j,
-        A[j, :] = (Z^T W_j Z + λI)^{-1} Z^T W_j y[:, j]
+        A[j, :] = (X^T W_j X + λI)^{-1} X^T W_j y[:, j]
 
-    where Z is the latents matrix and W_j = diag(1/err[:, j]^2).
+    with ``W_j = diag(1/err[:, j]^2)``, which is what makes this fast: ``output_size``
+    independent ``n_features``-sized solves rather than one big system.
 
-    The regularization strength λ is extracted from the transform's prior on A.
+    ``X`` is whatever reaches the linear layer, not necessarily the latents: for a
+    bare :class:`~pollux.models.transforms.LinearTransform` it *is* the latents, but
+    for a sequence it is the prefix run forward -- a latent slice, or the polynomial
+    expansion that makes this the Cannon. A bias term, if the layer has one, is
+    solved jointly as an extra column of ones.
+
+    The regularization strengths λ come from the layer's priors on ``A`` and ``b``.
 
     Parameters
     ----------
@@ -331,18 +535,28 @@ def _solve_output_params_least_squares(
         The data to fit.
     output_name
         Name of the output to optimize.
-    latents
-        Current latent vectors of shape (n_data, latent_size).
+    params
+        Current parameter estimates. The latents supply the features, and the
+        output's err_transform parameters supply the weights.
 
     Returns
     -------
     params
-        Optimized parameters for this output in nested format.
+        Optimized parameters for this output, in the nested format the transform
+        expects: a dict for a bare layer, a tuple of per-child dicts for a sequence.
 
     """
-    transform = _check_least_squares_transform(
-        model.outputs[output_name].data_transform, output_name
-    )
+    transform = model.outputs[output_name].data_transform
+    split = _split_param_layer(transform)
+    if split is None:
+        msg = (
+            f"Output '{output_name}' does not end in a linear layer with all of its "
+            "parameters in that layer, so its parameters cannot be solved in closed "
+            "form. Optimize this output with an SVI block instead."
+        )
+        raise ValueError(msg)
+    prefix, layer = split
+    latents = params["latents"]
 
     if output_name not in data:
         msg = f"No data found for output '{output_name}'"
@@ -350,53 +564,122 @@ def _solve_output_params_least_squares(
 
     output_data = data[output_name]
     y = output_data.data  # (n_data, output_size)
-    output_ivar = _inverse_variance(output_data)
-
-    latent_size = model.latent_size
+    output_ivar = _inverse_variance(model, data, output_name, params)
     output_size = y.shape[1]
 
-    # Get regularization from the transform's prior on A
-    a_prior = transform.priors.get("A", dist.Normal(0.0, 1.0))
-
-    reg_strength, prior_mean = _get_regularization_from_prior(a_prior)
-    reg_matrix = reg_strength * jnp.eye(latent_size)
-
-    # Prior mean for A, typically 0 but may be a scalar or an array
-    prior_mean_contrib = reg_strength * jnp.broadcast_to(
-        prior_mean, (output_size, latent_size)
+    # Features arriving at the linear layer. A parameter-free prefix takes no
+    # arguments, which is exactly what _split_param_layer guarantees.
+    features = latents if prefix is None else prefix.apply(latents)
+    has_bias = "b" in layer.shapes
+    design = (
+        jnp.concatenate([features, jnp.ones((len(y), 1))], axis=1)
+        if has_bias
+        else features
     )
+    n_design = design.shape[1]
 
-    def fit_single_output_dim(
-        y_dim: jax.Array, ivar_dim: jax.Array, prior_mean_row: jax.Array
-    ) -> jax.Array:
-        """Fit the latents -> output coefficients for a single output dimension."""
-        return weighted_least_squares(
-            latents, y_dim, ivar_dim, reg_matrix, prior_mean_row
+    # Regularization from the layer's own priors; the bias column gets its own entry
+    alpha, mu = _get_regularization_from_prior(layer.priors.get("A", dist.Normal(0, 1)))
+    reg_matrix = alpha * jnp.eye(n_design)
+    rhs_extra = alpha * jnp.broadcast_to(mu, (output_size, n_design))
+    if has_bias:
+        alpha_b, mu_b = _get_regularization_from_prior(
+            layer.priors.get("b", dist.Normal(0, 1))
         )
+        reg_matrix = reg_matrix.at[-1, -1].set(alpha_b)
+        rhs_extra = rhs_extra.at[:, -1].set(alpha_b * mu_b)
 
-    # Vectorize over output dimensions
-    A: jax.Array = jax.vmap(fit_single_output_dim)(
-        y.T, output_ivar.T, prior_mean_contrib
-    )  # (output_size, latent_size)
+    # One independent solve per output dimension -> (output_size, n_design)
+    solution: jax.Array = jax.vmap(
+        lambda y_dim, ivar_dim, rhs_row: weighted_least_squares(
+            design, y_dim, ivar_dim, reg_matrix, rhs_row
+        )
+    )(y.T, output_ivar.T, rhs_extra)
 
-    return {"A": A}
+    solved = (
+        {"A": solution[:, :-1], "b": solution[:, -1]} if has_bias else {"A": solution}
+    )
+    if prefix is None:
+        return solved
+
+    # Name the parameters for their position in the sequence, then let the transform
+    # put them back into its own nested layout
+    last = len(prefix.transforms)
+    return transform.unpack_pars(
+        {f"{last}:{name}": value for name, value in solved.items()}, ignore_missing=True
+    )
 
 
 def _string_to_parameter_block(model: Lux, name: str) -> ParameterBlock:
-    """Convert a string block name to a ParameterBlock with inferred optimizer."""
-    optimizer: Literal["least_squares"] | None
-    if name == "latents":
-        optimizer = "least_squares" if _all_outputs_linear(model) else None
-        return ParameterBlock(name="latents", params="latents", optimizer=optimizer)
-
-    output_name = name.split(":", maxsplit=1)[0]
-    if output_name not in model.outputs:
+    """A block that asks for a closed form; :func:`_resolve_blocks` decides if it gets
+    one, once there are parameters to test the transform with."""
+    if name != "latents" and name.split(":", maxsplit=1)[0] not in model.outputs:
         msg = f"Unknown parameter block: '{name}'"
         raise ValueError(msg)
-
-    transform = model.outputs[output_name].data_transform
-    optimizer = "least_squares" if _is_linear_transform(transform) else None
+    # Error-transform parameters enter the likelihood through the variance, never as
+    # least squares, so don't ask for a closed form we know cannot exist
+    optimizer = None if name.endswith(":err") else "least_squares"
     return ParameterBlock(name=name, params=name, optimizer=optimizer)
+
+
+def _least_squares_blocker(
+    model: Lux,
+    data: PolluxData,
+    current_params: dict[str, Any],
+    block: ParameterBlock,
+) -> str | None:
+    """Why this block cannot be solved in closed form, or None if it can be."""
+    for spec in block.params_list:
+        if spec == "latents":
+            linearized = _linearize_outputs(model, data, current_params)
+            if isinstance(linearized, str):
+                return f"{linearized}, so the latents cannot be solved in closed form"
+            continue
+
+        output_name, _, param_type = spec.partition(":")
+        if param_type == "err":
+            return f"'{spec}' is an error transform, which has no closed-form solve"
+        if _split_param_layer(model.outputs[output_name].data_transform) is None:
+            return (
+                f"output '{output_name}' does not end in a linear layer holding all "
+                "of its parameters"
+            )
+    return None
+
+
+def _resolve_blocks(
+    model: Lux,
+    data: PolluxData,
+    current_params: dict[str, Any],
+    blocks: list[ParameterBlock],
+) -> list[ParameterBlock]:
+    """Verify every block that wants a closed-form solve, downgrading those that can't.
+
+    Blocks the caller explicitly assigned an SVI optimizer are left alone -- that was
+    a choice, not a fallback, so it is not worth warning about.
+    """
+    resolved = []
+    fallbacks = []
+    for block in blocks:
+        if block.optimizer == "least_squares":
+            reason = _least_squares_blocker(model, data, current_params, block)
+            if reason is not None:
+                block = replace(block, optimizer=None)  # noqa: PLW2901
+                fallbacks.append((block.name, reason))
+        resolved.append(block)
+
+    if fallbacks:
+        detail = "\n".join(f"  {name:<12} - {reason}" for name, reason in fallbacks)
+        warnings.warn(
+            f"optimize_iterative could not use closed-form solves for "
+            f"{len(fallbacks)} of {len(blocks)} blocks, falling back to SVI/Adam:\n"
+            f"{detail}\n"
+            'Silence with warnings.filterwarnings("ignore", '
+            "category=pollux.exceptions.PolluxLinearizationWarning)",
+            PolluxLinearizationWarning,
+            stacklevel=3,
+        )
+    return resolved
 
 
 def _build_initial_params_from_fixed(
@@ -405,11 +688,14 @@ def _build_initial_params_from_fixed(
     fixed_pars: dict[str, Any],
     blocks: list[ParameterBlock],
 ) -> dict[str, Any]:
-    """Build initial params by merging fixed_pars with zero-initialized optimized params."""
+    """Build initial params by merging fixed_pars with initialized optimized params."""
     initial: dict[str, Any] = dict(fixed_pars)
 
     if "latents" not in initial and any("latents" in b.params_list for b in blocks):
-        initial["latents"] = jnp.zeros((len(data), model.latent_size))
+        observed = _latents_from_data(model, data)
+        initial["latents"] = (
+            jnp.zeros((len(data), model.latent_size)) if observed is None else observed
+        )
 
     return initial
 
@@ -429,8 +715,35 @@ def optimize_iterative(
     """Optimize model using iterative block coordinate descent.
 
     This implements an alternating optimization strategy that cycles through
-    parameter blocks, optimizing each while holding others fixed. For linear
-    models, each sub-problem can be solved exactly using weighted least squares.
+    parameter blocks, optimizing each while holding others fixed. Where a block's
+    sub-problem is quadratic it is solved exactly by weighted least squares, which
+    needs no learning rate and no step count.
+
+    Which blocks those are is decided by measurement rather than by transform type,
+    so it is a property of the model rather than a list of supported classes:
+
+    - the **latents** can be solved exactly when every output with data is affine in
+      them. That covers a bare linear map, but equally a slice of the latents feeding
+      a linear branch, a ``ConcatenateTransform`` of linear children, or a linear map
+      plus a fixed per-object offset.
+    - an **output's own parameters** can be solved exactly when its transform ends in
+      a linear layer that holds all of the transform's parameters. Anything before
+      that layer is just run forward to make features -- which is what lets the
+      Cannon's polynomial expansion work.
+
+    Blocks that do not qualify fall back to SVI, and say so with a
+    :class:`~pollux.exceptions.PolluxLinearizationWarning` naming each block and the
+    reason. ``result.blocks`` reports what each block actually ran with. See the
+    "Closed-form solves, found by linearization" page in the documentation for how
+    the decision is made and what it does and does not guarantee.
+
+    Initialization matters at least as much as any of that. Where an output reports
+    the latents directly -- labels behind a
+    :class:`~pollux.models.transforms.NoOpTransform`, as in the Cannon -- that
+    output's data is used to start the latents instead of a draw from the prior, and
+    the default block order flips so the outputs are fitted to those latents before
+    the latents are touched. Otherwise the first latents step spends itself chasing
+    prior-sampled output parameters. Pass ``initial_params`` to override.
 
     The default strategy alternates between:
     1. Optimize latents (with output parameters fixed)
@@ -512,29 +825,46 @@ def optimize_iterative(
     >>> test_opt_pars = result.params  # already contains fixed + optimized  # doctest: +SKIP
 
     """
-    # Resolve blocks to list[ParameterBlock] | None, converting any string specs.
-    # Done per element rather than by sniffing blocks[0], so a mixed list works.
-    _blocks: list[ParameterBlock] | None = (
-        None
-        if blocks is None
-        else [
-            _string_to_parameter_block(model, b) if isinstance(b, str) else b
-            for b in blocks
+    # Latents the data reports directly beat a draw from the prior, and also decide
+    # which end of the model it makes sense to start from
+    observed_latents = _latents_from_data(model, data)
+
+    # Default blocks: the latents and every transform that has something to fit --
+    # error transforms included, since their parameters are as much a part of the
+    # model as the data transforms'. A transform carrying no learnable parameters
+    # (NoOpTransform, a bare PolyFeatureTransform) gets no block.
+    if blocks is None:
+        output_blocks = [
+            f"{name}:{kind}"
+            for name, output in model.outputs.items()
+            for kind, transform in (
+                ("data", output.data_transform),
+                ("err", output.err_transform),
+            )
+            if _has_learnable_params(transform, model.latent_size, len(data))
         ]
-    )
+        # Start from whichever end the data pins down. With the latents already at
+        # their observed values, fit the outputs to them first: going the other way
+        # would spend the first latents step chasing prior-sampled output parameters
+        # and undo the head start.
+        blocks = (
+            [*output_blocks, "latents"]
+            if observed_latents is not None
+            else ["latents", *output_blocks]
+        )
+
+    # String specs are converted per element rather than by sniffing blocks[0], so a
+    # mixed list works.
+    _blocks: list[ParameterBlock] = [
+        _string_to_parameter_block(model, b) if isinstance(b, str) else b
+        for b in blocks
+    ]
 
     # Build initial_params from fixed_pars if not provided
     if initial_params is None and fixed_pars is not None:
         initial_params = _build_initial_params_from_fixed(
-            model, data, fixed_pars, _blocks or []
+            model, data, fixed_pars, _blocks
         )
-
-    # Default blocks: alternate between latents and each output
-    if _blocks is None:
-        _blocks = [
-            _string_to_parameter_block(model, name)
-            for name in ("latents", *(f"{o}:data" for o in model.outputs))
-        ]
 
     # Warn if any output has err_transform parameters that are neither being
     # optimized (in active blocks) nor intentionally held fixed (in fixed_pars)
@@ -546,24 +876,22 @@ def optimize_iterative(
             and output_name in fixed_pars
             and "err" in fixed_pars[output_name]
         )
-        if err_key not in active_block_params and not err_is_fixed:
-            et = lux_output.err_transform
-            priors = et.priors
-            has_params = (
-                any(len(p) > 0 for p in priors)
-                if isinstance(priors, tuple)
-                else len(priors) > 0
+        if (
+            err_key not in active_block_params
+            and not err_is_fixed
+            and _has_learnable_params(
+                lux_output.err_transform, model.latent_size, len(data)
             )
-            if has_params:
-                warnings.warn(
-                    f"Output '{output_name}' has an err_transform with learnable "
-                    f"parameters, but '{err_key}' is not in the active optimization "
-                    "blocks. These parameters will not be updated during iterative "
-                    f"optimization. To optimize them, add a ParameterBlock with "
-                    f"params='{err_key}'.",
-                    UserWarning,
-                    stacklevel=2,
-                )
+        ):
+            warnings.warn(
+                f"Output '{output_name}' has an err_transform with learnable "
+                f"parameters, but '{err_key}' is not in the active optimization "
+                "blocks. These parameters will not be updated during iterative "
+                f"optimization. To optimize them, add a ParameterBlock with "
+                f"params='{err_key}'.",
+                UserWarning,
+                stacklevel=2,
+            )
 
     # Initialize parameters by sampling from priors
     if initial_params is None:
@@ -578,8 +906,17 @@ def optimize_iterative(
             k: v[0] for k, v in packed_samples.items() if not k.startswith("obs:")
         }
         current_params = model.unpack_numpyro_pars(packed_samples)
+
+        if observed_latents is not None:
+            current_params["latents"] = observed_latents
     else:
         current_params = initial_params
+
+    # Now that there are parameters to probe with, settle which blocks get a
+    # closed-form solve. This is not settled for good: whether a transform is affine
+    # in the latents can depend on its parameters, and those move during the fit, so
+    # the cycle loop downgrades a block if the closed form stops applying.
+    _blocks = _resolve_blocks(model, data, current_params, _blocks)
 
     losses_per_cycle: list[float] = []
 
@@ -598,20 +935,36 @@ def optimize_iterative(
     for cycle in pbar:
         n_cycles = cycle + 1
 
-        for block in _blocks:
+        for index, block in enumerate(_blocks):
             if block.optimizer == "least_squares":
-                current_params = _optimize_block_least_squares(
+                outcome = _optimize_block_least_squares(
                     model, data, block, current_params, latents_prior
                 )
-            else:
-                # Use numpyro SVI for non-linear blocks
-                if rng_key is None:
-                    msg = "rng_key required for SVI-based optimization"
-                    raise ValueError(msg)
-                rng_key, subkey = jax.random.split(rng_key)
-                current_params = _optimize_block_numpyro(
-                    model, data, block, current_params, subkey, latents_prior
+                if not isinstance(outcome, str):
+                    current_params = outcome
+                    continue
+
+                # Whether a closed form applies depends on the parameters, and they
+                # have moved since the blocks were resolved -- a transform can be
+                # affine in the latents at one set of values and not at another.
+                # Downgrade for the rest of the fit rather than failing it.
+                _blocks[index] = replace(block, optimizer=None)
+                warnings.warn(
+                    f"Block '{block.name}' can no longer use a closed-form solve "
+                    f"({outcome}); it will use SVI/Adam for the rest of the fit.",
+                    PolluxLinearizationWarning,
+                    stacklevel=2,
                 )
+                block = _blocks[index]  # noqa: PLW2901
+
+            # Use numpyro SVI for non-linear blocks
+            if rng_key is None:
+                msg = "rng_key required for SVI-based optimization"
+                raise ValueError(msg)
+            rng_key, subkey = jax.random.split(rng_key)
+            current_params = _optimize_block_numpyro(
+                model, data, block, current_params, subkey, latents_prior
+            )
 
         # Compute loss at end of cycle
         loss = _compute_loss(model, data, current_params)
@@ -641,13 +994,7 @@ def optimize_iterative(
         losses_per_cycle=losses_per_cycle,
         n_cycles=n_cycles,
         converged=converged,
-    )
-
-
-def _all_outputs_linear(model: Lux) -> bool:
-    """Check if all model outputs use linear transforms."""
-    return all(
-        _is_linear_transform(out.data_transform) for out in model.outputs.values()
+        blocks=_blocks,
     )
 
 
@@ -657,15 +1004,22 @@ def _optimize_block_least_squares(
     block: ParameterBlock,
     current_params: dict[str, Any],
     latents_prior: dist.Distribution | None = None,
-) -> dict[str, Any]:
-    """Optimize a parameter block using least squares."""
+) -> dict[str, Any] | str:
+    """Optimize a parameter block using least squares.
+
+    Returns the updated parameters, or a sentence saying why the closed form no
+    longer applies at these parameter values.
+    """
     new_params = dict(current_params)
 
     for param_spec in block.params_list:
         if param_spec == "latents":
-            new_params["latents"] = _solve_latents_least_squares(
+            solved = _solve_latents_least_squares(
                 model, data, current_params, latents_prior
             )
+            if isinstance(solved, str):
+                return solved
+            new_params["latents"] = solved
             continue
 
         # An output name, optionally qualified: only "data" params are solvable here
@@ -676,7 +1030,7 @@ def _optimize_block_least_squares(
         if output_name not in new_params:
             new_params[output_name] = {"data": {}, "err": {}}
         new_params[output_name]["data"] = _solve_output_params_least_squares(
-            model, data, output_name, current_params["latents"]
+            model, data, output_name, current_params
         )
 
     return new_params
@@ -750,9 +1104,17 @@ def _optimize_block_numpyro(
         latents_prior=latents_prior,
     )
 
-    # Run SVI optimization
+    # Run SVI optimization, warm-started from where the last cycle left this block.
+    # Without this the guide re-initializes from the prior every cycle, so the block
+    # never accumulates progress and the overall loss is free to go *up* between
+    # cycles -- which block coordinate descent must never do.
     svi_key, sample_key = jax.random.split(rng_key)
-    guide = AutoDelta(partial_model)
+    guide = AutoDelta(
+        partial_model,
+        init_loc_fn=init_to_value(
+            values=model.pack_numpyro_pars(current_params, ignore_missing=True)
+        ),
+    )
     svi = SVI(partial_model, guide, optimizer, Trace_ELBO())
     svi_results = svi.run(svi_key, block.num_steps, data, progress_bar=False)
 
@@ -827,8 +1189,11 @@ def _compute_loss(
         pred = predictions[output_name]
         obs = output_data.data
 
-        # Gaussian negative log likelihood (ignoring constant)
-        chi2 = (pred - obs) ** 2 * _inverse_variance(output_data)
-        total_loss = float(total_loss) + float(0.5 * jnp.sum(chi2))
+        # Gaussian negative log likelihood. The normalization is only constant
+        # when the variance is; with an err_transform fitting the scatter, dropping
+        # it would let the loss fall without bound as the modelled scatter grows.
+        ivar = _inverse_variance(model, data, output_name, params)
+        chi2 = (pred - obs) ** 2 * ivar
+        total_loss = float(total_loss) + float(0.5 * jnp.sum(chi2 - jnp.log(ivar)))
 
     return total_loss
