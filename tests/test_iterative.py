@@ -250,10 +250,12 @@ class TestLinearizeLatents:
         z0 = jnp.zeros((n_stars, n_latents))
         probes = _latents_probe_points(jnp.full(z0.shape, scale), z0.shape)
 
-        assert _linearize_latents(lambda z: z @ A.T, z0, probes) is not None
-        assert (
-            _linearize_latents(lambda z: z @ A.T + 1e-4 * (z**2) @ A.T, z0, probes)
-            is None
+        # A tuple on success, a reason string on refusal -- so check the type, not
+        # just "is not None", which a reason string would also satisfy
+        assert not isinstance(_linearize_latents(lambda z: z @ A.T, z0, probes), str)
+        assert isinstance(
+            _linearize_latents(lambda z: z @ A.T + 1e-4 * (z**2) @ A.T, z0, probes),
+            str,
         )
 
     def test_a_second_amplitude_catches_what_one_would_miss(self):
@@ -270,10 +272,11 @@ class TestLinearizeLatents:
         def sneaky(z):
             return z + z**2 * (z - p)
 
-        assert (
-            _linearize_latents(sneaky, z0, probes[:1]) is not None
-        )  # one probe fooled
-        assert _linearize_latents(sneaky, z0, probes) is None  # two probes are not
+        # A tuple on success, a reason string on refusal
+        assert not isinstance(  # one probe is fooled
+            _linearize_latents(sneaky, z0, probes[:1]), str
+        )
+        assert isinstance(_linearize_latents(sneaky, z0, probes), str)  # two are not
 
     def test_probe_points_track_the_current_latents(self):
         """Probes scale with the latents, never collapse to zero, and differ in size."""
@@ -367,6 +370,127 @@ class TestSolveLatentsComposed:
         )
         assert jnp.allclose(solved, latents, atol=1e-2)
 
+    def test_a_map_that_couples_objects_is_refused(self):
+        """Affine is necessary but not sufficient.
+
+        ``z - z.mean(axis=0)`` is perfectly affine and sails through the affineness
+        probes, but its Jacobian is not block-diagonal, so there is no per-object
+        solve to make. Accepting it returned confident nonsense: predictions off by
+        ~1e13 rather than ~0.
+        """
+        n_stars, n_latents, n_out = 32, 3, 6
+        rng = np.random.default_rng(0)
+        latents = jnp.array(rng.normal(size=(n_stars, n_latents)))
+        A = jnp.array(rng.normal(size=(n_out, n_latents)))
+
+        model = plx.Lux(latent_size=n_latents)
+        model.register_output(
+            "flux",
+            TransformSequence(
+                (
+                    FunctionTransform(
+                        output_size=n_latents,
+                        transform=lambda z: z - z.mean(axis=0),
+                        vmap=False,
+                    ),
+                    LinearTransform(output_size=n_out),
+                )
+            ),
+        )
+        data = plx.data.PolluxData(
+            flux=plx.data.OutputData(
+                (latents - latents.mean(axis=0)) @ A.T,
+                err=jnp.full((n_stars, n_out), 1e-3),
+            )
+        )
+        params = {"latents": latents, "flux": {"data": ({}, {"A": A}), "err": {}}}
+
+        reason = _solve_latents_least_squares(model, data, params)
+        assert isinstance(reason, str)
+        assert "couples objects" in reason
+
+    def test_a_per_object_offset_is_not_mistaken_for_coupling(self):
+        """The negative control: vmap=False is legitimate and must stay solvable."""
+        n_stars, n_latents, n_out = 64, 3, 6
+        rng = np.random.default_rng(2)
+        latents = jnp.array(rng.normal(size=(n_stars, n_latents)))
+        A = jnp.array(rng.normal(size=(n_out, n_latents)))
+        offset = jnp.array(rng.normal(size=n_stars))
+
+        model = plx.Lux(latent_size=n_latents)
+        model.register_output(
+            "flux",
+            TransformSequence(
+                (LinearTransform(output_size=n_out), _per_object_offset(n_out))
+            ),
+        )
+        data = plx.data.PolluxData(
+            flux=plx.data.OutputData(
+                latents @ A.T + offset[:, None], err=jnp.full((n_stars, n_out), 1e-3)
+            )
+        )
+        params = {"latents": latents, "flux": {"data": ({"A": A}, {"offset": offset})}}
+
+        solved = _solve_latents_least_squares(
+            model, data, params, latents_prior=dist.Normal(0.0, 1e3)
+        )
+        assert not isinstance(solved, str)
+        assert jnp.allclose(solved, latents, atol=1e-2)
+
+    def test_solvability_can_change_mid_fit_and_the_block_downgrades(self):
+        """Affineness is a property of the parameters, not only of the model.
+
+        f(z) = A z + q A z**2 is affine exactly when q == 0, so a block resolved as
+        least-squares at q == 0 stops being solvable once an SVI block moves q. That
+        used to raise ValueError partway through the fit.
+        """
+        n_stars, n_latents, n_out = 64, 3, 8
+        rng = np.random.default_rng(0)
+        latents = jnp.array(rng.normal(size=(n_stars, n_latents)))
+        A = jnp.array(rng.normal(size=(n_out, n_latents)))
+
+        model = plx.Lux(latent_size=n_latents)
+        model.register_output(
+            "flux",
+            FunctionTransform(
+                output_size=n_out,
+                transform=jax.vmap(
+                    lambda z, A, q: A @ z + q * (A @ z**2), in_axes=(0, None, None)
+                ),
+                priors={
+                    "A": dist.Normal(0.0, 1.0).expand((n_out, n_latents)),
+                    "q": dist.Normal(0.0, 1.0),
+                },
+                shapes={},
+                vmap=False,
+            ),
+        )
+        data = plx.data.PolluxData(
+            flux=plx.data.OutputData(latents @ A.T, err=jnp.full((n_stars, n_out), 0.1))
+        )
+        # q starts at exactly zero, so the latents block resolves as least-squares
+        initial = {
+            "latents": latents,
+            "flux": {"data": {"A": A, "q": jnp.array(0.0)}, "err": {}},
+        }
+        with pytest.warns(PolluxLinearizationWarning, match="no longer"):
+            result = optimize_iterative(
+                model,
+                data,
+                blocks=[
+                    ParameterBlock("latents", "latents", optimizer="least_squares"),
+                    ParameterBlock("flux:data", "flux:data", num_steps=200),
+                ],
+                initial_params=initial,
+                max_cycles=3,
+                rng_key=jax.random.PRNGKey(0),
+                progress=False,
+            )
+
+        # The fit completed, and the block is permanently on SVI
+        assert result.n_cycles >= 1
+        assert {b.name: b.optimizer for b in result.blocks}["latents"] is None
+
     def test_nonlinear_output_is_refused_with_a_useful_message(self):
         """Polynomial features of the latents are not affine, so say so."""
         n_stars, n_latents, n_out = 16, 3, 5
@@ -385,8 +509,9 @@ class TestSolveLatentsComposed:
         A = jax.random.normal(jax.random.PRNGKey(0), (n_out, 10))
         params = {"flux": {"data": ({}, {"A": A}), "err": {}}}
 
-        with pytest.raises(ValueError, match="not affine in the latents"):
-            _solve_latents_least_squares(model, data, params)
+        reason = _solve_latents_least_squares(model, data, params)
+        assert isinstance(reason, str)
+        assert "not affine in the latents" in reason
 
 
 class TestSolveOutputParamsComposed:

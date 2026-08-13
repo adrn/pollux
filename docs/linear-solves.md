@@ -159,3 +159,40 @@ This means:
 
 The only way to make this a proof would be to walk the jaxpr and verify that every
 primitive reachable from the input is linear, and no one wants to have to do that!
+
+## But: affine is not quite enough either
+
+Being affine means we can extract a design matrix. But the linearsolve needs one more
+guarantee: each object's prediction must depend only on its own latents, so that the big
+system decomposes into one small system per object. That is the same plate independence
+the numpyro model assumes (i.e. with `vmap=True`).
+
+A transform written with `vmap=False` sees the whole batch at once, though, and can
+break it without ceasing to be affine. Centering the latents across objects,
+
+```python
+trans.FunctionTransform(
+    output_size=n_latents, transform=lambda z: z - z.mean(axis=0), vmap=False
+)
+```
+
+is perfectly affine and passes the checks above, but its Jacobian is not block-diagonal
+— object 1's prediction moves when object 2's latents move. Solving it per object does
+not give a wrong-ish answer, it gives nonsense.
+
+So Pollux checks this too. Push a tangent that is nonzero on every other object through
+the Jacobian: if the rows really are independent, the response is nonzero on exactly
+those same objects. Any global reduction — a mean, a sum, a normalization — leaks
+outside them and is caught. An output that fails this is refused in the same way a
+nonlinear one is.
+
+## One more caveat: the answer can change during a fit
+
+Both verdicts are about the transform _with its current parameters bound in_. A
+transform can be affine at one set of parameter values and not at another — for example
+$f(z) = A z + q\,A z^2$ is affine exactly when $q = 0$ — so neither answer is settled
+for good.
+
+Pollux decides once up front, to avoid wasting a cycle, but re-checks on every solve. If
+a block stops qualifying partway through a fit, it is downgraded to SVI for the rest of
+the run with a warning, rather than failing the fit.

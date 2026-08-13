@@ -173,15 +173,38 @@ def _split_param_layer(
 _AFFINE_RTOL = 1e-6
 
 
+def _rows_are_independent(jvp: Callable[[jax.Array], jax.Array], shape: tuple) -> bool:
+    """Whether each object's prediction depends only on its own latents.
+
+    The per-object normal equations assume a block-diagonal Jacobian, one block per
+    object. A transform written with ``vmap=False`` can quietly break that:
+    ``z - z.mean(axis=0)`` is perfectly affine and passes every affineness probe, but
+    couples every object to every other, and the solve would then return confident
+    nonsense rather than refusing.
+
+    Push a tangent supported on every other object through the Jacobian. If the rows
+    are independent the response is supported on the same rows; any global reduction
+    -- a mean, a sum, a normalization -- leaks outside them and is caught. A coupling
+    between two objects that happen to fall on the same side of the split would slip
+    through, but transforms couple objects globally or not at all in practice.
+    """
+    inside = (jnp.arange(shape[0]) % 2 == 0)[:, None]
+    tangent = jnp.where(inside, jax.random.normal(jax.random.PRNGKey(2), shape), 0.0)
+    response = jvp(tangent)
+    leaked = jnp.abs(jnp.where(inside, 0.0, response)).max()
+    return bool(leaked <= _AFFINE_RTOL * jnp.abs(response).max())
+
+
 def _linearize_latents(
     f: Callable[[jax.Array], jax.Array],
     z0: jax.Array,
     probes: tuple[jax.Array, ...],
-) -> tuple[jax.Array, Any, Any] | None:
-    """Linearize a prediction map in the latents, or return None if it is not affine.
+) -> tuple[jax.Array, Any, Any] | str:
+    """Linearize a prediction map in the latents, or say why it cannot be used.
 
     Returns ``(c, jvp, vjpT)`` with ``f(z) == jvp(z) + c``, where ``jvp`` applies the
-    effective design matrix ``J`` and ``vjpT`` applies its transpose. ``J`` is never
+    effective design matrix ``J`` and ``vjpT`` applies its transpose, or a string
+    describing why this map is not usable for a closed-form solve. ``J`` is never
     materialized: for spectra-sized outputs it would be ``latent_size`` copies of the
     data, while ``jvp``/``vjpT`` keep every temporary the size of one output array.
 
@@ -194,18 +217,26 @@ def _linearize_latents(
     "Closed-form solves, found by linearization" page in the documentation for why
     that is unlikely enough to rely on.
 
-    ``f`` maps ``(n_data, latent_size)`` latents to ``(n_data, output_size)``
-    predictions, and each object's prediction must depend only on its own latents --
-    the same plate independence the numpyro model assumes. The transpose sums over
-    objects, so a genuinely cross-object map would fold the cross terms into the wrong
-    place.
+    Affine is necessary but not sufficient: the solve also needs each object's
+    prediction to depend only on its own latents, which :func:`_rows_are_independent`
+    checks. Being affine says nothing about that -- centering the latents across
+    objects is affine and violates it.
+
+    Note that both verdicts are properties of ``f``, which has the *current*
+    parameters bound into it. A transform can be affine in the latents at one set of
+    parameter values and not at another, so neither answer is settled for good.
     """
     c, jvp = jax.linearize(f, z0)
+
     for probe in probes:
         pred = f(probe)
         residual = jnp.abs(pred - (c + jvp(probe))).max()
         if residual > _AFFINE_RTOL * jnp.abs(pred).max():
-            return None
+            return "is not affine in the latents"
+
+    if not _rows_are_independent(jvp, z0.shape):
+        return "couples objects to one another, so there is no per-object solve to make"
+
     return c, jvp, jax.linear_transpose(jvp, z0)
 
 
@@ -244,8 +275,8 @@ def _linearize_outputs(
 ) -> dict[str, tuple[jax.Array, Any, Any]] | str:
     """Linearize every output that has data.
 
-    Returns ``{output_name: (c, jvp, vjpT)}``, or the name of the first output that
-    turns out not to be affine in the latents.
+    Returns ``{output_name: (c, jvp, vjpT)}``, or a sentence naming the first output
+    that cannot be used for a closed-form latent solve and saying why.
     """
     z0 = jnp.zeros((len(data), model.latent_size))
     probes = _latents_probe_points(current_params.get("latents"), z0.shape)
@@ -257,8 +288,8 @@ def _linearize_outputs(
         result = _linearize_latents(
             _output_predict_fn(model, output_name, current_params), z0, probes
         )
-        if result is None:
-            return output_name
+        if isinstance(result, str):
+            return f"output '{output_name}' {result}"
         linearized[output_name] = result
     return linearized
 
@@ -377,7 +408,7 @@ def _solve_latents_least_squares(
     data: PolluxData,
     current_params: dict[str, Any],
     latents_prior: dist.Distribution | None = None,
-) -> jax.Array:
+) -> jax.Array | str:
     """Solve for optimal latents using weighted least squares.
 
     Each output contributes a prediction ``y ≈ J z + c``, where ``J`` is whatever
@@ -409,7 +440,11 @@ def _solve_latents_least_squares(
     Returns
     -------
     latents
-        Optimal latent vectors of shape (n_stars, latent_size).
+        Optimal latent vectors of shape (n_stars, latent_size), or a sentence saying
+        why no closed-form solve applies at these parameter values. It is a caller's
+        job to fall back to SVI on that: whether the solve applies can change from
+        cycle to cycle, because it is a property of the parameters as much as of the
+        model.
 
     Notes
     -----
@@ -424,12 +459,7 @@ def _solve_latents_least_squares(
 
     linearized = _linearize_outputs(model, data, current_params)
     if isinstance(linearized, str):
-        msg = (
-            f"Output '{linearized}' is not affine in the latents, so the latents "
-            "cannot be solved in closed form. Optimize them with an SVI block "
-            "instead (ParameterBlock('latents', 'latents'))."
-        )
-        raise ValueError(msg)
+        return linearized
 
     # Sum the per-output contributions to the normal equations
     AtWA = jnp.zeros((n_data, latent_size, latent_size))
@@ -603,11 +633,7 @@ def _least_squares_blocker(
         if spec == "latents":
             linearized = _linearize_outputs(model, data, current_params)
             if isinstance(linearized, str):
-                return (
-                    f"output '{linearized}' is not affine in the latents, so they "
-                    "cannot be solved in closed form (this output's own parameters "
-                    "still can be)"
-                )
+                return f"{linearized}, so the latents cannot be solved in closed form"
             continue
 
         output_name, _, param_type = spec.partition(":")
@@ -886,9 +912,10 @@ def optimize_iterative(
     else:
         current_params = initial_params
 
-    # Now that there are parameters to probe with, settle which blocks actually get a
-    # closed-form solve. Done once here rather than per cycle: the answer is a
-    # property of the model's structure, not of the current parameter values.
+    # Now that there are parameters to probe with, settle which blocks get a
+    # closed-form solve. This is not settled for good: whether a transform is affine
+    # in the latents can depend on its parameters, and those move during the fit, so
+    # the cycle loop downgrades a block if the closed form stops applying.
     _blocks = _resolve_blocks(model, data, current_params, _blocks)
 
     losses_per_cycle: list[float] = []
@@ -908,20 +935,36 @@ def optimize_iterative(
     for cycle in pbar:
         n_cycles = cycle + 1
 
-        for block in _blocks:
+        for index, block in enumerate(_blocks):
             if block.optimizer == "least_squares":
-                current_params = _optimize_block_least_squares(
+                outcome = _optimize_block_least_squares(
                     model, data, block, current_params, latents_prior
                 )
-            else:
-                # Use numpyro SVI for non-linear blocks
-                if rng_key is None:
-                    msg = "rng_key required for SVI-based optimization"
-                    raise ValueError(msg)
-                rng_key, subkey = jax.random.split(rng_key)
-                current_params = _optimize_block_numpyro(
-                    model, data, block, current_params, subkey, latents_prior
+                if not isinstance(outcome, str):
+                    current_params = outcome
+                    continue
+
+                # Whether a closed form applies depends on the parameters, and they
+                # have moved since the blocks were resolved -- a transform can be
+                # affine in the latents at one set of values and not at another.
+                # Downgrade for the rest of the fit rather than failing it.
+                _blocks[index] = replace(block, optimizer=None)
+                warnings.warn(
+                    f"Block '{block.name}' can no longer use a closed-form solve "
+                    f"({outcome}); it will use SVI/Adam for the rest of the fit.",
+                    PolluxLinearizationWarning,
+                    stacklevel=2,
                 )
+                block = _blocks[index]  # noqa: PLW2901
+
+            # Use numpyro SVI for non-linear blocks
+            if rng_key is None:
+                msg = "rng_key required for SVI-based optimization"
+                raise ValueError(msg)
+            rng_key, subkey = jax.random.split(rng_key)
+            current_params = _optimize_block_numpyro(
+                model, data, block, current_params, subkey, latents_prior
+            )
 
         # Compute loss at end of cycle
         loss = _compute_loss(model, data, current_params)
@@ -961,15 +1004,22 @@ def _optimize_block_least_squares(
     block: ParameterBlock,
     current_params: dict[str, Any],
     latents_prior: dist.Distribution | None = None,
-) -> dict[str, Any]:
-    """Optimize a parameter block using least squares."""
+) -> dict[str, Any] | str:
+    """Optimize a parameter block using least squares.
+
+    Returns the updated parameters, or a sentence saying why the closed form no
+    longer applies at these parameter values.
+    """
     new_params = dict(current_params)
 
     for param_spec in block.params_list:
         if param_spec == "latents":
-            new_params["latents"] = _solve_latents_least_squares(
+            solved = _solve_latents_least_squares(
                 model, data, current_params, latents_prior
             )
+            if isinstance(solved, str):
+                return solved
+            new_params["latents"] = solved
             continue
 
         # An output name, optionally qualified: only "data" params are solvable here
