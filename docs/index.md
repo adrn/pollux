@@ -9,14 +9,21 @@ the same objects. Pollux keeps track of the model parameters and hands the assem
 model to [numpyro][numpyro] for inference. It is built on [JAX][jax] and is designed for
 use in probabilistic and machine learning contexts.
 
-The framework is general, but it was written with stellar spectroscopy in mind, and two
-ready-made models ship with it:
+The framework itself is {py:class}`~pollux.models.LVM`: a latent size plus a set of
+named outputs, each with its own transform from the latents and an optional transform of
+its reported errors. Build a model with it directly whenever you want to compose the
+transforms yourself.
 
-- [_Lux_](https://arxiv.org/abs/2502.01745): Multi-output, generative, latent variable
-  models for inferring embedded representations of spectroscopic and many other kinds of
-  data.
-- [_Cannon_](https://arxiv.org/abs/1501.07604): Data-driven models for inferring stellar
-  parameters, element abundances, and other labels from stellar spectra.
+The framework is general, but it was written with stellar spectroscopy in mind, and two
+ready-made architectures ship with it. Both are `LVM` subclasses that register their own
+outputs, so they are fitted and used exactly like any other model:
+
+- {py:class}`~pollux.models.Lux` ([paper](https://arxiv.org/abs/2502.01745)):
+  Multi-output, generative, latent variable models for inferring embedded
+  representations of spectroscopic and many other kinds of data.
+- {py:class}`~pollux.models.Cannon` ([paper](https://arxiv.org/abs/1501.07604)):
+  Data-driven models for inferring stellar parameters, element abundances, and other
+  labels from stellar spectra.
 
 ---
 
