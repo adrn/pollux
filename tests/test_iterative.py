@@ -17,7 +17,9 @@ from pollux.models.iterative import (
     IterativeOptimizationResult,
     ParameterBlock,
     _build_fixed_pars,
+    _compute_loss,
     _get_regularization_from_prior,
+    _inverse_variance,
     _latents_probe_points,
     _least_squares_blocker,
     _linearize_latents,
@@ -396,7 +398,9 @@ class TestSolveOutputParamsComposed:
         latents = jnp.array(linear_model_and_data["true_latents"])
         n_latents = linear_model_and_data["n_latents"]
 
-        solved = _solve_output_params_least_squares(model, data, "flux", latents)
+        solved = _solve_output_params_least_squares(
+            model, data, "flux", {"latents": latents}
+        )
 
         w = 1.0 / data["flux"].err ** 2
         expected = jax.vmap(
@@ -426,7 +430,9 @@ class TestSolveOutputParamsComposed:
             )
         )
 
-        solved = _solve_output_params_least_squares(model, data, "flux", latents)
+        solved = _solve_output_params_least_squares(
+            model, data, "flux", {"latents": latents}
+        )
         # A tuple of per-child dicts, the layout a TransformSequence expects back
         assert isinstance(solved, tuple)
         assert solved[0] == {}
@@ -454,7 +460,9 @@ class TestSolveOutputParamsComposed:
             )
         )
 
-        solved = _solve_output_params_least_squares(model, data, "flux", labels)
+        solved = _solve_output_params_least_squares(
+            model, data, "flux", {"latents": labels}
+        )
         assert solved[1]["A"].shape == (n_out, n_features)
         assert jnp.allclose(solved[1]["A"], coeffs, atol=1e-3)
 
@@ -474,7 +482,9 @@ class TestSolveOutputParamsComposed:
             )
         )
 
-        solved = _solve_output_params_least_squares(model, data, "flux", latents)
+        solved = _solve_output_params_least_squares(
+            model, data, "flux", {"latents": latents}
+        )
         assert jnp.allclose(solved["A"], A, atol=1e-3)
         assert jnp.allclose(solved["b"], b, atol=1e-3)
 
@@ -506,7 +516,9 @@ class TestSolveOutputParamsComposed:
             flux=plx.data.OutputData(jnp.ones((8, 4)), err=jnp.full((8, 4), 0.1))
         )
         with pytest.raises(ValueError, match="does not end in a linear layer"):
-            _solve_output_params_least_squares(model, data, "flux", jnp.zeros((8, 3)))
+            _solve_output_params_least_squares(
+                model, data, "flux", {"latents": jnp.zeros((8, 3))}
+            )
 
 
 class TestOptimizeIterativePartitionedLatents:
@@ -590,6 +602,93 @@ class TestOptimizeIterativePartitionedLatents:
             predictions["labels"], latents[:, 2:] @ A_labels.T, atol=2e-2
         )
         assert result.losses_per_cycle[-1] < result.losses_per_cycle[0]
+
+
+def _intrinsic_scatter(output_size):
+    """An err_transform that adds a per-pixel intrinsic scatter in quadrature."""
+    return FunctionTransform(
+        output_size=output_size,
+        transform=lambda err, s: jnp.sqrt(err**2 + s**2),
+        priors={"s": dist.HalfNormal(1.0).expand((output_size,))},
+        shapes={},
+    )
+
+
+class TestErrTransformParticipates:
+    """Error-transform parameters are part of the model, so they are part of the fit."""
+
+    @pytest.fixture
+    def scatter_model_and_data(self):
+        n_stars, n_latents, n_flux = 64, 3, 12
+        rng = np.random.default_rng(4)
+        latents = jnp.array(rng.normal(size=(n_stars, n_latents)))
+        A = jnp.array(rng.normal(size=(n_flux, n_latents)))
+
+        model = plx.Lux(latent_size=n_latents)
+        model.register_output(
+            "flux",
+            LinearTransform(output_size=n_flux),
+            err_transform=_intrinsic_scatter(n_flux),
+        )
+        data = plx.data.PolluxData(
+            flux=plx.data.OutputData(
+                latents @ A.T, err=jnp.full((n_stars, n_flux), 0.02)
+            )
+        )
+        return model, data, latents, A
+
+    def test_err_block_is_in_the_defaults(self, scatter_model_and_data):
+        """It used to be left out, and then warned about by the very same function."""
+        model, data, *_ = scatter_model_and_data
+
+        with warnings.catch_warnings(record=True) as record:
+            warnings.simplefilter("always")
+            result = model.optimize_iterative(
+                data, max_cycles=1, rng_key=jax.random.PRNGKey(0), progress=False
+            )
+
+        assert [b.name for b in result.blocks] == ["latents", "flux:data", "flux:err"]
+        # The err block can never have a closed form, so it should not ask for one
+        # and then be told no
+        assert {b.name: b.optimizer for b in result.blocks}["flux:err"] is None
+        assert not [w for w in record if "err_transform" in str(w.message)]
+        assert result.params["flux"]["err"]["s"].shape == (data["flux"].data.shape[1],)
+
+    def test_least_squares_weights_include_the_modelled_scatter(
+        self, scatter_model_and_data
+    ):
+        """Weighting by raw errors while another block fits the scatter would leave
+        the two blocks minimizing different objectives."""
+        model, data, latents, _ = scatter_model_and_data
+        n_flux = data["flux"].data.shape[1]
+
+        # A scatter far larger than the reported errors, so ignoring it is obvious
+        scatter = jnp.full(n_flux, 5.0)
+        params = {"latents": latents, "flux": {"data": {}, "err": {"s": scatter}}}
+
+        ivar = _inverse_variance(model, data, "flux", params)
+        expected = 1.0 / (data["flux"].err ** 2 + scatter**2)
+        assert jnp.allclose(ivar, expected)
+        assert not jnp.allclose(ivar, 1.0 / data["flux"].err ** 2)
+
+    def test_loss_keeps_the_normalization_when_the_variance_is_fitted(
+        self, scatter_model_and_data
+    ):
+        """Without the log-determinant term the loss falls without bound as s grows."""
+        model, data, latents, A = scatter_model_and_data
+        base = {"latents": latents, "flux": {"data": {"A": A}}}
+
+        small = _compute_loss(
+            model,
+            data,
+            {**base, "flux": {**base["flux"], "err": {"s": jnp.full(12, 0.01)}}},
+        )
+        large = _compute_loss(
+            model,
+            data,
+            {**base, "flux": {**base["flux"], "err": {"s": jnp.full(12, 100.0)}}},
+        )
+        assert large > small
 
 
 class TestCannonAsLux:

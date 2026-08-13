@@ -28,7 +28,7 @@ from numpyro.infer.initialization import init_to_value
 from tqdm.auto import tqdm
 
 from .._linalg import weighted_least_squares
-from ..data import OutputData, PolluxData
+from ..data import PolluxData
 from ..exceptions import PolluxLinearizationWarning
 from .transforms import (
     AbstractTransform,
@@ -263,9 +263,40 @@ def _linearize_outputs(
     return linearized
 
 
-def _inverse_variance(output_data: OutputData) -> jax.Array:
-    """Inverse-variance weights for an output, or ones where errors are absent."""
-    err = output_data.err
+def _has_learnable_params(
+    transform: AbstractTransform, latent_size: int, data_size: int
+) -> bool:
+    """Whether a transform contributes any parameters to sample or solve for."""
+    return bool(transform.get_expanded_priors(latent_size, data_size))
+
+
+def _inverse_variance(
+    model: Lux, data: PolluxData, output_name: str, params: dict[str, Any]
+) -> jax.Array:
+    """Inverse-variance weights for an output, as the *model* sees them.
+
+    The err_transform is part of the model -- intrinsic scatter added in quadrature,
+    a scale factor on reported uncertainties -- so the weights have to come through
+    it rather than from the raw error column. Weighting by the raw errors while
+    another block fits the scatter would leave the two blocks minimizing different
+    objectives, and block coordinate descent only converges when they share one.
+
+    Falls back to ones where no uncertainties were given at all.
+    """
+    output_data = data[output_name]
+    err_pars = params.get(output_name, {}).get("err", {})
+    err_transform = model.outputs[output_name].err_transform
+    try:
+        err = (
+            err_transform.apply(output_data.err, **err_pars)
+            if isinstance(err_pars, dict)
+            else err_transform.apply(output_data.err, *err_pars)
+        )
+    except RuntimeError:
+        # The err parameters are not available yet -- e.g. initial_params supplied
+        # without them -- so the reported uncertainties are the best guess to hand
+        err = output_data.err
+
     if jnp.all(err <= 0):
         return jnp.ones_like(output_data.data)
     return 1.0 / err**2
@@ -371,7 +402,7 @@ def _solve_latents_least_squares(
 
     for output_name, (c, jvp, vjpT) in linearized.items():
         output_data = data[output_name]
-        w = _inverse_variance(output_data)
+        w = _inverse_variance(model, data, output_name, current_params)
 
         # J^T W (y - c), one VJP
         AtWy = AtWy + vjpT(w * (output_data.data - c))[0]
@@ -410,7 +441,7 @@ def _solve_output_params_least_squares(
     model: Lux,
     data: PolluxData,
     output_name: str,
-    latents: jax.Array,
+    params: dict[str, Any],
 ) -> dict[str, Any] | tuple[dict[str, Any], ...]:
     """Solve for optimal output parameters using weighted least squares.
 
@@ -439,8 +470,9 @@ def _solve_output_params_least_squares(
         The data to fit.
     output_name
         Name of the output to optimize.
-    latents
-        Current latent vectors of shape (n_data, latent_size).
+    params
+        Current parameter estimates. The latents supply the features, and the
+        output's err_transform parameters supply the weights.
 
     Returns
     -------
@@ -459,6 +491,7 @@ def _solve_output_params_least_squares(
         )
         raise ValueError(msg)
     prefix, layer = split
+    latents = params["latents"]
 
     if output_name not in data:
         msg = f"No data found for output '{output_name}'"
@@ -466,7 +499,7 @@ def _solve_output_params_least_squares(
 
     output_data = data[output_name]
     y = output_data.data  # (n_data, output_size)
-    output_ivar = _inverse_variance(output_data)
+    output_ivar = _inverse_variance(model, data, output_name, params)
     output_size = y.shape[1]
 
     # Features arriving at the linear layer. A parameter-free prefix takes no
@@ -518,7 +551,10 @@ def _string_to_parameter_block(model: Lux, name: str) -> ParameterBlock:
     if name != "latents" and name.split(":", maxsplit=1)[0] not in model.outputs:
         msg = f"Unknown parameter block: '{name}'"
         raise ValueError(msg)
-    return ParameterBlock(name=name, params=name, optimizer="least_squares")
+    # Error-transform parameters enter the likelihood through the variance, never as
+    # least squares, so don't ask for a closed form we know cannot exist
+    optimizer = None if name.endswith(":err") else "least_squares"
+    return ParameterBlock(name=name, params=name, optimizer=optimizer)
 
 
 def _least_squares_blocker(
@@ -717,21 +753,24 @@ def optimize_iterative(
     >>> test_opt_pars = result.params  # already contains fixed + optimized  # doctest: +SKIP
 
     """
-    # Default blocks: alternate between latents and each output. String specs are
-    # converted per element rather than by sniffing blocks[0], so a mixed list works.
+    # Default blocks: the latents, then every transform that has something to fit --
+    # error transforms included, since their parameters are as much a part of the
+    # model as the data transforms'. A transform carrying no learnable parameters
+    # (NoOpTransform, a bare PolyFeatureTransform) gets no block.
     if blocks is None:
-        # Outputs whose transform carries no learnable parameters (NoOpTransform, a
-        # bare PolyFeatureTransform) have nothing to optimize, so they get no block
-        blocks = [
-            "latents",
-            *(
-                f"{name}:data"
-                for name, output in model.outputs.items()
-                if output.data_transform.get_expanded_priors(
-                    model.latent_size, len(data)
-                )
-            ),
+        blocks = ["latents"]
+        blocks += [
+            f"{name}:{kind}"
+            for name, output in model.outputs.items()
+            for kind, transform in (
+                ("data", output.data_transform),
+                ("err", output.err_transform),
+            )
+            if _has_learnable_params(transform, model.latent_size, len(data))
         ]
+
+    # String specs are converted per element rather than by sniffing blocks[0], so a
+    # mixed list works.
     _blocks: list[ParameterBlock] = [
         _string_to_parameter_block(model, b) if isinstance(b, str) else b
         for b in blocks
@@ -753,24 +792,22 @@ def optimize_iterative(
             and output_name in fixed_pars
             and "err" in fixed_pars[output_name]
         )
-        if err_key not in active_block_params and not err_is_fixed:
-            et = lux_output.err_transform
-            priors = et.priors
-            has_params = (
-                any(len(p) > 0 for p in priors)
-                if isinstance(priors, tuple)
-                else len(priors) > 0
+        if (
+            err_key not in active_block_params
+            and not err_is_fixed
+            and _has_learnable_params(
+                lux_output.err_transform, model.latent_size, len(data)
             )
-            if has_params:
-                warnings.warn(
-                    f"Output '{output_name}' has an err_transform with learnable "
-                    f"parameters, but '{err_key}' is not in the active optimization "
-                    "blocks. These parameters will not be updated during iterative "
-                    f"optimization. To optimize them, add a ParameterBlock with "
-                    f"params='{err_key}'.",
-                    UserWarning,
-                    stacklevel=2,
-                )
+        ):
+            warnings.warn(
+                f"Output '{output_name}' has an err_transform with learnable "
+                f"parameters, but '{err_key}' is not in the active optimization "
+                "blocks. These parameters will not be updated during iterative "
+                f"optimization. To optimize them, add a ParameterBlock with "
+                f"params='{err_key}'.",
+                UserWarning,
+                stacklevel=2,
+            )
 
     # Initialize parameters by sampling from priors
     if initial_params is None:
@@ -882,7 +919,7 @@ def _optimize_block_least_squares(
         if output_name not in new_params:
             new_params[output_name] = {"data": {}, "err": {}}
         new_params[output_name]["data"] = _solve_output_params_least_squares(
-            model, data, output_name, current_params["latents"]
+            model, data, output_name, current_params
         )
 
     return new_params
@@ -1041,8 +1078,11 @@ def _compute_loss(
         pred = predictions[output_name]
         obs = output_data.data
 
-        # Gaussian negative log likelihood (ignoring constant)
-        chi2 = (pred - obs) ** 2 * _inverse_variance(output_data)
-        total_loss = float(total_loss) + float(0.5 * jnp.sum(chi2))
+        # Gaussian negative log likelihood. The normalization is only constant
+        # when the variance is; with an err_transform fitting the scatter, dropping
+        # it would let the loss fall without bound as the modelled scatter grows.
+        ivar = _inverse_variance(model, data, output_name, params)
+        chi2 = (pred - obs) ** 2 * ivar
+        total_loss = float(total_loss) + float(0.5 * jnp.sum(chi2 - jnp.log(ivar)))
 
     return total_loss
