@@ -197,33 +197,43 @@ else:
 
 # -- Check for executed tutorials and only add to toctree if they exist ------
 
-# Note: list the expected .ipynb filename for each tutorial
-tutorial_files = [
-    "tutorials/Lux-linear-simulated-data.ipynb",
-    "tutorials/Lux-getting-started-apogee.ipynb",
-    "tutorials/Lux-iterative-optimization.ipynb",
-    "tutorials/Lux-simulated-data-underestimated-err.ipynb",
-]
+# Note: list the expected .ipynb filename for each tutorial, grouped the way the
+# package is: the general framework first, then one section per architecture built
+# on it.
+tutorial_sections = {
+    "Latent Variable Models": [
+        "tutorials/LVM-getting-started.ipynb",
+        "tutorials/LVM-iterative-optimization.ipynb",
+        "tutorials/LVM-error-models.ipynb",
+        "tutorials/LVM-hierarchical-missing-labels.ipynb",
+    ],
+    "The Lux Model": [
+        "tutorials/Lux-getting-started-apogee.ipynb",
+        "tutorials/Lux-apogee-uncertainties.ipynb",
+    ],
+    "The Cannon": [
+        "tutorials/Cannon-getting-started-apogee.ipynb",
+    ],
+}
+tutorial_files = [fn for group in tutorial_sections.values() for fn in group]
 
 _not_executed = []
-_tutorial_toctree_items = []
-for fn in tutorial_files:
-    if not Path(fn).exists() and "GITHUB_TOKEN" not in os.environ:
-        _not_executed.append(fn)
-        continue
-    _tutorial_toctree_items.append(fn)
+_toctrees = []
+for caption, filenames in tutorial_sections.items():
+    found = []
+    for fn in filenames:
+        if not Path(fn).exists() and "GITHUB_TOKEN" not in os.environ:
+            _not_executed.append(fn)
+            continue
+        found.append(fn)
 
-if _tutorial_toctree_items:
-    _items = "\n   ".join(_tutorial_toctree_items)
-    _tutorial_toctree = f"""\
-.. toctree::
-   :maxdepth: 1
-   :caption: Tutorials
+    if found:
+        _items = "\n   ".join(found)
+        _toctrees.append(
+            f".. toctree::\n   :maxdepth: 1\n   :caption: {caption}\n\n   {_items}\n"
+        )
 
-   {_items}
-"""
-else:
-    _tutorial_toctree = "No tutorials found!\n"
+_tutorial_toctree = "\n".join(_toctrees) if _toctrees else "No tutorials found!\n"
 
 if _not_executed:
     print(
