@@ -531,7 +531,11 @@ def _least_squares_blocker(
         if spec == "latents":
             linearized = _linearize_outputs(model, data, current_params)
             if isinstance(linearized, str):
-                return f"output '{linearized}' is not affine in the latents"
+                return (
+                    f"output '{linearized}' is not affine in the latents, so they "
+                    "cannot be solved in closed form (this output's own parameters "
+                    "still can be)"
+                )
             continue
 
         output_name, _, param_type = spec.partition(":")
