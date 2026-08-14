@@ -43,6 +43,31 @@ or with [uv][uv]:
 uv add pollux
 ```
 
+## Get Started
+
+The best way to get started with `pollux` is to work through the tutorials:
+
+```{eval-rst}
+.. include:: _tutorials.rst
+```
+
+```{toctree}
+:maxdepth: 1
+:caption: Technical Notes
+
+linear-solves.md
+```
+
+```{toctree}
+:maxdepth: 1
+:hidden:
+:caption: API Reference
+
+api/index.md
+```
+
+### Development installation
+
 To install the unreleased development version, point either tool at the repository
 instead:
 
@@ -51,10 +76,8 @@ pip install git+https://github.com/adrn/pollux
 uv add git+https://github.com/adrn/pollux
 ```
 
-### Development installation
-
-Clone the repository, then set up an environment with the development dependencies — the
-test suite, the documentation build, and the linters:
+For local development, clone the repository, then set up an environment with the
+development dependencies — the test suite, the documentation build, and the linters:
 
 ```bash
 uv sync                                        # everything, in .venv
@@ -79,26 +102,3 @@ Then run the tests with `uv run pytest` or `pytest`.
 [numpyro]: https://num.pyro.ai/
 [uv]: https://docs.astral.sh/uv/
 [pep735]: https://peps.python.org/pep-0735/
-
-## Get Started
-
-The best way to get started with `pollux` is to work through the tutorials:
-
-```{eval-rst}
-.. include:: _tutorials.rst
-```
-
-```{toctree}
-:maxdepth: 1
-:caption: Technical Notes
-
-linear-solves.md
-```
-
-```{toctree}
-:maxdepth: 1
-:hidden:
-:caption: API Reference
-
-api/index.md
-```
