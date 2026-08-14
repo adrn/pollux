@@ -14,7 +14,6 @@ __all__ = [
     "ParamPriorsT",
     "ParamShapesT",
     "PolyFeatureTransform",
-    "QuadraticTransform",
     "ScatterTransform",
     "ShapeT",
     "TransformSequence",
@@ -41,7 +40,6 @@ from ..typing import (
     LatentsT,
     LinearT,
     OutputT,
-    QuadT,
     TransformFuncT,
 )
 
@@ -915,40 +913,6 @@ class AffineTransform(AbstractSingleTransform):
     )
     shapes: ParamShapesT = ImmutableMap(
         {
-            "A": ("output_size", "latent_size"),
-            "b": ("output_size",),
-        }
-    )
-
-
-# ----
-
-
-def _quadratic_transform(z: LatentsT, Q: QuadT, A: LinearT, b: OutputT) -> OutputT:
-    """Apply a quadratic transformation.
-
-    Computes a quadratic form plus a linear term and an offset: z^T Q z + A @ z + b.
-    """
-    return jnp.einsum("i,oij,j->o", z, Q, z) + A @ z + b
-
-
-class QuadraticTransform(AbstractSingleTransform):
-    """Quadratic transformation of latent vectors.
-
-    Implements the transformation: y = z^T Q z + A @ z + b, where Q is a tensor,
-    A is a matrix, z is a latent vector, and b is a bias vector.
-    """
-
-    transform: TransformFuncT = _quadratic_transform
-    priors: ParamPriorsT = eqx.field(
-        default=ImmutableMap(
-            {"Q": dist.Normal(0, 1), "A": dist.Normal(0, 1), "b": dist.Normal(0, 1)}
-        ),
-        converter=ImmutableMap,
-    )
-    shapes: ParamShapesT = ImmutableMap(
-        {
-            "Q": ("output_size", "latent_size", "latent_size"),
             "A": ("output_size", "latent_size"),
             "b": ("output_size",),
         }

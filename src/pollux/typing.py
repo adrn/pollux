@@ -9,7 +9,6 @@ from numpyro.optim import _NumPyroOptim
 
 LatentsT = Float[Array, "latents"]
 
-QuadT = Float[Array, "output latents latents"]
 LinearT = Float[Array, "output latents"]
 OutputT = Float[Array, "output"]
 
@@ -33,7 +32,6 @@ __all__ = [
     "OptimizerT",
     "OutputT",
     "PackedParamsT",
-    "QuadT",
     "TransformFuncT",
     "UnpackedParamsT",
 ]
