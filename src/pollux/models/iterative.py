@@ -829,6 +829,20 @@ def optimize_iterative(
     ... ]
     >>> result = optimize_iterative(model, data, blocks=blocks)  # doctest: +SKIP
 
+    Blocks with no closed form run Adam at ``step_size=1e-3`` for 1000 steps by
+    default; both are set per block, and a different optimizer goes in the same place:
+
+    >>> blocks = [  # doctest: +SKIP
+    ...     ParameterBlock(
+    ...         "latents", "latents",
+    ...         num_steps=500, optimizer_kwargs={"step_size": 1e-2},
+    ...     ),
+    ...     ParameterBlock(
+    ...         "flux:err", "flux:err",
+    ...         optimizer=numpyro.optim.SGD, optimizer_kwargs={"step_size": 1e-4},
+    ...     ),
+    ... ]
+
     Optimizing only latents with fixed output parameters (e.g. applying a
     trained model to new test data):
 
