@@ -1,17 +1,13 @@
 """Lux: a multi-output latent variable model for spectra and labels.
 
-Lux (Price-Whelan et al. 2025) represents each object by a latent vector and generates
-every observed output as a linear -- or optionally quadratic -- function of it. Because
-the spectra and the labels are outputs of the *same* latents, a model trained on stars
-with both can infer labels for stars with only a spectrum, and vice versa.
-
-This is one architecture built on :class:`~pollux.models.LVM`. Anything the constructor
-below cannot express, build with ``LVM`` and :meth:`~pollux.models.LVM.register_output`
-directly.
+Lux (Horta et al. 2025) represents each object by a latent vector and generates every
+observed output as a linear function of the latent vector. Because the spectra and the
+labels are outputs of the same latents, a model trained on stars with both can infer
+labels for stars with only a spectrum, and vice versa.
 
 References
 ----------
-Price-Whelan, A. M., Hogg, D. W., Widmark, A., et al. 2025, arXiv:2502.01745
+Horta, D. R., Price-Whelan, A. M., Hogg, D. W., Ness, M., Casey, A. R. 2025, arXiv:2502.01745
 """
 
 from collections.abc import Mapping, Sequence

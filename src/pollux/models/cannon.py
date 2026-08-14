@@ -15,7 +15,7 @@ coefficient solve is the closed-form weighted least squares that
 
 References
 ----------
-Ness, M., Hogg, D. W., Rix, H.-W., Ho, A. Y. Q., & Zasowski, G. 2015, ApJ, 808, 16
+Ness, M., Hogg, D. W. et al. 2015
 """
 
 from __future__ import annotations

@@ -1,3 +1,5 @@
+"""The general latent variable model (LVM) framework."""
+
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from functools import partial
@@ -180,23 +182,22 @@ class LVMOutput(eqx.Module):
 class LVM(eqx.Module):
     """A generative latent variable model with multiple outputs.
 
-    This is the general framework the rest of the package is built on: each object is
-    represented by a latent vector, and every observed output is generated as a
-    transformation away from that vector. The outputs can be heterogeneous -- spectra,
-    photometry, stellar labels, or anything else measured for the same objects -- and
-    each one carries its own transform from the latents, plus an optional transform of
-    its reported errors. The observed data are taken to be Gaussian about the predicted
-    values. While the framework is general, it was written with stellar spectroscopic
-    data in mind.
+    This is a general model-construction framework for constructing Latent Variable
+    Models (LVMs). Each object is represented by a latent vector, and every observed
+    output is generated as a transformation away from that vector. The outputs can be
+    heterogeneous -- spectra, photometry, stellar labels, or anything else measured for
+    the same objects -- and each one carries its own transform from the latents, plus an
+    optional transform of its reported errors. The observed data (observed output
+    values) are assumed to be drawn from a Gaussian about the predicted values. While
+    the framework is general, it was written with stellar spectroscopic data in mind.
 
-    Build a model by constructing it with a latent size and calling
-    :meth:`register_output` once per output, then fit it with :meth:`optimize` or
+    Build a model by specifying the latent size and using :meth:`register_output` to
+    create transforms to outputs. Then fit the model with :meth:`optimize` or
     :meth:`optimize_iterative`.
 
-    Specific architectures ship as subclasses that register their own outputs:
-    :class:`~pollux.models.Lux` and :class:`~pollux.models.Cannon`. Reach for those when
-    one of them describes your model, and for ``LVM`` directly when you want to compose
-    the transforms yourself.
+    We provide specific architectures for stellar spectroscopy as subclasses that
+    register their own outputs: :class:`~pollux.models.Lux` and
+    :class:`~pollux.models.Cannon`.
 
     Parameters
     ----------
@@ -241,9 +242,6 @@ class LVM(eqx.Module):
     """
 
     latent_size: int
-    # Not init=False: architectures register their outputs from inside __init__, so by
-    # the time equinox inspects the instance this holds transform parameters -- and it
-    # warns about array leaves reached through an init=False field.
     outputs: dict[str, LVMOutput] = eqx.field(default_factory=dict)
 
     def register_output(
