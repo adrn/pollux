@@ -1,345 +1,330 @@
-"""Tests for the Cannon model."""
+"""Tests for the Cannon architecture."""
 
+import jax
 import jax.numpy as jnp
 import numpy as np
+import numpyro.distributions as dist
 import pytest
 
 import pollux as plx
+import pollux.exceptions as plx_exceptions
+from pollux._linalg import weighted_least_squares
 from pollux.models import Cannon
-from pollux.models.transforms import LinearTransform, PolyFeatureTransform
+from pollux.models.iterative import _latents_from_data
+from pollux.models.transforms import (
+    LinearTransform,
+    NoOpTransform,
+    PolyFeatureTransform,
+    ScatterTransform,
+    TransformSequence,
+)
+
+jax.config.update("jax_enable_x64", True)
 
 
 class TestCannonBasic:
-    """Basic tests for Cannon initialization and properties."""
+    """Construction and the polynomial feature bookkeeping."""
 
     def test_init(self):
-        """Test basic initialization."""
         cannon = Cannon(label_size=3, output_size=100, poly_degree=2)
-        assert cannon.label_size == 3
-        assert cannon.output_size == 100
+        assert cannon.latent_size == 3  # the latents are the labels
         assert cannon.poly_degree == 2
         assert cannon.include_bias is True
-        assert cannon.is_fitted is False
-        assert cannon.coeffs is None
-        assert cannon.scatter is None
+        assert isinstance(cannon, plx.LVM)
 
-    def test_n_features(self):
-        """Test n_features property for various configurations."""
-        # 3 labels, degree 2, with bias: C(3+2, 2) = 10
-        cannon = Cannon(label_size=3, output_size=100, poly_degree=2)
-        assert cannon.n_features == 10
-
-        # 2 labels, degree 2, with bias: C(2+2, 2) = 6
-        cannon = Cannon(label_size=2, output_size=100, poly_degree=2)
-        assert cannon.n_features == 6
-
-        # 3 labels, degree 1, with bias: C(3+1, 1) = 4
-        cannon = Cannon(label_size=3, output_size=100, poly_degree=1)
-        assert cannon.n_features == 4
-
-        # 3 labels, degree 2, no bias: C(3+2, 2) - 1 = 9
+    @pytest.mark.parametrize(
+        ("label_size", "poly_degree", "include_bias", "expected"),
+        [
+            (3, 2, True, 10),  # C(3+2, 2)
+            (2, 2, True, 6),  # C(2+2, 2)
+            (3, 1, True, 4),  # C(3+1, 1)
+            (3, 2, False, 9),  # C(3+2, 2) - 1
+        ],
+    )
+    def test_n_features(self, label_size, poly_degree, include_bias, expected):
         cannon = Cannon(
-            label_size=3, output_size=100, poly_degree=2, include_bias=False
+            label_size=label_size,
+            output_size=100,
+            poly_degree=poly_degree,
+            include_bias=include_bias,
         )
-        assert cannon.n_features == 9
+        assert cannon.n_features == expected
 
     def test_get_features(self):
-        """Test polynomial feature expansion."""
         cannon = Cannon(label_size=2, output_size=10, poly_degree=2)
         labels = jnp.array([[1.0, 2.0], [3.0, 4.0]])
         features = cannon.get_features(labels)
 
         assert features.shape == (2, 6)
         # For degree 2 with bias: [1, x1, x2, x1^2, x1*x2, x2^2]
-        expected_row_0 = jnp.array([1.0, 1.0, 2.0, 1.0, 2.0, 4.0])
-        assert jnp.allclose(features[0], expected_row_0)
+        assert jnp.allclose(features[0], jnp.array([1.0, 1.0, 2.0, 1.0, 2.0, 4.0]))
 
 
-class TestCannonFit:
-    """Tests for Cannon fitting."""
+class TestCannonStructure:
+    """The registered outputs are what make this the Cannon."""
 
-    def test_fit_simple_linear(self):
-        """Test fitting a simple linear relationship (degree 1)."""
-        rng = np.random.default_rng(42)
-        n_stars = 100
-        n_labels = 2
-        n_pixels = 50
+    def test_registers_labels_and_output(self):
+        cannon = Cannon(label_size=3, output_size=100)
+        assert sorted(cannon.outputs) == ["flux", "label"]
 
-        # Generate labels
-        labels = jnp.array(rng.standard_normal((n_stars, n_labels)))
+    def test_labels_are_the_latents(self):
+        """A NoOpTransform on the labels is what ties the latents to them."""
+        cannon = Cannon(label_size=3, output_size=100)
+        assert isinstance(cannon.outputs["label"].data_transform, NoOpTransform)
 
-        # Create true coefficients: bias + linear terms
-        # For degree=1: features are [1, x1, x2], so 3 features
-        true_coeffs = jnp.array(rng.standard_normal((n_pixels, 3)))
+    def test_output_is_poly_then_linear(self):
+        cannon = Cannon(label_size=3, output_size=100, poly_degree=3)
+        transform = cannon.outputs["flux"].data_transform
+        assert isinstance(transform, TransformSequence)
+        poly, linear = transform.transforms
+        assert isinstance(poly, PolyFeatureTransform)
+        assert poly.degree == 3
+        assert isinstance(linear, LinearTransform)
+        assert linear.output_size == 100
 
-        # Generate features and output
-        cannon = Cannon(label_size=n_labels, output_size=n_pixels, poly_degree=1)
-        features = cannon.get_features(labels)
-        spectra = features @ true_coeffs.T
-
-        # Fit
-        cannon = cannon.fit(labels, spectra)
-
-        assert cannon.is_fitted
-        assert cannon.coeffs.shape == (n_pixels, 3)
-        assert cannon.scatter.shape == (n_pixels,)
-
-        # Coefficients should match well (no noise in data)
-        assert jnp.allclose(cannon.coeffs, true_coeffs, atol=1e-5)
-
-    def test_fit_with_noise(self):
-        """Test fitting with noisy data."""
-        rng = np.random.default_rng(42)
-        n_stars = 500
-        n_labels = 3
-        n_pixels = 100
-        noise_level = 0.1
-
-        # Generate labels
-        labels = jnp.array(rng.standard_normal((n_stars, n_labels)))
-
-        # Create true coefficients
-        cannon = Cannon(label_size=n_labels, output_size=n_pixels, poly_degree=2)
-        true_coeffs = jnp.array(rng.standard_normal((n_pixels, cannon.n_features)))
-
-        # Generate output with noise
-        features = cannon.get_features(labels)
-        spectra_true = features @ true_coeffs.T
-        noise = jnp.array(rng.standard_normal((n_stars, n_pixels)) * noise_level)
-        spectra = spectra_true + noise
-
-        # Fit with inverse variance
-        ivar = jnp.ones_like(spectra) / noise_level**2
-        cannon = cannon.fit(labels, spectra, output_ivar=ivar)
-
-        assert cannon.is_fitted
-        # Scatter should be close to noise level
-        assert jnp.isclose(jnp.mean(cannon.scatter), noise_level, atol=0.02)
-
-    def test_fit_with_regularization(self):
-        """Test that regularization shrinks coefficients."""
-        rng = np.random.default_rng(42)
-        n_stars = 100
-        n_labels = 3
-        n_pixels = 50
-
-        labels = jnp.array(rng.standard_normal((n_stars, n_labels)))
-        spectra = jnp.array(rng.standard_normal((n_stars, n_pixels)))
-
-        cannon = Cannon(label_size=n_labels, output_size=n_pixels, poly_degree=2)
-
-        # Fit without regularization
-        cannon_unreg = cannon.fit(labels, spectra, regularization=0.0)
-
-        # Fit with regularization
-        cannon_reg = cannon.fit(labels, spectra, regularization=1.0)
-
-        # Regularized coefficients should have smaller norm
-        unreg_norm = jnp.linalg.norm(cannon_unreg.coeffs)
-        reg_norm = jnp.linalg.norm(cannon_reg.coeffs)
-        assert reg_norm < unreg_norm
-
-    def test_fit_validation_errors(self):
-        """Test that fit raises errors for invalid inputs."""
-        cannon = Cannon(label_size=3, output_size=100, poly_degree=2)
-
-        # Wrong label size
-        with pytest.raises(ValueError, match="Expected labels with 3 columns"):
-            cannon.fit(jnp.zeros((10, 2)), jnp.zeros((10, 100)))
-
-        # Wrong output size
-        with pytest.raises(ValueError, match="Expected output with 100 columns"):
-            cannon.fit(jnp.zeros((10, 3)), jnp.zeros((10, 50)))
-
-        # Mismatched number of stars
-        with pytest.raises(ValueError, match="labels has 10 stars but output has 20"):
-            cannon.fit(jnp.zeros((10, 3)), jnp.zeros((20, 100)))
-
-
-class TestCannonPredict:
-    """Tests for Cannon prediction."""
-
-    def test_predict_unfitted_raises(self):
-        """Test that predict raises error before fitting."""
-        cannon = Cannon(label_size=3, output_size=100, poly_degree=2)
-        with pytest.raises(RuntimeError, match="must be fitted"):
-            cannon.predict(jnp.zeros((10, 3)))
-
-    def test_predict_wrong_label_size(self):
-        """Test that predict raises error for wrong label size."""
-        cannon = Cannon(label_size=3, output_size=100, poly_degree=2)
-        # Manually set coeffs to make it "fitted"
+    def test_custom_output_names(self):
         cannon = Cannon(
-            label_size=3,
-            output_size=100,
-            poly_degree=2,
-            coeffs=jnp.zeros((100, 10)),
-            scatter=jnp.zeros(100),
+            label_size=2, output_size=8, label_name="params", output_name="spec"
         )
-        with pytest.raises(ValueError, match="Expected labels with 3 columns"):
-            cannon.predict(jnp.zeros((10, 2)))
+        assert sorted(cannon.outputs) == ["params", "spec"]
 
-    def test_predict_roundtrip(self):
-        """Test that fit/predict roundtrips work."""
-        rng = np.random.default_rng(42)
-        n_stars = 100
-        n_labels = 3
-        n_pixels = 50
+    def test_same_name_twice_raises(self):
+        """register_output already refuses a duplicate; no extra guard needed."""
+        with pytest.raises(ValueError, match="already exists"):
+            Cannon(label_size=2, output_size=8, label_name="x", output_name="x")
 
-        labels = jnp.array(rng.standard_normal((n_stars, n_labels)))
-        cannon = Cannon(label_size=n_labels, output_size=n_pixels, poly_degree=2)
-        true_coeffs = jnp.array(rng.standard_normal((n_pixels, cannon.n_features)))
+    def test_scatter_on_the_spectrum_by_default(self):
+        """The per-pixel s_lambda is fitted; the catalog label errors are not."""
+        cannon = Cannon(label_size=3, output_size=100)
+        assert isinstance(cannon.outputs["flux"].err_transform, ScatterTransform)
+        assert isinstance(cannon.outputs["label"].err_transform, NoOpTransform)
 
-        features = cannon.get_features(labels)
-        spectra = features @ true_coeffs.T
+    def test_scatter_on_both_when_asked(self):
+        cannon = Cannon(label_size=3, output_size=100, intrinsic_scatter=True)
+        for output in cannon.outputs.values():
+            assert isinstance(output.err_transform, ScatterTransform)
 
-        # Fit and predict
-        cannon = cannon.fit(labels, spectra)
-        predicted = cannon.predict(labels)
+    def test_scatter_can_be_selected(self):
+        cannon = Cannon(label_size=3, output_size=100, intrinsic_scatter=["flux"])
+        assert isinstance(cannon.outputs["flux"].err_transform, ScatterTransform)
+        assert isinstance(cannon.outputs["label"].err_transform, NoOpTransform)
 
-        assert jnp.allclose(predicted, spectra, atol=1e-5)
+    def test_scatter_prior_scale_from_mapping(self):
+        cannon = Cannon(
+            label_size=3, output_size=100, intrinsic_scatter={"label": 0.1, "flux": 1.0}
+        )
+        assert np.isclose(cannon.outputs["label"].err_transform.priors["s"].scale, 0.1)
+        assert np.isclose(cannon.outputs["flux"].err_transform.priors["s"].scale, 1.0)
 
-
-class TestCannonTransformSequence:
-    """Tests for Cannon-to-TransformSequence conversion."""
-
-    def test_to_transform_sequence(self):
-        """Test conversion to TransformSequence."""
-        cannon = Cannon(label_size=3, output_size=128, poly_degree=2)
-        transform = cannon.to_transform_sequence()
-
-        assert isinstance(transform, plx.models.TransformSequence)
-        assert len(transform.transforms) == 2
-        assert isinstance(transform.transforms[0], PolyFeatureTransform)
-        assert isinstance(transform.transforms[1], LinearTransform)
-        assert transform.transforms[0].degree == 2
-        assert transform.transforms[1].output_size == 128
-
-    def test_get_coeffs_unfitted_raises(self):
-        """Test that getting coeffs before fitting raises error."""
-        cannon = Cannon(label_size=3, output_size=100, poly_degree=2)
-        with pytest.raises(RuntimeError, match="must be fitted"):
-            cannon.get_coeffs_as_transform_pars()
-
-    def test_get_coeffs_as_transform_pars(self):
-        """Test getting coefficients in transform parameter format."""
-        rng = np.random.default_rng(42)
-        n_stars = 100
-        n_labels = 3
-        n_pixels = 50
-
-        labels = jnp.array(rng.standard_normal((n_stars, n_labels)))
-        cannon = Cannon(label_size=n_labels, output_size=n_pixels, poly_degree=2)
-
-        features = cannon.get_features(labels)
-        spectra = jnp.array(rng.standard_normal((n_stars, n_pixels)))
-
-        cannon = cannon.fit(labels, spectra)
-        pars = cannon.get_coeffs_as_transform_pars()
-
-        assert "data" in pars
-        assert isinstance(pars["data"], list)
-        assert len(pars["data"]) == 2
-        assert pars["data"][0] == {}  # PolyFeatureTransform has no params
-        assert "A" in pars["data"][1]
-        assert pars["data"][1]["A"].shape == (n_pixels, cannon.n_features)
-
-    def test_cannon_with_lux_model(self):
-        """Test using Cannon's TransformSequence with Lux."""
-        rng = np.random.default_rng(42)
-        n_stars = 50
-        n_labels = 3
-        n_pixels = 20
-
-        # Create and fit Cannon
-        labels = jnp.array(rng.standard_normal((n_stars, n_labels)))
-        cannon = Cannon(label_size=n_labels, output_size=n_pixels, poly_degree=2)
-        features = cannon.get_features(labels)
-        true_coeffs = jnp.array(rng.standard_normal((n_pixels, cannon.n_features)))
-        spectra = features @ true_coeffs.T
-
-        cannon = cannon.fit(labels, spectra)
-
-        # Create Lux with Cannon's transform
-        model = plx.Lux(latent_size=n_labels)
-        transform = cannon.to_transform_sequence()
-        model.register_output("flux", transform)
-
-        # Get Cannon's fitted params and use them to predict
-        cannon_pars = cannon.get_coeffs_as_transform_pars()
-
-        # Predict using Lux with Cannon's coefficients
-        predicted = model.predict_outputs(labels, {"flux": cannon_pars})
-
-        # Should match Cannon's prediction
-        cannon_predicted = cannon.predict(labels)
-        assert jnp.allclose(predicted["flux"], cannon_predicted, atol=1e-5)
+    def test_coeff_prior_is_the_regularization_knob(self):
+        cannon = Cannon(label_size=3, output_size=8, coeff_prior=dist.Normal(0.0, 0.5))
+        prior = cannon.outputs["flux"].data_transform.transforms[1].priors["A"]
+        assert np.isclose(prior.scale, 0.5)
 
 
-class TestCannonEndToEnd:
-    """End-to-end integration tests for Cannon."""
+@pytest.fixture
+def cannon_and_data():
+    """A Cannon plus data generated from known coefficients.
 
-    def test_realistic_workflow(self):
-        """Test a realistic Cannon workflow with train/test split."""
-        rng = np.random.default_rng(42)
-        n_train = 500
-        n_test = 100
-        n_labels = 3
-        n_pixels = 100
-        noise_level = 0.05
+    No intrinsic scatter, so the weights in the closed-form solve are exactly the
+    inverse variances of the reported errors.
+    """
+    rng = np.random.default_rng(42)
+    n_stars, n_labels, n_flux = 200, 3, 25
 
-        # Generate training data
-        train_labels = jnp.array(rng.standard_normal((n_train, n_labels)))
+    cannon = Cannon(
+        label_size=n_labels, output_size=n_flux, poly_degree=2, intrinsic_scatter=False
+    )
+    labels = jnp.array(rng.normal(size=(n_stars, n_labels)))
+    features = cannon.get_features(labels)
+    theta = jnp.array(rng.normal(size=(n_flux, cannon.n_features)))
+    flux_err = jnp.array(rng.uniform(0.02, 0.2, size=(n_stars, n_flux)))
+    flux = features @ theta.T + jnp.array(rng.normal(size=flux_err.shape)) * flux_err
 
-        # True model: polynomial relationship
-        cannon = Cannon(label_size=n_labels, output_size=n_pixels, poly_degree=2)
-        true_coeffs = jnp.array(rng.standard_normal((n_pixels, cannon.n_features)))
-        true_coeffs = true_coeffs * 0.1  # Scale down for realistic magnitudes
+    data = plx.data.PolluxData(
+        label=plx.data.OutputData(labels, err=jnp.full((n_stars, n_labels), 1e-3)),
+        flux=plx.data.OutputData(flux, err=flux_err),
+    )
+    return {
+        "cannon": cannon,
+        "data": data,
+        "labels": labels,
+        "features": features,
+        "theta": theta,
+        "flux": flux,
+        "flux_err": flux_err,
+    }
 
-        train_features = cannon.get_features(train_labels)
-        train_spectra_true = train_features @ true_coeffs.T
-        train_noise = jnp.array(rng.standard_normal((n_train, n_pixels)) * noise_level)
-        train_spectra = train_spectra_true + train_noise
-        train_ivar = jnp.ones_like(train_spectra) / noise_level**2
 
-        # Generate test data
-        test_labels = jnp.array(rng.standard_normal((n_test, n_labels)))
-        test_features = cannon.get_features(test_labels)
-        test_spectra_true = test_features @ true_coeffs.T
+def _train(cannon, data, labels):
+    """The classic Cannon training step: pin the latents, solve the coefficients."""
+    return cannon.optimize_iterative(
+        data,
+        blocks=["flux:data"],
+        fixed_pars={"latents": labels},
+        max_cycles=1,
+        progress=False,
+    )
 
-        # Fit Cannon
-        cannon = cannon.fit(train_labels, train_spectra, train_ivar)
 
-        # Predict on test set
-        predicted = cannon.predict(test_labels)
+# The polynomial feature expansion makes the output non-affine in the latents, so any
+# block that solves for the latents is downgraded from a closed form to gradient
+# descent -- correctly, and loudly. Cannon users will meet this warning too.
+expect_latents_fallback = pytest.mark.filterwarnings(
+    "ignore:optimize_iterative could not use closed-form:"
+    "pollux.exceptions.PolluxLinearizationWarning"
+)
 
-        # Check prediction accuracy
-        residuals = predicted - test_spectra_true
-        rms = jnp.sqrt(jnp.mean(residuals**2))
 
-        # Should be close to noise level (can be somewhat larger due to finite
-        # training set and regularization)
-        assert rms < noise_level * 2
+class TestCannonTraining:
+    def test_matches_per_pixel_weighted_least_squares(self, cannon_and_data):
+        """The framework must land on the same closed form the old fit() solved.
 
+        This is the whole justification for rebuilding the Cannon on LVM: the
+        per-pixel solve is still an exact weighted least squares, now reached through
+        optimize_iterative's linear-block detection.
+        """
+        c = cannon_and_data
+        cannon, features = c["cannon"], c["features"]
+
+        # LinearTransform's default Normal(0, 1) prior is a ridge term of strength 1.0,
+        # which is what optimize_iterative derives from it.
+        reg = 1.0 * jnp.eye(cannon.n_features)
+        ivar = 1.0 / c["flux_err"] ** 2
+        expected = jax.vmap(lambda y, w: weighted_least_squares(features, y, w, reg))(
+            c["flux"].T, ivar.T
+        )
+
+        res = _train(cannon, c["data"], c["labels"])
+        assert jnp.allclose(res.params["flux"]["data"][1]["A"], expected)
+
+    def test_recovers_known_coefficients(self, cannon_and_data):
+        c = cannon_and_data
+        res = _train(c["cannon"], c["data"], c["labels"])
+        fitted = res.params["flux"]["data"][1]["A"]
+        assert fitted.shape == (25, c["cannon"].n_features)
+        assert jnp.allclose(fitted, c["theta"], atol=0.1)
+
+    def test_a_narrower_coeff_prior_shrinks_the_coefficients(self, cannon_and_data):
+        """Regularization is the prior on the coefficients."""
+        c = cannon_and_data
+        loose = _train(c["cannon"], c["data"], c["labels"])
+        tight_cannon = Cannon(
+            label_size=3,
+            output_size=25,
+            poly_degree=2,
+            intrinsic_scatter=False,
+            coeff_prior=dist.Normal(0.0, 1e-2),
+        )
+        tight = _train(tight_cannon, c["data"], c["labels"])
+
+        loose_norm = jnp.sum(loose.params["flux"]["data"][1]["A"] ** 2)
+        tight_norm = jnp.sum(tight.params["flux"]["data"][1]["A"] ** 2)
+        assert tight_norm < loose_norm
+
+    def test_predict_round_trip(self, cannon_and_data):
+        c = cannon_and_data
+        res = _train(c["cannon"], c["data"], c["labels"])
+        pred = c["cannon"].predict_outputs(res.params)
+
+        # The labels come back through the NoOpTransform untouched
+        assert jnp.allclose(pred["label"], c["labels"])
+        resid = pred["flux"] - c["flux"]
+        assert jnp.sqrt(jnp.mean(resid**2)) < 0.2
+
+
+class TestCannonLabelInference:
+    """The other half of the Cannon: labels for stars with only a spectrum."""
+
+    @expect_latents_fallback
+    def test_infers_labels_with_output_params_fixed(self, cannon_and_data):
+        c = cannon_and_data
+        cannon, labels = c["cannon"], c["labels"]
+        trained = _train(cannon, c["data"], labels)
+
+        flux_only = plx.data.PolluxData(flux=c["data"]["flux"])
+        res = cannon.optimize_iterative(
+            flux_only,
+            blocks=["latents"],
+            fixed_pars=cannon.output_pars(trained.params),
+            max_cycles=20,
+            tol=1e-8,
+            rng_key=jax.random.PRNGKey(0),
+            progress=False,
+        )
+
+        inferred = res.params["latents"]
+        assert inferred.shape == labels.shape
+
+        # Labels are recovered from the spectra alone -- for nearly every star. A
+        # degree-2 polynomial is not convex in the labels, so a minority of stars
+        # settle into a different basin however long the optimizer runs, and an RMS
+        # over all of them is dominated by those. Assert the bulk recovery instead,
+        # which is what the model actually promises.
+        err = jnp.abs(inferred - labels)
+        assert jnp.median(err) < 0.05
+        off = jnp.mean(jnp.max(err, axis=1) > 0.2)
+        assert off < 0.1, f"{off:.1%} of stars found a different basin"
+
+    def test_latents_block_is_not_closed_form(self, cannon_and_data):
+        """The polynomial in the labels is exactly why: it is not affine in them."""
+        c = cannon_and_data
+        cannon = c["cannon"]
+        flux_only = plx.data.PolluxData(flux=c["data"]["flux"])
+        trained = _train(cannon, c["data"], c["labels"])
+
+        with pytest.warns(
+            plx_exceptions.PolluxLinearizationWarning, match="not affine in the latents"
+        ):
+            cannon.optimize_iterative(
+                flux_only,
+                blocks=["latents"],
+                fixed_pars=cannon.output_pars(trained.params),
+                max_cycles=1,
+                rng_key=jax.random.PRNGKey(0),
+                progress=False,
+            )
+
+    def test_warm_start_uses_the_observed_labels(self, cannon_and_data):
+        """The NoOpTransform passthrough lets the latents start at the labels."""
+        c = cannon_and_data
+        observed = _latents_from_data(c["cannon"], c["data"])
+        assert observed is not None
+        assert jnp.allclose(observed, c["labels"])
+
+
+class TestCannonWithScatter:
+    """With the scatter on, it is fitted alongside everything else."""
+
+    @expect_latents_fallback
+    def test_default_blocks_include_the_scatters(self, cannon_and_data):
+        c = cannon_and_data
+        cannon = Cannon(
+            label_size=3, output_size=25, poly_degree=2, intrinsic_scatter=True
+        )
+        res = cannon.optimize_iterative(
+            c["data"], max_cycles=1, rng_key=jax.random.PRNGKey(0), progress=False
+        )
+        names = [b.name for b in res.blocks]
+        assert "flux:err" in names
+        assert res.params["flux"]["err"]["s"].shape == (25,)
+        assert jnp.all(res.params["flux"]["err"]["s"] >= 0)
+
+    @expect_latents_fallback
+    def test_coefficient_block_still_gets_a_closed_form(self, cannon_and_data):
+        """The polynomial-then-linear output stays exactly solvable."""
+        c = cannon_and_data
+        cannon = Cannon(label_size=3, output_size=25, poly_degree=2)
+        res = cannon.optimize_iterative(
+            c["data"], max_cycles=1, rng_key=jax.random.PRNGKey(0), progress=False
+        )
+        solvers = {b.name: b.optimizer for b in res.blocks}
+        assert solvers["flux:data"] == "least_squares"
+
+
+class TestCannonHighDegree:
     def test_high_degree_polynomial(self):
-        """Test with higher degree polynomial."""
-        rng = np.random.default_rng(42)
-        n_stars = 200
-        n_labels = 2
-        n_pixels = 30
-
-        labels = jnp.array(rng.standard_normal((n_stars, n_labels)))
-        cannon = Cannon(label_size=n_labels, output_size=n_pixels, poly_degree=4)
-
-        # With degree 4 and 2 labels: C(2+4, 4) = 15 features
+        """Degree 4 with 2 labels: C(2+4, 4) = 15 features."""
+        cannon = Cannon(label_size=2, output_size=6, poly_degree=4)
         assert cannon.n_features == 15
-
-        features = cannon.get_features(labels)
-        true_coeffs = jnp.array(rng.standard_normal((n_pixels, cannon.n_features)))
-        spectra = features @ true_coeffs.T
-
-        cannon = cannon.fit(labels, spectra)
-        predicted = cannon.predict(labels)
-
-        # Higher degree polynomials have more numerical precision issues
-        assert jnp.allclose(predicted, spectra, atol=1e-3)
+        assert cannon.get_features(jnp.zeros((3, 2))).shape == (3, 15)

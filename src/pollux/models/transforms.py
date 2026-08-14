@@ -14,7 +14,7 @@ __all__ = [
     "ParamPriorsT",
     "ParamShapesT",
     "PolyFeatureTransform",
-    "QuadraticTransform",
+    "ScatterTransform",
     "ShapeT",
     "TransformSequence",
 ]
@@ -40,7 +40,6 @@ from ..typing import (
     LatentsT,
     LinearT,
     OutputT,
-    QuadT,
     TransformFuncT,
 )
 
@@ -923,34 +922,51 @@ class AffineTransform(AbstractSingleTransform):
 # ----
 
 
-def _quadratic_transform(z: LatentsT, Q: QuadT, A: LinearT, b: OutputT) -> OutputT:
-    """Apply a quadratic transformation.
+def _scatter_transform(err: OutputT, s: OutputT) -> OutputT:
+    """Add an intrinsic scatter in quadrature to the reported errors.
 
-    Computes a quadratic form plus a linear term and an offset: z^T Q z + A @ z + b.
+    Computes sqrt(err^2 + s^2).
     """
-    return jnp.einsum("i,oij,j->o", z, Q, z) + A @ z + b
+    return jnp.sqrt(err**2 + s**2)
 
 
-class QuadraticTransform(AbstractSingleTransform):
-    """Quadratic transformation of latent vectors.
+class ScatterTransform(AbstractSingleTransform):
+    """Intrinsic scatter added in quadrature to the reported errors.
 
-    Implements the transformation: y = z^T Q z + A @ z + b, where Q is a tensor,
-    A is a matrix, z is a latent vector, and b is a bias vector.
+    Implements the transformation: y = sqrt(err^2 + s^2), where ``s`` is a fitted
+    per-element scatter. This is meant to be used as the ``err_transform`` of an
+    output, where it absorbs variance the reported errors do not account for.
+
+    The prior on ``s`` is an ordinary field, so the scale that suits your data --
+    which depends on how the output was preprocessed -- can be set at construction.
+
+    Examples
+    --------
+    >>> import numpyro.distributions as dist
+    >>> from pollux.models.transforms import ScatterTransform
+    >>> trans = ScatterTransform(output_size=8)
+    >>> wider = ScatterTransform(output_size=8, priors={"s": dist.HalfNormal(5.0)})
     """
 
-    transform: TransformFuncT = _quadratic_transform
+    transform: TransformFuncT = _scatter_transform
     priors: ParamPriorsT = eqx.field(
-        default=ImmutableMap(
-            {"Q": dist.Normal(0, 1), "A": dist.Normal(0, 1), "b": dist.Normal(0, 1)}
-        ),
+        default=ImmutableMap({"s": dist.HalfNormal(1.0)}),
         converter=ImmutableMap,
     )
-    shapes: ParamShapesT = ImmutableMap(
-        {
-            "Q": ("output_size", "latent_size", "latent_size"),
-            "A": ("output_size", "latent_size"),
-            "b": ("output_size",),
-        }
+    shapes: ParamShapesT = ImmutableMap({"s": ("output_size",)})
+
+
+def scatter_at_scale(output_size: int, scale: float | None) -> ScatterTransform:
+    """A :class:`ScatterTransform` with its ``HalfNormal`` prior at ``scale``.
+
+    ``scale=None`` keeps the transform's own default prior, so that default is
+    written down in exactly one place. Architectures use this to turn a
+    per-output scatter selector into transforms.
+    """
+    if scale is None:
+        return ScatterTransform(output_size=output_size)
+    return ScatterTransform(
+        output_size=output_size, priors={"s": dist.HalfNormal(scale)}
     )
 
 
@@ -1043,10 +1059,10 @@ class EquinoxNNTransform(AbstractTransform):
     ...     bias_prior=dist.Normal(0, 0.01),
     ... )
 
-    Use with Lux:
+    Use with LVM:
 
     >>> import pollux as plx
-    >>> model = plx.Lux(latent_size=8)
+    >>> model = plx.LVM(latent_size=8)
     >>> model.register_output("flux", nn_trans)
     """
 
@@ -1184,9 +1200,3 @@ class EquinoxNNTransform(AbstractTransform):
     ) -> dict[str, Any]:
         """Pack parameters (identity, keyed by NN parameter path)."""
         return self.unpack_pars(nested_pars, ignore_missing=ignore_missing)
-
-
-# ----
-
-
-# ----

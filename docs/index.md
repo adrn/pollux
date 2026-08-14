@@ -3,20 +3,29 @@
 ## Introduction
 
 Pollux is a Python library for building data-driven latent variable models. You define a
-latent space and compose transforms from it to any number of observed outputs, which can
-be heterogeneous — spectra, photometry, stellar labels, or anything else measured for
-the same objects. Pollux keeps track of the model parameters and hands the assembled
-model to [numpyro][numpyro] for inference. It is built on [JAX][jax] and is designed for
-use in probabilistic and machine learning contexts.
+latent space and compose transforms from the latent space to any number of observed
+outputs, which can be heterogeneous (e.g., spectra, photometry, stellar labels, or
+anything else measured for the same objects). Pollux keeps track of the model parameters
+and hands the assembled model to [numpyro][numpyro] for inference. It is built on
+[JAX][jax] and is designed for use in both generative/probabilistic and machine learning
+contexts.
 
-The framework is general, but it was written with stellar spectroscopy in mind, and two
-ready-made models ship with it:
+The framework itself is implemented with the {py:class}`~pollux.models.LVM` class. To
+construct a model, you specify a latent size (dimensionality) plus a set of named
+outputs, each with its own transform from the latents and an optional transform of its
+reported errors.
 
-- [_Lux_](https://arxiv.org/abs/2502.01745): Multi-output, generative, latent variable
-  models for inferring embedded representations of spectroscopic and many other kinds of
-  data.
-- [_Cannon_](https://arxiv.org/abs/1501.07604): Data-driven models for inferring stellar
-  parameters, element abundances, and other labels from stellar spectra.
+The framework is general, but it was written with stellar spectroscopy in mind. Pollux
+provides a few ready-made model architectures with spectroscopy in mind. Both are `LVM`
+subclasses that register their own outputs, so they are fitted and used exactly like any
+other LVM model instance:
+
+- {py:class}`~pollux.models.Lux` ([paper](https://arxiv.org/abs/2502.01745)):
+  Multi-output, generative, latent variable models for inferring embedded
+  representations of spectroscopic and many other kinds of data.
+- {py:class}`~pollux.models.Cannon` ([paper](https://arxiv.org/abs/1501.07604)):
+  Data-driven models for inferring stellar parameters, element abundances, and other
+  labels from stellar spectra.
 
 ---
 
@@ -34,6 +43,31 @@ or with [uv][uv]:
 uv add pollux
 ```
 
+## Get Started
+
+The best way to get started with `pollux` is to work through the tutorials:
+
+```{eval-rst}
+.. include:: _tutorials.rst
+```
+
+```{toctree}
+:maxdepth: 1
+:caption: Technical Notes
+
+linear-solves.md
+```
+
+```{toctree}
+:maxdepth: 1
+:hidden:
+:caption: API Reference
+
+api/index.md
+```
+
+### Development installation
+
 To install the unreleased development version, point either tool at the repository
 instead:
 
@@ -42,10 +76,8 @@ pip install git+https://github.com/adrn/pollux
 uv add git+https://github.com/adrn/pollux
 ```
 
-### Development installation
-
-Clone the repository, then set up an environment with the development dependencies — the
-test suite, the documentation build, and the linters:
+For local development, clone the repository, then set up an environment with the
+development dependencies — the test suite, the documentation build, and the linters:
 
 ```bash
 uv sync                                        # everything, in .venv
@@ -70,26 +102,3 @@ Then run the tests with `uv run pytest` or `pytest`.
 [numpyro]: https://num.pyro.ai/
 [uv]: https://docs.astral.sh/uv/
 [pep735]: https://peps.python.org/pep-0735/
-
-## Get Started
-
-The best way to get started with `pollux` is to work through the tutorials:
-
-```{eval-rst}
-.. include:: _tutorials.rst
-```
-
-```{toctree}
-:maxdepth: 1
-:caption: Technical Notes
-
-linear-solves.md
-```
-
-```{toctree}
-:maxdepth: 1
-:hidden:
-:caption: API Reference
-
-api/index.md
-```

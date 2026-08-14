@@ -1,7 +1,7 @@
 # Linearized, Closed-form solves
 
 After constructing a model, you can optimize it either with stochastic variational
-inference (SVI) via the {py:func}`~pollux.models.lux.Lux.optimize` method or with
+inference (SVI) via the {py:meth}`~pollux.models.LVM.optimize` method or with
 `optimize_iterative`. `optimize_iterative` fits a model by block coordinate descent: it
 cycles through blocks of parameters, optimizing each block while holding the others
 fixed. The reason this is worth doing is that some of the sub-problems are linear in the
@@ -37,7 +37,7 @@ def latent_slice(lo, hi):
     return trans.FunctionTransform(output_size=hi - lo, transform=lambda z: z[lo:hi])
 
 
-model = plx.Lux(latent_size=4)
+model = plx.LVM(latent_size=4)
 model.register_output(
     "spec",
     trans.TransformSequence(
@@ -92,7 +92,7 @@ z0 = jnp.zeros((n_data, latent_size))
 
 
 def predict(latents):
-    return model.predict_outputs(latents, params, names=["spec"])["spec"]
+    return model.predict_outputs(params, latents, names=["spec"])["spec"]
 
 
 b, jvp = jax.linearize(predict, z0)

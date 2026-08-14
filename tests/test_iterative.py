@@ -26,6 +26,7 @@ from pollux.models.iterative import (
     _linearize_latents,
     _optimize_block_numpyro,
     _output_predict_fn,
+    _participating_outputs,
     _solve_latents_least_squares,
     _solve_output_params_least_squares,
     _split_param_layer,
@@ -37,6 +38,7 @@ from pollux.models.transforms import (
     LinearTransform,
     NoOpTransform,
     PolyFeatureTransform,
+    ScatterTransform,
     TransformSequence,
 )
 
@@ -45,14 +47,14 @@ jax.config.update("jax_enable_x64", True)
 
 @pytest.fixture
 def linear_model_and_data():
-    """A Lux model with a single linear output, plus matching synthetic data."""
+    """A LVM model with a single linear output, plus matching synthetic data."""
     n_stars = 32
     n_latents = 4
     n_flux = 16
 
     rng = np.random.default_rng(123)
 
-    model = plx.Lux(latent_size=n_latents)
+    model = plx.LVM(latent_size=n_latents)
     model.register_output("flux", LinearTransform(output_size=n_flux))
 
     true_A = rng.normal(size=(n_flux, n_latents)) * 0.5
@@ -119,7 +121,7 @@ class TestLeastSquaresBlocker:
     def test_a_sequence_of_linear_pieces_is_solvable(self):
         """A composition used to be refused outright for being a TransformSequence."""
         n_stars, n_out = 8, 5
-        model = plx.Lux(latent_size=4)
+        model = plx.LVM(latent_size=4)
         model.register_output(
             "flux",
             TransformSequence(
@@ -222,7 +224,7 @@ class TestLinearizeLatents:
         A = jax.random.normal(jax.random.PRNGKey(1), (n_out, n_latents))
         offset = jax.random.normal(jax.random.PRNGKey(2), (n_stars,))
 
-        model = plx.Lux(latent_size=n_latents)
+        model = plx.LVM(latent_size=n_latents)
         model.register_output(
             "flux",
             TransformSequence(
@@ -319,7 +321,7 @@ class TestSolveLatentsComposed:
         A1 = jnp.array(rng.normal(size=(n_out1, 2)))
         A2 = jnp.array(rng.normal(size=(n_out2, 2)))
 
-        model = plx.Lux(latent_size=4)
+        model = plx.LVM(latent_size=4)
         for name, lo, hi, A in [("spec", 0, 2, A1), ("labels", 2, 4, A2)]:
             model.register_output(
                 name,
@@ -352,7 +354,7 @@ class TestSolveLatentsComposed:
         A = jnp.array(rng.normal(size=(n_out, n_latents)))
         offset = jnp.array(rng.normal(size=n_stars) * 20.0)
 
-        model = plx.Lux(latent_size=n_latents)
+        model = plx.LVM(latent_size=n_latents)
         model.register_output(
             "flux",
             TransformSequence(
@@ -383,7 +385,7 @@ class TestSolveLatentsComposed:
         latents = jnp.array(rng.normal(size=(n_stars, n_latents)))
         A = jnp.array(rng.normal(size=(n_out, n_latents)))
 
-        model = plx.Lux(latent_size=n_latents)
+        model = plx.LVM(latent_size=n_latents)
         model.register_output(
             "flux",
             TransformSequence(
@@ -417,7 +419,7 @@ class TestSolveLatentsComposed:
         A = jnp.array(rng.normal(size=(n_out, n_latents)))
         offset = jnp.array(rng.normal(size=n_stars))
 
-        model = plx.Lux(latent_size=n_latents)
+        model = plx.LVM(latent_size=n_latents)
         model.register_output(
             "flux",
             TransformSequence(
@@ -449,7 +451,7 @@ class TestSolveLatentsComposed:
         latents = jnp.array(rng.normal(size=(n_stars, n_latents)))
         A = jnp.array(rng.normal(size=(n_out, n_latents)))
 
-        model = plx.Lux(latent_size=n_latents)
+        model = plx.LVM(latent_size=n_latents)
         model.register_output(
             "flux",
             FunctionTransform(
@@ -494,7 +496,7 @@ class TestSolveLatentsComposed:
     def test_nonlinear_output_is_refused_with_a_useful_message(self):
         """Polynomial features of the latents are not affine, so say so."""
         n_stars, n_latents, n_out = 16, 3, 5
-        model = plx.Lux(latent_size=n_latents)
+        model = plx.LVM(latent_size=n_latents)
         model.register_output(
             "flux",
             TransformSequence(
@@ -543,7 +545,7 @@ class TestSolveOutputParamsComposed:
         latents = jnp.array(rng.normal(size=(n_stars, 5)))
         A = jnp.array(rng.normal(size=(n_out, 2)))
 
-        model = plx.Lux(latent_size=5)
+        model = plx.LVM(latent_size=5)
         model.register_output(
             "flux",
             TransformSequence(
@@ -572,7 +574,7 @@ class TestSolveOutputParamsComposed:
         n_features = 10  # 1 + 3 + 6 monomials up to degree 2
         coeffs = jnp.array(rng.normal(size=(n_out, n_features)))
 
-        model = plx.Lux(latent_size=3)
+        model = plx.LVM(latent_size=3)
         model.register_output(
             "flux",
             TransformSequence(
@@ -600,7 +602,7 @@ class TestSolveOutputParamsComposed:
         A = jnp.array(rng.normal(size=(n_out, n_latents)))
         b = jnp.array(rng.normal(size=n_out))
 
-        model = plx.Lux(latent_size=n_latents)
+        model = plx.LVM(latent_size=n_latents)
         model.register_output("flux", AffineTransform(output_size=n_out))
         data = plx.data.PolluxData(
             flux=plx.data.OutputData(
@@ -631,7 +633,7 @@ class TestSolveOutputParamsComposed:
         assert _split_param_layer(transform) is None
 
     def test_unsolvable_output_raises_with_a_useful_message(self):
-        model = plx.Lux(latent_size=3)
+        model = plx.LVM(latent_size=3)
         model.register_output(
             "flux",
             TransformSequence(
@@ -658,7 +660,7 @@ class TestOptimizeIterativePartitionedLatents:
         A_spec = jnp.array(rng.normal(size=(n_spec, 2)))
         A_labels = jnp.array(rng.normal(size=(n_labels, 2)))
 
-        model = plx.Lux(latent_size=4)
+        model = plx.LVM(latent_size=4)
         model.register_output(
             "spec",
             TransformSequence(
@@ -722,22 +724,12 @@ class TestOptimizeIterativePartitionedLatents:
         # branch, so compare predictions rather than the individual factors.
         # Alternating least squares converges linearly on a bilinear problem, so the
         # tolerance is loose: what matters is that it heads for the right answer.
-        predictions = model.predict_outputs(result.params["latents"], result.params)
+        predictions = model.predict_outputs(result.params)
         assert jnp.allclose(predictions["spec"], latents[:, :2] @ A_spec.T, atol=2e-2)
         assert jnp.allclose(
             predictions["labels"], latents[:, 2:] @ A_labels.T, atol=2e-2
         )
         assert result.losses_per_cycle[-1] < result.losses_per_cycle[0]
-
-
-def _intrinsic_scatter(output_size):
-    """An err_transform that adds a per-pixel intrinsic scatter in quadrature."""
-    return FunctionTransform(
-        output_size=output_size,
-        transform=lambda err, s: jnp.sqrt(err**2 + s**2),
-        priors={"s": dist.HalfNormal(1.0).expand((output_size,))},
-        shapes={},
-    )
 
 
 class TestErrTransformParticipates:
@@ -750,11 +742,11 @@ class TestErrTransformParticipates:
         latents = jnp.array(rng.normal(size=(n_stars, n_latents)))
         A = jnp.array(rng.normal(size=(n_flux, n_latents)))
 
-        model = plx.Lux(latent_size=n_latents)
+        model = plx.LVM(latent_size=n_latents)
         model.register_output(
             "flux",
             LinearTransform(output_size=n_flux),
-            err_transform=_intrinsic_scatter(n_flux),
+            err_transform=ScatterTransform(output_size=n_flux),
         )
         data = plx.data.PolluxData(
             flux=plx.data.OutputData(
@@ -830,7 +822,7 @@ class TestLatentsFromData:
         )
 
     def test_passthrough_output_supplies_the_latents(self):
-        model = plx.Lux(latent_size=3)
+        model = plx.LVM(latent_size=3)
         model.register_output("label", NoOpTransform())
         labels = jnp.arange(24.0).reshape(8, 3)
         data = self._data(label=labels)
@@ -839,20 +831,20 @@ class TestLatentsFromData:
     def test_a_transform_that_is_not_the_identity_is_not_used(self):
         """The gate is tested, not assumed: PolyFeatureTransform has no parameters
         either, but it is emphatically not a passthrough."""
-        model = plx.Lux(latent_size=3)
+        model = plx.LVM(latent_size=3)
         model.register_output("poly", PolyFeatureTransform(degree=2))
         data = self._data(poly=jnp.ones((8, 10)))
         assert _latents_from_data(model, data) is None
 
     def test_a_transform_with_parameters_is_not_used(self):
         """Its output only equals the latents for particular parameter values."""
-        model = plx.Lux(latent_size=3)
+        model = plx.LVM(latent_size=3)
         model.register_output("flux", LinearTransform(output_size=3))
         data = self._data(flux=jnp.ones((8, 3)))
         assert _latents_from_data(model, data) is None
 
     def test_a_passthrough_with_no_data_is_not_used(self):
-        model = plx.Lux(latent_size=3)
+        model = plx.LVM(latent_size=3)
         model.register_output("label", NoOpTransform())
         model.register_output("flux", LinearTransform(output_size=5))
         data = self._data(flux=jnp.ones((8, 5)))
@@ -861,7 +853,7 @@ class TestLatentsFromData:
     def test_default_blocks_fit_the_outputs_first_when_seeded(self):
         """Otherwise the first latents step chases prior-sampled output parameters
         and throws the head start away."""
-        seeded = plx.Lux(latent_size=3)
+        seeded = plx.LVM(latent_size=3)
         seeded.register_output("label", NoOpTransform())
         seeded.register_output("flux", LinearTransform(output_size=5))
         data = self._data(label=jnp.ones((8, 3)), flux=jnp.ones((8, 5)))
@@ -872,7 +864,7 @@ class TestLatentsFromData:
 
         # Without a passthrough output there is nothing to seed from, so the latents
         # keep going first
-        plain = plx.Lux(latent_size=3)
+        plain = plx.LVM(latent_size=3)
         plain.register_output("flux", LinearTransform(output_size=5))
         result = plain.optimize_iterative(
             self._data(flux=jnp.ones((8, 5))),
@@ -884,7 +876,7 @@ class TestLatentsFromData:
 
 
 class TestCannonAsLux:
-    """The Cannon written as a Lux model: labels are the latents, flux is poly->linear."""
+    """The Cannon written as a LVM model: labels are the latents, flux is poly->linear."""
 
     @pytest.fixture
     def cannon_model_and_data(self):
@@ -895,7 +887,7 @@ class TestCannonAsLux:
         theta = jnp.array(rng.normal(size=(n_flux, n_features)))
         flux = PolyFeatureTransform(degree=2).apply(labels) @ theta.T
 
-        model = plx.Lux(latent_size=n_labels)
+        model = plx.LVM(latent_size=n_labels)
         model.register_output("label", NoOpTransform())
         model.register_output(
             "flux",
@@ -1048,7 +1040,7 @@ class TestOptimizeIterative:
 
 
 class TestLuxOptimizeIterativeSignature:
-    """The Lux.optimize_iterative method's parameter order."""
+    """The LVM.optimize_iterative method's parameter order."""
 
     def test_blocks_can_be_passed_positionally(self, linear_model_and_data):
         """`model.optimize_iterative(data, blocks)` binds blocks, not max_cycles."""
@@ -1068,7 +1060,7 @@ class TestLuxOptimizeIterativeSignature:
 
     def test_defaults_to_ten_cycles(self):
         """The method keeps its own max_cycles default, not the function's 100."""
-        sig = inspect.signature(plx.Lux.optimize_iterative)
+        sig = inspect.signature(plx.LVM.optimize_iterative)
         assert sig.parameters["max_cycles"].default == 10
         assert list(sig.parameters)[:4] == ["self", "data", "blocks", "fixed_pars"]
 
@@ -1257,7 +1249,7 @@ class TestOptimizeIterativeWithNonlinear:
             vmap=False,
         )
 
-        model = plx.Lux(latent_size=n_latents)
+        model = plx.LVM(latent_size=n_latents)
         model.register_output("flux", transform)
 
         # Generate data
@@ -1384,7 +1376,7 @@ class TestMixedLinearNonlinear:
 
         rng = np.random.default_rng(42)
 
-        model = plx.Lux(latent_size=n_latents)
+        model = plx.LVM(latent_size=n_latents)
 
         # Linear output for labels
         model.register_output("label", LinearTransform(output_size=n_labels))
@@ -1486,3 +1478,89 @@ class TestMixedLinearNonlinear:
 
         assert result.n_cycles >= 1
         assert all(jnp.isfinite(loss) for loss in result.losses_per_cycle)
+
+
+class TestPartialData:
+    """A model is routinely applied to data holding only some of its outputs.
+
+    Inferring labels from spectra alone is the standard test-set step. Every part of
+    the fit has to agree to leave the absent outputs out -- the closed-form solves,
+    the SVI blocks, the prior initialization, the loss and the default block list --
+    and the ones that used to disagree failed looking for data or parameters that
+    were never going to exist.
+    """
+
+    @pytest.fixture
+    def model_and_partial_data(self):
+        """Two parameterized linear outputs, but data for only one of them."""
+        rng = np.random.default_rng(0)
+        n_stars, n_labels, n_flux = 20, 3, 6
+
+        model = plx.LVM(latent_size=2)
+        model.register_output("label", LinearTransform(output_size=n_labels))
+        model.register_output("flux", LinearTransform(output_size=n_flux))
+
+        flux_only = plx.data.PolluxData(
+            flux=plx.data.OutputData(
+                jnp.array(rng.normal(size=(n_stars, n_flux))),
+                err=jnp.full((n_stars, n_flux), 0.1),
+            )
+        )
+        trained = {
+            "latents": jnp.zeros((n_stars, 2)),
+            "flux": {"data": {"A": jnp.array(rng.normal(size=(n_flux, 2)))}, "err": {}},
+        }
+        return model, flux_only, trained
+
+    def test_participating_outputs(self, model_and_partial_data):
+        model, data, _ = model_and_partial_data
+        assert _participating_outputs(model, data) == ["flux"]
+
+    def test_loss_ignores_absent_outputs(self, model_and_partial_data):
+        """It used to predict every output first, needing parameters for the absent
+        one before discarding its prediction."""
+        model, data, trained = model_and_partial_data
+        assert jnp.isfinite(_compute_loss(model, data, trained))
+
+    def test_default_blocks_skip_absent_outputs(self, model_and_partial_data):
+        """A block for an absent output reaches the solver and finds no data."""
+        model, data, trained = model_and_partial_data
+        result = optimize_iterative(
+            model,
+            data,
+            max_cycles=1,
+            rng_key=jax.random.PRNGKey(0),
+            initial_params=trained,
+            progress=False,
+        )
+        assert [b.name for b in result.blocks] == ["latents", "flux:data"]
+
+    def test_prior_initialization_skips_absent_outputs(self, model_and_partial_data):
+        """With neither fixed_pars nor initial_params, the parameters are drawn from
+        the priors -- which ran the whole model over a dataset missing an output."""
+        model, data, _ = model_and_partial_data
+        result = optimize_iterative(
+            model,
+            data,
+            blocks=["latents"],
+            max_cycles=1,
+            rng_key=jax.random.PRNGKey(0),
+            progress=False,
+        )
+        assert result.params["latents"].shape == (len(data), model.latent_size)
+
+    def test_end_to_end_label_inference(self, model_and_partial_data):
+        """The whole point: fit the latents to a spectrum-only dataset."""
+        model, data, trained = model_and_partial_data
+        result = optimize_iterative(
+            model,
+            data,
+            blocks=["latents"],
+            fixed_pars=model.output_pars(trained),
+            max_cycles=5,
+            rng_key=jax.random.PRNGKey(0),
+            progress=False,
+        )
+        latents = result.params["latents"]
+        assert latents.shape == (len(data), model.latent_size)
+        assert jnp.all(jnp.isfinite(latents))

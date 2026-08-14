@@ -130,7 +130,7 @@ include = ["src"]
 # return type of numpyro.sample surface as false positives in the module that
 # does the sampling.
 [[tool.ty.overrides]]
-include = ["src/pollux/models/lux.py"]
+include = ["src/pollux/models/lvm.py"]
 rules = { invalid-argument-type = "ignore", invalid-assignment = "ignore" }
 
 # equinox's field() is a dataclass field factory; ty reads the descriptor type
