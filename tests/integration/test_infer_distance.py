@@ -29,6 +29,9 @@ def test_infer_distance():
 
     # True distance moduli:
     true_dm = rng.normal(11.0, 3.0, size=(n_stars, 1))
+
+    # The labels deliberately get no preprocessor: the distance modulus prior below is
+    # specified in natural label units, so the labels have to stay in them.
     all_data = plx.data.PolluxData(
         flux=plx.data.OutputData(
             data["flux"],
@@ -38,9 +41,8 @@ def test_infer_distance():
         label=plx.data.OutputData(
             data["label"] + true_dm,
             err=data["label_err"],
-            # preprocessor=plx.data.ShiftScalePreprocessor.from_data(data["label"]),
         ),
-    )
+    ).preprocess()
 
     model = plx.LVM(latent_size=n_latents)
     model.register_output("flux", plx.models.LinearTransform(output_size=128))
