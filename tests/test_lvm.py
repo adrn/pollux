@@ -120,7 +120,7 @@ def multi_output_model(model_config):
     return model
 
 
-class TestLuxParameterPackUnpack:
+class TestLVMParameterPackUnpack:
     """Test suite for LVM parameter packing and unpacking functionality.
 
     These tests verify the new two-dictionary parameter structure that separates
