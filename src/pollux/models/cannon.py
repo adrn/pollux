@@ -34,6 +34,7 @@ from .transforms import (
     TransformSequence,
     _compute_n_poly_features,
     polynomial_features,
+    scatter_at_scale,
 )
 
 __all__ = ["Cannon"]
@@ -74,10 +75,12 @@ class Cannon(LVM):
         :class:`~pollux.data.PolluxData` you intend to fit.
     intrinsic_scatter
         Which outputs get a fitted per-element scatter added in quadrature to their
-        reported errors: ``True`` for both (default), ``False`` for neither, a sequence
-        of output names, or a mapping from output name to the scale of the
-        ``HalfNormal`` prior on the scatter. The scatter on the spectrum is the
-        Cannon's per-pixel :math:`s_\\lambda`.
+        reported errors. By default (``None``) that is the spectrum and not the
+        labels: the spectrum's scatter is the Cannon's per-pixel
+        :math:`s_\\lambda`, while the catalog labels' reported errors are taken at
+        face value. Pass ``True`` for both, ``False`` for neither, an output name or
+        sequence of them, or a mapping from output name to the scale of the
+        ``HalfNormal`` prior on the scatter.
     coeff_prior
         Prior on the polynomial coefficients. Regularization enters here: a narrower
         prior shrinks the coefficients harder, and
@@ -160,37 +163,33 @@ class Cannon(LVM):
         include_bias: bool = True,
         label_name: str = "label",
         output_name: str = "flux",
-        intrinsic_scatter: bool | Sequence[str] | Mapping[str, float] = True,
+        intrinsic_scatter: bool | Sequence[str] | Mapping[str, float] | None = None,
         coeff_prior: dist.Distribution | None = None,
     ) -> None:
         super().__init__(latent_size=label_size)
         self.poly_degree = poly_degree
         self.include_bias = include_bias
 
-        if label_name == output_name:
-            msg = (
-                f"label_name and output_name are both '{label_name}', but the Cannon "
-                "registers them as two separate outputs."
-            )
-            raise ValueError(msg)
+        # The spectrum's uncertainties are the ones typically under-reported; the
+        # catalog labels' errors are taken at face value unless asked otherwise
+        if intrinsic_scatter is None:
+            intrinsic_scatter = [output_name]
 
         scatter_scales = select_outputs(
             intrinsic_scatter, [label_name, output_name], "intrinsic_scatter"
         )
 
         def scatter_for(name: str, size: int) -> ScatterTransform | None:
-            if name not in scatter_scales:
-                return None
-            scale = scatter_scales[name]
-            # No scale given means keep the transform's own default prior
-            if scale is None:
-                return ScatterTransform(output_size=size)
-            return ScatterTransform(
-                output_size=size, priors={"s": dist.HalfNormal(scale)}
+            return (
+                scatter_at_scale(size, scatter_scales[name])
+                if name in scatter_scales
+                else None
             )
 
         # The labels are the latents, observed directly. optimize_iterative detects
         # this passthrough and warm-starts the latents from the observed labels.
+        # register_output rejects a duplicate name, so label_name == output_name is
+        # already caught there.
         self.register_output(
             label_name,
             NoOpTransform(output_size=label_size),

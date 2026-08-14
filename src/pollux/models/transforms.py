@@ -956,6 +956,20 @@ class ScatterTransform(AbstractSingleTransform):
     shapes: ParamShapesT = ImmutableMap({"s": ("output_size",)})
 
 
+def scatter_at_scale(output_size: int, scale: float | None) -> ScatterTransform:
+    """A :class:`ScatterTransform` with its ``HalfNormal`` prior at ``scale``.
+
+    ``scale=None`` keeps the transform's own default prior, so that default is
+    written down in exactly one place. Architectures use this to turn a
+    per-output scatter selector into transforms.
+    """
+    if scale is None:
+        return ScatterTransform(output_size=output_size)
+    return ScatterTransform(
+        output_size=output_size, priors={"s": dist.HalfNormal(scale)}
+    )
+
+
 # ----
 
 

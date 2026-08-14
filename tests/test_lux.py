@@ -48,53 +48,57 @@ class TestSelectOutputs:
 
 
 class TestLuxConstruction:
-    def test_registers_one_output_per_entry(self):
-        model = plx.Lux(latent_size=16, outputs={"label": 6, "flux": 1000})
+    def test_registers_labels_and_flux(self):
+        """Lux is a spectroscopy model, so it names its two outputs itself."""
+        model = plx.Lux(latent_size=16, label_size=6, flux_size=1000)
         assert list(model.outputs) == ["label", "flux"]
         assert model.latent_size == 16
         assert model.outputs["label"].data_transform.output_size == 6
         assert model.outputs["flux"].data_transform.output_size == 1000
 
     def test_is_an_lvm(self):
-        model = plx.Lux(latent_size=4, outputs={"flux": 8})
+        model = plx.Lux(latent_size=4, label_size=3, flux_size=8)
         assert isinstance(model, plx.LVM)
 
     def test_every_output_is_linear(self):
         """Lux is a linear model; a polynomial in the latents is the Cannon."""
-        model = plx.Lux(latent_size=4, outputs={"label": 3, "flux": 8})
+        model = plx.Lux(latent_size=4, label_size=3, flux_size=8)
         for output in model.outputs.values():
             assert isinstance(output.data_transform, LinearTransform)
 
     def test_scatter_on_the_flux_by_default(self):
         """The spectrum's errors are the under-reported ones, not the labels'."""
-        model = plx.Lux(latent_size=4, outputs={"label": 3, "flux": 8})
+        model = plx.Lux(latent_size=4, label_size=3, flux_size=8)
         assert isinstance(model.outputs["flux"].err_transform, ScatterTransform)
         assert isinstance(model.outputs["label"].err_transform, NoOpTransform)
 
-    def test_default_scatter_skips_a_model_with_no_flux(self):
-        """The default is applied by name, and stays quiet when there is no "flux"."""
-        model = plx.Lux(latent_size=4, outputs={"spec": 8, "label": 3})
+    def test_scatter_can_be_turned_off(self):
+        model = plx.Lux(
+            latent_size=4, label_size=3, flux_size=8, intrinsic_scatter=False
+        )
         for output in model.outputs.values():
             assert isinstance(output.err_transform, NoOpTransform)
 
-    def test_scatter_can_be_turned_off(self):
-        model = plx.Lux(latent_size=4, outputs={"flux": 8}, intrinsic_scatter=False)
-        assert isinstance(model.outputs["flux"].err_transform, NoOpTransform)
+    def test_scatter_on_both_when_asked(self):
+        model = plx.Lux(
+            latent_size=4, label_size=3, flux_size=8, intrinsic_scatter=True
+        )
+        for output in model.outputs.values():
+            assert isinstance(output.err_transform, ScatterTransform)
 
     def test_scatter_selected_per_output(self):
         model = plx.Lux(
-            latent_size=4,
-            outputs={"label": 3, "flux": 8},
-            intrinsic_scatter=["flux"],
+            latent_size=4, label_size=3, flux_size=8, intrinsic_scatter=["label"]
         )
-        assert isinstance(model.outputs["flux"].err_transform, ScatterTransform)
-        assert isinstance(model.outputs["label"].err_transform, NoOpTransform)
+        assert isinstance(model.outputs["label"].err_transform, ScatterTransform)
+        assert isinstance(model.outputs["flux"].err_transform, NoOpTransform)
 
     def test_scatter_prior_scale_from_mapping(self):
         """The scale that suits an output depends on its preprocessing."""
         model = plx.Lux(
             latent_size=4,
-            outputs={"label": 3, "flux": 8},
+            label_size=3,
+            flux_size=8,
             intrinsic_scatter={"flux": 5.0},
         )
         prior = model.outputs["flux"].err_transform.priors["s"]
@@ -103,22 +107,23 @@ class TestLuxConstruction:
         assert isinstance(model.outputs["label"].err_transform, NoOpTransform)
 
     def test_default_scatter_prior_scale_is_one(self):
-        model = plx.Lux(latent_size=4, outputs={"flux": 8})
+        model = plx.Lux(latent_size=4, label_size=3, flux_size=8)
         assert np.isclose(model.outputs["flux"].err_transform.priors["s"].scale, 1.0)
 
-    def test_no_outputs_raises(self):
-        """An architecture with no outputs is a mistake, not an empty framework model."""
-        with pytest.raises(ValueError, match="at least one output"):
-            plx.Lux(latent_size=4, outputs={})
-
     def test_unknown_selector_name_raises(self):
+        """Lux has exactly two outputs, and neither is called "spectrum"."""
         with pytest.raises(ValueError, match="not outputs of this model"):
-            plx.Lux(latent_size=4, outputs={"flux": 8}, intrinsic_scatter=["spectrum"])
+            plx.Lux(
+                latent_size=4,
+                label_size=3,
+                flux_size=8,
+                intrinsic_scatter=["spectrum"],
+            )
 
     def test_selectors_accept_a_bare_output_name(self):
         """intrinsic_scatter="flux" means the flux, not the letters f, l, u and x."""
         model = plx.Lux(
-            latent_size=4, outputs={"label": 3, "flux": 8}, intrinsic_scatter="flux"
+            latent_size=4, label_size=3, flux_size=8, intrinsic_scatter="flux"
         )
         assert isinstance(model.outputs["flux"].err_transform, ScatterTransform)
         assert isinstance(model.outputs["label"].err_transform, NoOpTransform)
@@ -153,7 +158,8 @@ class TestLuxMatchesHandBuiltModel:
     def sugared(self, sizes):
         return plx.Lux(
             latent_size=sizes["n_latents"],
-            outputs={"label": sizes["n_labels"], "flux": sizes["n_flux"]},
+            label_size=sizes["n_labels"],
+            flux_size=sizes["n_flux"],
             intrinsic_scatter={"flux": 5.0},
         )
 
