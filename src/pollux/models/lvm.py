@@ -637,7 +637,7 @@ class LVM(eqx.Module):
             custom_model=custom_model,
         )
 
-        # The RNG key shouldn't have a massive impact here, since it it only used
+        # The RNG key shouldn't have a massive impact here, since it is only used
         # internally by stochastic optimizers:
         svi_key, sample_key = jax.random.split(rng_key, 2)
 
