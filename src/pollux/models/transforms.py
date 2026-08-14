@@ -1222,9 +1222,3 @@ class EquinoxNNTransform(AbstractTransform):
     ) -> dict[str, Any]:
         """Pack parameters (identity, keyed by NN parameter path)."""
         return self.unpack_pars(nested_pars, ignore_missing=ignore_missing)
-
-
-# ----
-
-
-# ----
