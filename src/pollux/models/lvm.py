@@ -14,6 +14,7 @@ from numpyro.infer import SVI, Trace_ELBO
 from numpyro.infer.autoguide import AutoDelta, AutoGuide
 
 from ..data import PolluxData
+from ..data.data import warn_if_unprocessed
 from ..typing import (
     BatchedLatentsT,
     BatchedOutputT,
@@ -835,6 +836,8 @@ class LVM(eqx.Module):
                 )
 
         """
+
+        warn_if_unprocessed(data, "optimize()")
 
         # Default to using Adam optimizer. numpyro's Adam has no default step
         # size; 1e-3 matches the default used by optimize_iterative's SVI blocks.

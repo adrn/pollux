@@ -1,5 +1,6 @@
 __all__ = ["OutputData", "PolluxData"]
 
+import warnings
 from typing import TYPE_CHECKING, Any, Union
 
 import equinox as eqx
@@ -7,6 +8,7 @@ import jax.numpy as jnp
 from jax.typing import ArrayLike
 from xmmutablemap import ImmutableMap
 
+from ..exceptions import PolluxPreprocessingWarning
 from ..typing import BatchedDataT
 from .preprocessor import AbstractPreprocessor, NullPreprocessor
 
@@ -235,3 +237,36 @@ class PolluxData(ImmutableMap[str, OutputData]):
 
     def __len__(self) -> int:
         return len(next(iter(self.values())).data)
+
+
+def warn_if_unprocessed(data: PolluxData, caller: str) -> None:
+    """Warn when fitting data that carries a preprocessor it has not been through.
+
+    Attaching a preprocessor and then forgetting to call :meth:`PolluxData.preprocess`
+    is a quiet failure: the fit runs, but the model sees the raw values while the priors
+    and any fitted scatter are specified on the preprocessed scale. Nothing downstream
+    can detect it, so it is caught here, at the point the data enter a fit.
+
+    Parameters
+    ----------
+    data
+        The data about to be fitted.
+    caller
+        Name of the fitting entry point, used in the message.
+    """
+    pending = [
+        name
+        for name, output in data.items()
+        if not output.processed
+        and not isinstance(output.preprocessor, NullPreprocessor)
+    ]
+    if not pending:
+        return
+
+    msg = (
+        f"{caller} was given data whose output(s) {sorted(pending)} carry a "
+        "preprocessor but have not been preprocessed. Call data.preprocess() first, "
+        "or the model will fit the raw values while the priors and any fitted scatter "
+        "assume the preprocessed scale."
+    )
+    warnings.warn(msg, PolluxPreprocessingWarning, stacklevel=3)

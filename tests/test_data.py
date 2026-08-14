@@ -2,7 +2,11 @@ import jax
 import jax.numpy as jnp
 import pytest
 
+import pollux as plx
 from pollux.data import NullPreprocessor, OutputData, PolluxData, ShiftScalePreprocessor
+from pollux.data.data import warn_if_unprocessed
+from pollux.exceptions import PolluxPreprocessingWarning
+from pollux.models.transforms import LinearTransform
 
 
 @pytest.fixture(scope="class")
@@ -139,3 +143,47 @@ class TestPolluxData:
         assert all(not v.processed for v in unprocessed.values())
         assert jnp.allclose(unprocessed["flux"].data, data["flux"].data, atol=1e-4)
         assert jnp.allclose(unprocessed["label"].data, data["label"].data, atol=1e-4)
+
+
+class TestWarnIfUnprocessed:
+    """The guard against fitting data that carries a preprocessor it never went through.
+
+    See :func:`pollux.data.data.warn_if_unprocessed`.
+    """
+
+    def _data(self, sample_arrays, preprocessor):
+        return PolluxData(
+            flux=OutputData(data=sample_arrays["flux"], preprocessor=preprocessor),
+            label=OutputData(data=sample_arrays["label"]),
+        )
+
+    def test_warns_when_unprocessed(self, sample_arrays):
+        data = self._data(sample_arrays, ShiftScalePreprocessor(1.0, 2.0))  # type: ignore[arg-type]
+        with pytest.warns(PolluxPreprocessingWarning, match=r"\['flux'\]"):
+            warn_if_unprocessed(data, "optimize()")
+
+    def test_silent_once_preprocessed(self, sample_arrays):
+        data = self._data(sample_arrays, ShiftScalePreprocessor(1.0, 2.0))  # type: ignore[arg-type]
+        # pytest is configured to turn warnings into errors, so a warning here fails
+        warn_if_unprocessed(data.preprocess(), "optimize()")
+
+    def test_silent_for_null_preprocessor(self, sample_arrays):
+        warn_if_unprocessed(self._data(sample_arrays, NullPreprocessor()), "optimize()")
+
+    def test_optimize_warns(self, sample_arrays):
+        """The guard is wired into the fitting entry points, not just available."""
+        model = plx.LVM(latent_size=2)
+        model.register_output("flux", LinearTransform(output_size=10))
+        data = PolluxData(
+            flux=OutputData(
+                data=sample_arrays["flux"],
+                err=sample_arrays["flux_err"],
+                preprocessor=ShiftScalePreprocessor.from_data(sample_arrays["flux"]),
+            )
+        )
+
+        with pytest.warns(PolluxPreprocessingWarning):
+            model.optimize(data, num_steps=1, rng_key=jax.random.PRNGKey(0))
+
+        with pytest.warns(PolluxPreprocessingWarning):
+            model.optimize_iterative(data, max_cycles=1, progress=False)

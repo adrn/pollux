@@ -26,22 +26,23 @@ def test_infer_error_intrinsic_scatter():
         rng=rng,
     )
 
+    flux_pp = plx.data.ShiftScalePreprocessor.from_data(data["flux"])
     all_data = plx.data.PolluxData(
-        flux=plx.data.OutputData(
-            data["flux"],
-            preprocessor=plx.data.ShiftScalePreprocessor.from_data(data["flux"]),
-        ),
+        flux=plx.data.OutputData(data["flux"], preprocessor=flux_pp),
         label=plx.data.OutputData(
             data["label"],
             err=data["label_err"],
             preprocessor=plx.data.ShiftScalePreprocessor.from_data(data["label"]),
         ),
-    )
+    ).preprocess()
 
+    # The scatter is fitted on the preprocessed scale, so a prior we can reason about
+    # in flux units goes through the same transform the errors would
+    s_prior_scale = flux_pp.transform_err(jnp.full(n_flux, 0.1))
     err_trans = plx.models.FunctionTransform(
         output_size=n_flux,
         transform=lambda err, s: jnp.sqrt(err**2 + s**2),
-        priors={"s": dist.HalfNormal(0.1).expand((n_flux,))},
+        priors={"s": dist.HalfNormal(s_prior_scale)},
         shapes={},
         vmap=False,
     )
@@ -60,6 +61,6 @@ def test_infer_error_intrinsic_scatter():
     )
     res.losses.block_until_ready()
 
-    assert np.isclose(
-        np.mean(opt_pars["flux"]["err"]["s"]), np.mean(data["flux_err"]), atol=0.05
-    )
+    # ...and read back out of it, to compare against the errors that generated the data
+    s_flux_units = flux_pp.inverse_transform_err(opt_pars["flux"]["err"]["s"])
+    assert np.isclose(np.mean(s_flux_units), np.mean(data["flux_err"]), atol=0.05)
