@@ -29,6 +29,7 @@ from tqdm.auto import tqdm
 
 from .._linalg import weighted_least_squares
 from ..data import PolluxData
+from ..data.data import warn_if_unprocessed
 from ..exceptions import PolluxLinearizationWarning
 from .transforms import (
     AbstractTransform,
@@ -852,6 +853,8 @@ def optimize_iterative(
     >>> test_opt_pars = result.params  # already contains fixed + optimized  # doctest: +SKIP
 
     """
+    warn_if_unprocessed(data, "optimize_iterative()")
+
     # Latents the data reports directly beat a draw from the prior, and also decide
     # which end of the model it makes sense to start from
     observed_latents = _latents_from_data(model, data)
