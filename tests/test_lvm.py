@@ -749,6 +749,86 @@ class TestOptimizeGuide:
         assert pars_delta["latents"].shape == pars_normal["latents"].shape
 
 
+class TestLatentUncertainties:
+    """Tests for LVM.latent_uncertainties."""
+
+    @pytest.fixture
+    def linear(self):
+        """A purely linear model, where the exact posterior covariance is known."""
+        rng = np.random.default_rng(7)
+        n_latents, n_flux, n_stars = 2, 8, 5
+
+        model = plx.LVM(latent_size=n_latents)
+        model.register_output("flux", LinearTransform(output_size=n_flux))
+
+        A = jnp.asarray(rng.normal(size=(n_flux, n_latents)))
+        latents = jnp.asarray(rng.normal(size=(n_stars, n_latents)))
+        flux_err = jnp.asarray(rng.uniform(0.05, 0.2, size=(n_stars, n_flux)))
+        flux = latents @ A.T + jnp.asarray(rng.normal(0, flux_err))
+
+        data = plx.data.PolluxData(flux=plx.data.OutputData(flux, err=flux_err))
+        pars = {"latents": latents, "flux": {"data": {"A": A}, "err": {}}}
+        return model, data, pars, A, flux_err
+
+    def test_matches_the_analytic_covariance(self, linear):
+        """For a linear model the objective is quadratic, so this is exact."""
+        model, data, pars, A, flux_err = linear
+
+        cov = model.latent_uncertainties(data, pars, covariance=True)
+
+        # (A^T W A + prior precision)^-1, star by star, with the default unit Gaussian
+        for i in range(len(data)):
+            W = jnp.diag(1.0 / flux_err[i] ** 2)
+            expected = jnp.linalg.inv(A.T @ W @ A + jnp.eye(2))
+            assert jnp.allclose(cov[i], expected, rtol=1e-5)
+
+    def test_prior_tightens_the_uncertainties(self, linear):
+        model, data, pars, _, _ = linear
+
+        with_prior = model.latent_uncertainties(data, pars)
+        without = model.latent_uncertainties(data, pars, latents_prior=False)
+        tighter = model.latent_uncertainties(
+            data, pars, latents_prior=dist.Normal(0, 0.1)
+        )
+
+        assert jnp.all(with_prior < without)
+        assert jnp.all(tighter < with_prior)
+
+    def test_sigma_is_the_covariance_diagonal(self, linear):
+        model, data, pars, _, _ = linear
+
+        sigma = model.latent_uncertainties(data, pars)
+        cov = model.latent_uncertainties(data, pars, covariance=True)
+        assert sigma.shape == (len(data), model.latent_size)
+        assert jnp.allclose(sigma, jnp.sqrt(jnp.diagonal(cov, axis1=-2, axis2=-1)))
+
+    def test_larger_errors_give_larger_uncertainties(self, linear):
+        model, data, pars, _, flux_err = linear
+        noisier = plx.data.PolluxData(
+            flux=plx.data.OutputData(data["flux"].data, err=flux_err * 5)
+        )
+        assert jnp.all(
+            model.latent_uncertainties(noisier, pars)
+            > model.latent_uncertainties(data, pars)
+        )
+
+    def test_latents_can_be_passed_explicitly(self, linear):
+        model, data, pars, _, _ = linear
+        sigma = model.latent_uncertainties(data, pars, latents=pars["latents"])
+        assert jnp.allclose(sigma, model.latent_uncertainties(data, pars))
+
+    def test_missing_latents_raises(self, linear):
+        model, data, pars, _, _ = linear
+        no_latents = {k: v for k, v in pars.items() if k != "latents"}
+        with pytest.raises(KeyError, match="No latents given"):
+            model.latent_uncertainties(data, no_latents)
+
+    def test_output_without_data_raises(self, linear):
+        model, data, pars, _, _ = linear
+        with pytest.raises(ValueError, match="No data for output"):
+            model.latent_uncertainties(data, pars, names="label")
+
+
 class TestOptimizeInitLocFn:
     """Tests for the init_loc_fn parameter on LVM.optimize."""
 

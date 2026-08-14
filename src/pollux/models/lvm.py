@@ -21,7 +21,7 @@ from ..typing import (
     PackedParamsT,
     UnpackedParamsT,
 )
-from .iterative import optimize_iterative
+from .iterative import _inverse_variance, _participating_outputs, optimize_iterative
 from .transforms import AbstractSingleTransform, NoOpTransform, TransformSequence
 
 if TYPE_CHECKING:
@@ -556,6 +556,167 @@ class LVM(eqx.Module):
 
         return data_pars
 
+    def _resolve_latents_prior(
+        self, latents_prior: dist.Distribution | bool | None
+    ) -> dist.Distribution:
+        """The latents prior as a distribution, expanded to the latent size.
+
+        ``None`` means a unit Gaussian and ``False`` means an improper uniform, which
+        is the convention every method taking a ``latents_prior`` follows.
+        """
+        if latents_prior is None:
+            prior = dist.Normal()
+
+        elif latents_prior is False:
+            prior = dist.ImproperUniform(dist.constraints.real, (), event_shape=())
+
+        elif not isinstance(latents_prior, dist.Distribution):
+            msg = "latents_prior must be a numpyro distribution instance"
+            raise TypeError(msg)
+
+        else:
+            prior = latents_prior
+
+        if prior.batch_shape != (self.latent_size,):
+            prior = prior.expand((self.latent_size,))
+
+        return prior
+
+    def latent_uncertainties(
+        self,
+        data: PolluxData,
+        pars: dict[str, Any],
+        *,
+        latents: BatchedLatentsT | None = None,
+        names: list[str] | str | None = None,
+        latents_prior: dist.Distribution | bool | None = None,
+        covariance: bool = False,
+    ) -> jax.Array:
+        """Per-object latent uncertainties from Hessian of the likelihood.
+
+        This computes estimates of the uncertainties on the latents for each object,
+        given the fitted model parameters and the data the latents were determined from.
+
+        This inverts the Hessian of the objective with respect to each object's latent
+        vector (at fixed output parameters) evaluated at the fitted latents. This is the
+        Laplace approximation to the latents' posterior: the width of the Gaussian that
+        matches the objective's curvature at the optimum.
+
+        Parameters
+        ----------
+        data
+            The data the latents were fitted to.
+        pars
+            Fitted parameters, as returned by :meth:`optimize` or
+            :meth:`optimize_iterative`.
+        latents
+            The latents to evaluate the curvature at. If not passed, read from
+            ``pars["latents"]``.
+        names
+            Which outputs contribute. If ``None``, every registered output the data
+            carries -- the right choice when the latents were fitted against all of
+            them. Pass a subset to match a fit that used one: inferring labels from
+            spectra alone means ``names="flux"``, and the uncertainties are then a
+            statement about what the spectrum alone constrains.
+        latents_prior
+            The prior on the latents, which contributes its own curvature. Follows the
+            same convention as :meth:`optimize`: ``None`` for a unit Gaussian, ``False``
+            for none at all. **Pass the same value you fitted with**, or the width will
+            not correspond to the optimum it is reported at.
+        covariance
+            If True, return the full ``(n_objects, latent_size, latent_size)``
+            covariance matrices instead of just the standard deviations. The
+            off-diagonals are the correlations between latents.
+
+        Returns
+        -------
+        array
+            Standard deviations of shape ``(n_objects, latent_size)``, or covariance
+            matrices of shape ``(n_objects, latent_size, latent_size)``. An object
+            whose curvature implies a negative variance gets ``nan`` -- see below.
+
+        Examples
+        --------
+        After inferring labels from spectra alone, with the trained output parameters
+        held fixed::
+
+            res = model.optimize_iterative(
+                test_data, blocks=["latents"], fixed_pars=model.output_pars(pars)
+            )
+            errs = model.latent_uncertainties(test_data, res.params, names="flux")
+
+        Notes
+        -----
+        These are formal errors: they do not incorporate model uncertainty (either from
+        training or from incomplete or faulty optimization of the model).
+
+        This is only meaningful evaluated *at* an optimum. A model whose outputs are
+        nonlinear in the latents -- :class:`~pollux.models.Cannon`,
+        :class:`~pollux.models.Clam` -- is not convex in them, so away from a stationary
+        point the Hessian can be indefinite, and a negative curvature direction is not
+        an uncertainty. Those entries come back as ``nan`` rather than as a number, so a
+        fit that did not converge for some objects shows up instead of quietly reporting
+        a tiny error bar for them. The pseudo-inverse is used for the same reason: an
+        object that the data barely constrain can produce a singular Hessian.
+
+        For a model that *is* linear in the latents, like :class:`~pollux.models.Lux`,
+        the objective is exactly quadratic and these are the exact posterior widths
+        rather than an approximation.
+        """
+        if latents is None:
+            if "latents" not in pars:
+                msg = (
+                    "No latents given and none found in pars['latents']. Either pass "
+                    "latents=... explicitly, or pass the parameters returned by "
+                    "optimize() / optimize_iterative(), which include the latents."
+                )
+                raise KeyError(msg)
+            latents = pars["latents"]
+
+        if isinstance(names, str):
+            names = [names]
+        active = _participating_outputs(self, data) if names is None else names
+
+        missing = [name for name in active if name not in data]
+        if missing:
+            msg = (
+                f"No data for output(s) {sorted(missing)}, so they contribute no "
+                "curvature. Pass only outputs the data carries."
+            )
+            raise ValueError(msg)
+
+        observed = {name: data[name].data for name in active}
+        ivars = {name: _inverse_variance(self, data, name, pars) for name in active}
+
+        prior = self._resolve_latents_prior(latents_prior)
+        # An improper uniform is flat, so it adds nothing to the curvature -- and has
+        # no log_prob to ask for
+        use_prior = not isinstance(prior, dist.ImproperUniform)
+
+        def neg_log_post(
+            z: jax.Array, obs: dict[str, jax.Array], ivar: dict[str, jax.Array]
+        ) -> jax.Array:
+            pred = self.predict_outputs(pars, latents=z[None], names=active)
+            chi2 = sum(
+                jnp.sum((obs[name] - pred[name][0]) ** 2 * ivar[name])
+                for name in active
+            )
+            if use_prior:
+                return 0.5 * chi2 - jnp.sum(prior.log_prob(z))
+            return jnp.array(0.5 * chi2)
+
+        cov = jnp.linalg.pinv(
+            jax.vmap(jax.hessian(neg_log_post))(latents, observed, ivars)
+        )
+        if covariance:
+            return cov
+
+        # A negative variance means the Hessian is indefinite for that object, which
+        # means it is not at a minimum and there is no width to report. NaN says so;
+        # clipping to zero would read as an infinitely well-measured latent.
+        var = jnp.diagonal(cov, axis1=-2, axis2=-1)
+        return jnp.where(var > 0, jnp.sqrt(var), jnp.nan)
+
     def default_numpyro_model(
         self,
         data: PolluxData,
@@ -588,26 +749,7 @@ class LVM(eqx.Module):
             modeling components.
         """
         n_data = len(data)
-
-        if latents_prior is None:
-            _latents_prior = dist.Normal()
-
-        elif latents_prior is False:
-            _latents_prior = dist.ImproperUniform(
-                dist.constraints.real,
-                (),
-                event_shape=(),
-            )
-
-        elif not isinstance(latents_prior, dist.Distribution):
-            msg = "latents_prior must be a numpyro distribution instance"
-            raise TypeError(msg)
-
-        else:
-            _latents_prior = latents_prior
-
-        if _latents_prior.batch_shape != (self.latent_size,):
-            _latents_prior = _latents_prior.expand((self.latent_size,))
+        _latents_prior = self._resolve_latents_prior(latents_prior)
 
         # Use condition handler to fix parameters if specified
         with numpyro.handlers.condition(data=fixed_pars or {}):
