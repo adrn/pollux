@@ -89,11 +89,18 @@ class TestCannonStructure:
         assert sorted(cannon.outputs) == ["params", "spec"]
 
     def test_same_name_twice_raises(self):
-        with pytest.raises(ValueError, match="two separate outputs"):
+        """register_output already refuses a duplicate; no extra guard needed."""
+        with pytest.raises(ValueError, match="already exists"):
             Cannon(label_size=2, output_size=8, label_name="x", output_name="x")
 
-    def test_scatter_on_both_by_default(self):
+    def test_scatter_on_the_spectrum_by_default(self):
+        """The per-pixel s_lambda is fitted; the catalog label errors are not."""
         cannon = Cannon(label_size=3, output_size=100)
+        assert isinstance(cannon.outputs["flux"].err_transform, ScatterTransform)
+        assert isinstance(cannon.outputs["label"].err_transform, NoOpTransform)
+
+    def test_scatter_on_both_when_asked(self):
+        cannon = Cannon(label_size=3, output_size=100, intrinsic_scatter=True)
         for output in cannon.outputs.values():
             assert isinstance(output.err_transform, ScatterTransform)
 
@@ -292,13 +299,14 @@ class TestCannonWithScatter:
     @expect_latents_fallback
     def test_default_blocks_include_the_scatters(self, cannon_and_data):
         c = cannon_and_data
-        cannon = Cannon(label_size=3, output_size=25, poly_degree=2)
+        cannon = Cannon(
+            label_size=3, output_size=25, poly_degree=2, intrinsic_scatter=True
+        )
         res = cannon.optimize_iterative(
             c["data"], max_cycles=1, rng_key=jax.random.PRNGKey(0), progress=False
         )
         names = [b.name for b in res.blocks]
         assert "flux:err" in names
-        assert "label:err" in names
         assert res.params["flux"]["err"]["s"].shape == (25,)
         assert jnp.all(res.params["flux"]["err"]["s"] >= 0)
 

@@ -11,7 +11,6 @@ from pollux.models.lvm import select_outputs
 from pollux.models.transforms import (
     LinearTransform,
     NoOpTransform,
-    QuadraticTransform,
     ScatterTransform,
 )
 
@@ -60,21 +59,23 @@ class TestLuxConstruction:
         model = plx.Lux(latent_size=4, outputs={"flux": 8})
         assert isinstance(model, plx.LVM)
 
-    def test_linear_by_default_quadratic_on_request(self):
-        model = plx.Lux(
-            latent_size=4, outputs={"label": 3, "flux": 8}, quadratic=["flux"]
-        )
-        assert isinstance(model.outputs["label"].data_transform, LinearTransform)
-        assert isinstance(model.outputs["flux"].data_transform, QuadraticTransform)
-
-    def test_quadratic_true_selects_every_output(self):
-        model = plx.Lux(latent_size=4, outputs={"label": 3, "flux": 8}, quadratic=True)
+    def test_every_output_is_linear(self):
+        """Lux is a linear model; a polynomial in the latents is the Cannon."""
+        model = plx.Lux(latent_size=4, outputs={"label": 3, "flux": 8})
         for output in model.outputs.values():
-            assert isinstance(output.data_transform, QuadraticTransform)
+            assert isinstance(output.data_transform, LinearTransform)
 
-    def test_scatter_on_by_default(self):
-        model = plx.Lux(latent_size=4, outputs={"flux": 8})
+    def test_scatter_on_the_flux_by_default(self):
+        """The spectrum's errors are the under-reported ones, not the labels'."""
+        model = plx.Lux(latent_size=4, outputs={"label": 3, "flux": 8})
         assert isinstance(model.outputs["flux"].err_transform, ScatterTransform)
+        assert isinstance(model.outputs["label"].err_transform, NoOpTransform)
+
+    def test_default_scatter_skips_a_model_with_no_flux(self):
+        """The default is applied by name, and stays quiet when there is no "flux"."""
+        model = plx.Lux(latent_size=4, outputs={"spec": 8, "label": 3})
+        for output in model.outputs.values():
+            assert isinstance(output.err_transform, NoOpTransform)
 
     def test_scatter_can_be_turned_off(self):
         model = plx.Lux(latent_size=4, outputs={"flux": 8}, intrinsic_scatter=False)
@@ -112,18 +113,13 @@ class TestLuxConstruction:
 
     def test_unknown_selector_name_raises(self):
         with pytest.raises(ValueError, match="not outputs of this model"):
-            plx.Lux(latent_size=4, outputs={"flux": 8}, quadratic=["spectrum"])
+            plx.Lux(latent_size=4, outputs={"flux": 8}, intrinsic_scatter=["spectrum"])
 
     def test_selectors_accept_a_bare_output_name(self):
-        """quadratic="flux" should mean the flux, not the letters f, l, u and x."""
+        """intrinsic_scatter="flux" means the flux, not the letters f, l, u and x."""
         model = plx.Lux(
-            latent_size=4,
-            outputs={"label": 3, "flux": 8},
-            quadratic="flux",
-            intrinsic_scatter="flux",
+            latent_size=4, outputs={"label": 3, "flux": 8}, intrinsic_scatter="flux"
         )
-        assert isinstance(model.outputs["flux"].data_transform, QuadraticTransform)
-        assert isinstance(model.outputs["label"].data_transform, LinearTransform)
         assert isinstance(model.outputs["flux"].err_transform, ScatterTransform)
         assert isinstance(model.outputs["label"].err_transform, NoOpTransform)
 
