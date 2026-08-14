@@ -26,6 +26,7 @@ from pollux.models.iterative import (
     _linearize_latents,
     _optimize_block_numpyro,
     _output_predict_fn,
+    _participating_outputs,
     _solve_latents_least_squares,
     _solve_output_params_least_squares,
     _split_param_layer,
@@ -1477,3 +1478,89 @@ class TestMixedLinearNonlinear:
 
         assert result.n_cycles >= 1
         assert all(jnp.isfinite(loss) for loss in result.losses_per_cycle)
+
+
+class TestPartialData:
+    """A model is routinely applied to data holding only some of its outputs.
+
+    Inferring labels from spectra alone is the standard test-set step. Every part of
+    the fit has to agree to leave the absent outputs out -- the closed-form solves,
+    the SVI blocks, the prior initialization, the loss and the default block list --
+    and the ones that used to disagree failed looking for data or parameters that
+    were never going to exist.
+    """
+
+    @pytest.fixture
+    def model_and_partial_data(self):
+        """Two parameterized linear outputs, but data for only one of them."""
+        rng = np.random.default_rng(0)
+        n_stars, n_labels, n_flux = 20, 3, 6
+
+        model = plx.LVM(latent_size=2)
+        model.register_output("label", LinearTransform(output_size=n_labels))
+        model.register_output("flux", LinearTransform(output_size=n_flux))
+
+        flux_only = plx.data.PolluxData(
+            flux=plx.data.OutputData(
+                jnp.array(rng.normal(size=(n_stars, n_flux))),
+                err=jnp.full((n_stars, n_flux), 0.1),
+            )
+        )
+        trained = {
+            "latents": jnp.zeros((n_stars, 2)),
+            "flux": {"data": {"A": jnp.array(rng.normal(size=(n_flux, 2)))}, "err": {}},
+        }
+        return model, flux_only, trained
+
+    def test_participating_outputs(self, model_and_partial_data):
+        model, data, _ = model_and_partial_data
+        assert _participating_outputs(model, data) == ["flux"]
+
+    def test_loss_ignores_absent_outputs(self, model_and_partial_data):
+        """It used to predict every output first, needing parameters for the absent
+        one before discarding its prediction."""
+        model, data, trained = model_and_partial_data
+        assert jnp.isfinite(_compute_loss(model, data, trained))
+
+    def test_default_blocks_skip_absent_outputs(self, model_and_partial_data):
+        """A block for an absent output reaches the solver and finds no data."""
+        model, data, trained = model_and_partial_data
+        result = optimize_iterative(
+            model,
+            data,
+            max_cycles=1,
+            rng_key=jax.random.PRNGKey(0),
+            initial_params=trained,
+            progress=False,
+        )
+        assert [b.name for b in result.blocks] == ["latents", "flux:data"]
+
+    def test_prior_initialization_skips_absent_outputs(self, model_and_partial_data):
+        """With neither fixed_pars nor initial_params, the parameters are drawn from
+        the priors -- which ran the whole model over a dataset missing an output."""
+        model, data, _ = model_and_partial_data
+        result = optimize_iterative(
+            model,
+            data,
+            blocks=["latents"],
+            max_cycles=1,
+            rng_key=jax.random.PRNGKey(0),
+            progress=False,
+        )
+        assert result.params["latents"].shape == (len(data), model.latent_size)
+
+    def test_end_to_end_label_inference(self, model_and_partial_data):
+        """The whole point: fit the latents to a spectrum-only dataset."""
+        model, data, trained = model_and_partial_data
+        result = optimize_iterative(
+            model,
+            data,
+            blocks=["latents"],
+            fixed_pars=model.output_pars(trained),
+            max_cycles=5,
+            rng_key=jax.random.PRNGKey(0),
+            progress=False,
+        )
+        latents = result.params["latents"]
+        assert latents.shape == (len(data), model.latent_size)
+        assert jnp.all(jnp.isfinite(latents))

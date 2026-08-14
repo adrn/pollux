@@ -521,12 +521,77 @@ class TestPredictOutputsLatents:
         with pytest.raises(TypeError, match="takes the parameters"):
             model.predict_outputs(pars["latents"], pars)
 
-    def test_output_pars_strips_only_latents(self, model_and_pars):
+    def test_output_pars_strips_the_latents(self, model_and_pars):
         model, pars = model_and_pars
         stripped = model.output_pars(pars)
         assert set(stripped) == {"flux"}
-        assert stripped["flux"] is pars["flux"]
+        assert jnp.array_equal(stripped["flux"]["data"]["A"], pars["flux"]["data"]["A"])
         assert "latents" in pars  # the original is untouched
+
+
+class TestOutputParsPerObject:
+    """output_pars promises the parameters that carry over to *other* objects.
+
+    The latents are the obvious per-object parameters, but a transform can declare
+    others via a "data_size" shape. Carrying one of those into a new dataset would
+    either blow up on shape or, worse, silently apply one object's nuisance
+    parameter to a different object.
+    """
+
+    @pytest.fixture
+    def model_and_pars(self):
+        n_data, n_out = 6, 4
+        offset = FunctionTransform(
+            output_size=n_out,
+            transform=lambda y, offset: y + offset[:, None],
+            priors={"offset": dist.Normal(0.0, 5.0)},
+            shapes={"offset": ("data_size",)},
+            vmap=False,
+        )
+        model = plx.LVM(latent_size=2)
+        model.register_output(
+            "flux",
+            TransformSequence((LinearTransform(output_size=n_out), offset)),
+        )
+        pars = {
+            "latents": jnp.zeros((n_data, 2)),
+            "flux": {
+                "data": ({"A": jnp.ones((n_out, 2))}, {"offset": jnp.arange(6.0)}),
+                "err": {},
+            },
+        }
+        return model, pars, n_data
+
+    def test_per_object_names_found_by_measurement(self, model_and_pars):
+        model, _, _ = model_and_pars
+        assert model.per_object_param_names() == {"latents", "flux:1:offset"}
+
+    def test_per_object_parameters_are_dropped(self, model_and_pars):
+        model, pars, _ = model_and_pars
+        stripped = model.output_pars(pars)
+
+        assert "latents" not in stripped
+        # The shared linear map survives; the per-object offset does not
+        assert jnp.array_equal(
+            stripped["flux"]["data"][0]["A"], pars["flux"]["data"][0]["A"]
+        )
+        assert "offset" not in stripped["flux"]["data"][1]
+
+    def test_result_transfers_to_a_different_number_of_objects(self, model_and_pars):
+        """The point of dropping them: the training-set size must not leak."""
+        model, pars, n_data = model_and_pars
+        other = jnp.zeros((n_data + 3, 2))  # deliberately a different size
+
+        packed = model.pack_numpyro_pars(model.output_pars(pars), ignore_missing=True)
+        assert not any(
+            getattr(v, "shape", ()) and v.shape[0] == n_data for v in packed.values()
+        )
+
+    def test_shared_only_model_is_unaffected(self):
+        """With no per-object transform parameters, only the latents go."""
+        model = plx.LVM(latent_size=2)
+        model.register_output("flux", LinearTransform(output_size=3))
+        assert model.per_object_param_names() == {"latents"}
 
 
 class TestOptimizeDefaults:

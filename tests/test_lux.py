@@ -29,6 +29,9 @@ class TestSelectOutputs:
             (["flux"], {"flux": None}),
             (("label", "flux"), {"label": None, "flux": None}),
             ({"flux": 5.0}, {"flux": 5.0}),
+            # A bare name is a Sequence[str] of its own characters, so this would
+            # otherwise select 'f', 'l', 'u', 'x'
+            ("flux", {"flux": None}),
         ],
     )
     def test_forms(self, spec, expected):
@@ -38,6 +41,11 @@ class TestSelectOutputs:
         """A typo in a selector should not silently do nothing."""
         with pytest.raises(ValueError, match=r"\['flx'\] are not outputs"):
             select_outputs(["flx"], ["label", "flux"], "intrinsic_scatter")
+
+    def test_unknown_bare_name_raises(self):
+        """A mistyped bare name reports itself, not its letters."""
+        with pytest.raises(ValueError, match=r"\['flx'\] are not outputs"):
+            select_outputs("flx", ["label", "flux"], "intrinsic_scatter")
 
 
 class TestLuxConstruction:
@@ -105,6 +113,19 @@ class TestLuxConstruction:
     def test_unknown_selector_name_raises(self):
         with pytest.raises(ValueError, match="not outputs of this model"):
             plx.Lux(latent_size=4, outputs={"flux": 8}, quadratic=["spectrum"])
+
+    def test_selectors_accept_a_bare_output_name(self):
+        """quadratic="flux" should mean the flux, not the letters f, l, u and x."""
+        model = plx.Lux(
+            latent_size=4,
+            outputs={"label": 3, "flux": 8},
+            quadratic="flux",
+            intrinsic_scatter="flux",
+        )
+        assert isinstance(model.outputs["flux"].data_transform, QuadraticTransform)
+        assert isinstance(model.outputs["label"].data_transform, LinearTransform)
+        assert isinstance(model.outputs["flux"].err_transform, ScatterTransform)
+        assert isinstance(model.outputs["label"].err_transform, NoOpTransform)
 
 
 class TestLuxMatchesHandBuiltModel:

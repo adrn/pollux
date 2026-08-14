@@ -294,6 +294,19 @@ def _linearize_outputs(
     return linearized
 
 
+def _participating_outputs(model: LVM, data: PolluxData) -> list[str]:
+    """The registered outputs this dataset actually carries.
+
+    A model is often applied to data holding only some of its outputs -- inferring
+    labels from spectra alone, say. An output with no data contributes no likelihood
+    term, so every part of the fit has to agree to leave it out: the closed-form
+    solves, the SVI blocks, the prior initialization, the loss, and the default block
+    list. Where they disagree, the ones that do not skip it fail looking for data or
+    parameters that were never going to exist.
+    """
+    return [name for name in model.outputs if name in data]
+
+
 def _has_learnable_params(
     transform: AbstractTransform, latent_size: int, data_size: int
 ) -> bool:
@@ -833,13 +846,15 @@ def optimize_iterative(
     # error transforms included, since their parameters are as much a part of the
     # model as the data transforms'. A transform carrying no learnable parameters
     # (NoOpTransform, a bare PolyFeatureTransform) gets no block.
+    participating = _participating_outputs(model, data)
+
     if blocks is None:
         output_blocks = [
             f"{name}:{kind}"
-            for name, output in model.outputs.items()
+            for name in participating
             for kind, transform in (
-                ("data", output.data_transform),
-                ("err", output.err_transform),
+                ("data", model.outputs[name].data_transform),
+                ("err", model.outputs[name].err_transform),
             )
             if _has_learnable_params(transform, model.latent_size, len(data))
         ]
@@ -869,9 +884,8 @@ def optimize_iterative(
     # Warn if any output has err_transform parameters that are neither being
     # optimized (in active blocks) nor intentionally held fixed (in fixed_pars)
     active_block_params = {b.params for b in _blocks}
-    for output_name, output in model.outputs.items():
-        if output_name not in data:
-            continue  # not part of this fit at all, so nothing to warn about
+    for output_name in participating:
+        output = model.outputs[output_name]
         err_key = f"{output_name}:err"
         err_is_fixed = (
             fixed_pars is not None
@@ -900,7 +914,11 @@ def optimize_iterative(
         if rng_key is None:
             rng_key = jax.random.PRNGKey(0)
         rng_key, init_key = jax.random.split(rng_key)
-        predictive = Predictive(model.default_numpyro_model, num_samples=1)
+        # names: the prior draw has to skip absent outputs too, or setup_numpyro
+        # indexes the dataset for an output it does not hold
+        predictive = Predictive(
+            partial(model.default_numpyro_model, names=participating), num_samples=1
+        )
         packed_samples = predictive(init_key, data)
         # Remove the batch dimension from num_samples=1, and filter out
         # observed samples (keys starting with "obs:")
@@ -1099,15 +1117,11 @@ def _optimize_block_numpyro(
     # Pack fixed parameters for numpyro
     packed_fixed_pars = model.pack_numpyro_pars(fixed_pars, ignore_missing=True)
 
-    # Only model the outputs the data actually carries. Every closed-form path here
-    # already skips absent outputs, and an SVI block has to agree with them: applying a
-    # trained model to data holding only some of its outputs -- inferring labels from
-    # spectra alone, say -- otherwise dies in setup_numpyro looking for the rest.
     partial_model = partial(
         model.default_numpyro_model,
         fixed_pars=packed_fixed_pars,
         latents_prior=latents_prior,
-        names=[name for name in model.outputs if name in data],
+        names=_participating_outputs(model, data),
     )
 
     # Run SVI optimization, warm-started from where the last cycle left this block.
@@ -1184,13 +1198,13 @@ def _compute_loss(
 ) -> float:
     """Compute the negative log likelihood loss."""
     latents = params["latents"]
-    predictions = model.predict_outputs(params, latents)
+    participating = _participating_outputs(model, data)
+    # Predicting an absent output would demand parameters it was never fitted with,
+    # and its prediction is discarded by the loop below in any case
+    predictions = model.predict_outputs(params, latents, names=participating)
 
     total_loss = 0.0
-    for output_name in model.outputs:
-        if output_name not in data:
-            continue
-
+    for output_name in participating:
         output_data = data[output_name]
         pred = predictions[output_name]
         obs = output_data.data

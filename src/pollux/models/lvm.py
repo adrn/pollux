@@ -41,8 +41,8 @@ def select_outputs(
     Parameters
     ----------
     spec
-        The selector: ``True``, ``False``/``None``, a sequence of output names, or a
-        mapping from output name to a scalar.
+        The selector: ``True``, ``False``/``None``, a single output name, a sequence
+        of output names, or a mapping from output name to a scalar.
     names
         The output names the selector is allowed to mention.
     what
@@ -65,6 +65,11 @@ def select_outputs(
     {'flux': 5.0}
     >>> select_outputs(False, ["label", "flux"], "scatter")
     {}
+
+    A single name need not be wrapped in a list:
+
+    >>> select_outputs("flux", ["label", "flux"], "scatter")
+    {'flux': None}
     """
     names = list(names)
 
@@ -72,6 +77,11 @@ def select_outputs(
         return dict.fromkeys(names)
     if spec is False or spec is None:
         return {}
+
+    # A str is a Sequence[str] of its own characters, so quadratic="flux" would
+    # otherwise select 'f', 'l', 'u', 'x' and report all four as unknown outputs
+    if isinstance(spec, str):
+        spec = [spec]
 
     selected: dict[str, float | None] = (
         dict(spec) if isinstance(spec, Mapping) else dict.fromkeys(spec)
@@ -398,14 +408,42 @@ class LVM(eqx.Module):
 
         return results
 
-    @staticmethod
-    def output_pars(pars: dict[str, Any]) -> dict[str, Any]:
-        """Return the parameters that are shared across objects, i.e. everything
-        but the latents.
+    def per_object_param_names(self) -> set[str]:
+        """Packed names of the parameters that are one-per-object.
 
-        The latents are per-object, so they are exactly the parameters that do not
-        carry over from a training set to a test set. This is the dict to pass as
-        ``fixed_pars`` when applying a trained model to new objects.
+        The latents are the obvious ones, but a transform can declare parameters
+        shaped by ``"data_size"`` too -- a per-object offset, say -- and those are
+        equally tied to the objects they were fitted on.
+
+        Which parameters those are is *measured* rather than read off a type: the
+        transform's priors are expanded at two different data sizes, and any
+        parameter whose shape moves with the data size is per-object. That way it
+        works for any transform, including ones defined by a user.
+        """
+        per_object = {"latents"}
+
+        for output_name, output in self.outputs.items():
+            for kind, transform in (
+                ("", output.data_transform),
+                ("err:", output.err_transform),
+            ):
+                small = transform.get_expanded_priors(self.latent_size, data_size=2)
+                large = transform.get_expanded_priors(self.latent_size, data_size=3)
+                per_object.update(
+                    f"{output_name}:{kind}{name}"
+                    for name, prior in small.items()
+                    if prior.batch_shape != large[name].batch_shape
+                )
+
+        return per_object
+
+    def output_pars(self, pars: dict[str, Any]) -> dict[str, Any]:
+        """Return the parameters that carry over from one set of objects to another.
+
+        That is everything except the parameters tied to the objects they were fitted
+        on: the latents, and any transform parameter shaped by ``"data_size"``. This
+        is the dict to pass as ``fixed_pars`` when applying a trained model to new
+        objects.
 
         Parameters
         ----------
@@ -416,15 +454,30 @@ class LVM(eqx.Module):
         Returns
         -------
         dict
-            A shallow copy of ``pars`` without the ``"latents"`` entry.
+            ``pars`` with the per-object entries removed. Outputs left with no
+            parameters at all are dropped entirely.
 
         Examples
         --------
-        >>> pars = {"latents": 1, "flux": {"data": {"A": 2}}}
-        >>> LVM.output_pars(pars)
-        {'flux': {'data': {'A': 2}}}
+        >>> import pollux as plx
+        >>> from pollux.models.transforms import LinearTransform
+        >>> model = plx.LVM(latent_size=2)
+        >>> model.register_output("flux", LinearTransform(output_size=3))
+        >>> pars = {"latents": [[0.0, 0.0]], "flux": {"data": {"A": 2}, "err": {}}}
+        >>> model.output_pars(pars)
+        {'flux': {'data': {'A': 2}, 'err': {}}}
+
+        See Also
+        --------
+        per_object_param_names : which parameters this drops, and why.
         """
-        return {k: v for k, v in pars.items() if k != "latents"}
+        per_object = self.per_object_param_names()
+
+        # Work in the flat "output:param" naming, which is what the prior expansion
+        # used to decide what is per-object, then rebuild the nested layout
+        packed = self.pack_numpyro_pars(pars, ignore_missing=True)
+        kept = {k: v for k, v in packed.items() if k not in per_object}
+        return self.unpack_numpyro_pars(kept, ignore_missing=True)
 
     def setup_numpyro(
         self,
