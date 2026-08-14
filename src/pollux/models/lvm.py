@@ -489,9 +489,10 @@ class LVM(eqx.Module):
         ----------
         latents
             The latent vectors that transform into the outputs. Whether these are
-            inferred or known depends on the architecture: in :class:`~pollux.models.Lux`
-            they are free parameters, whereas in :class:`~pollux.models.Cannon` they are
-            the observed stellar labels of the training set.
+            inferred or known depends on the architecture: in
+            :class:`~pollux.models.Lux` they are free parameters, whereas in
+            :class:`~pollux.models.Cannon` they are the observed stellar labels of the
+            training set.
         data
             A dictionary-like object of observed data for each output. The keys should
             correspond to the output names.
@@ -558,7 +559,7 @@ class LVM(eqx.Module):
     def default_numpyro_model(
         self,
         data: PolluxData,
-        latents_prior: dist.Distribution | None | bool = None,
+        latents_prior: dist.Distribution | bool | None = None,
         fixed_pars: PackedParamsT | None = None,
         names: list[str] | None = None,
         custom_model: Callable[[BatchedLatentsT, dict[str, Any], PolluxData], None]
@@ -627,7 +628,7 @@ class LVM(eqx.Module):
         num_steps: int,
         rng_key: jax.Array,
         optimizer: OptimizerT | None = None,
-        latents_prior: dist.Distribution | None | bool = None,
+        latents_prior: dist.Distribution | bool | None = None,
         custom_model: Callable[[BatchedLatentsT, dict[str, Any], PolluxData], None]
         | None = None,
         fixed_pars: UnpackedParamsT | None = None,
@@ -724,7 +725,7 @@ class LVM(eqx.Module):
         blocks: "list[ParameterBlock] | list[str] | None" = None,
         fixed_pars: UnpackedParamsT | None = None,
         max_cycles: int = 10,
-        tol: float = 1e-4,
+        tol: float = 1e-6,
         rng_key: jax.Array | None = None,
         initial_params: UnpackedParamsT | None = None,
         latents_prior: dist.Distribution | None = None,
@@ -732,17 +733,124 @@ class LVM(eqx.Module):
     ) -> "IterativeOptimizationResult":
         """Optimize using iterative parameter block coordinate descent.
 
-        Wherever a sub-problem turns out to be quadratic, this solves it exactly with
-        weighted least squares instead of running SVI on it. Whether it is quadratic
-        is established by linearizing the transform, so composed models count too --
-        a slice of the latents feeding a linear branch, polynomial features feeding a
-        linear layer, a linear map plus a fixed offset. The default strategy
-        alternates between optimizing the latents (with output parameters fixed) and
-        optimizing each output's parameters (with the latents fixed).
+        This cycles through blocks of parameters, optimizing each while holding the
+        others fixed. Wherever a sub-problem turns out to be quadratic it is solved
+        exactly by weighted least squares, which needs no learning rate and no step
+        count. Whether it is quadratic is established by linearizing the transform, so
+        composed models count too -- a slice of the latents feeding a linear branch,
+        polynomial features feeding a linear layer, a linear map plus a fixed offset.
 
-        See :func:`pollux.models.optimize_iterative` for the full description of
-        the parameters and of the returned result. Note that this method defaults
-        to ``max_cycles=10``.
+        Which blocks those are is decided by measurement rather than by transform type:
+
+        - the **latents** can be solved exactly when every output with data is affine
+          in them. That covers a bare linear map, but equally a slice of the latents
+          feeding a linear branch, a ``ConcatenateTransform`` of linear children, or a
+          linear map plus a fixed per-object offset.
+        - an **output's own parameters** can be solved exactly when its transform ends
+          in a linear layer that holds all of the transform's parameters. Anything
+          before that layer is just run forward to make features -- which is what lets
+          the Cannon's polynomial expansion work.
+
+        Blocks that do not qualify fall back to SVI, and say so with a
+        :class:`~pollux.exceptions.PolluxLinearizationWarning` naming each block and
+        the reason. ``result.blocks`` reports what each block actually ran with.
+
+        Parameters
+        ----------
+        data
+            The training data.
+        blocks
+            List of :class:`~pollux.models.ParameterBlock` specifications, or a list of
+            strings naming which parameter groups to optimize (e.g. ``["latents"]``).
+            Strings become blocks with an inferred optimizer (``"least_squares"`` where
+            the sub-problem allows it). If ``None``, alternates between the latents and
+            each output that has something to fit. A block spec is ``"latents"``,
+            ``"output_name"``, ``"output_name:data"`` or ``"output_name:err"``.
+        fixed_pars
+            Parameters to hold fixed during optimization. When provided alongside
+            string ``blocks``, ``fixed_pars`` is merged with the optimized parameters
+            before returning, so the result is a complete parameter dict. Ignored when
+            ``initial_params`` is also given (you are responsible for merging then).
+            :meth:`output_pars` builds the right dict for applying a trained model to
+            new objects.
+        max_cycles
+            Maximum number of full optimization cycles. Note this method defaults to
+            10, where :func:`~pollux.models.optimize_iterative` defaults to 100.
+        tol
+            Convergence tolerance. Stops when the relative change in loss is below it.
+        rng_key
+            JAX random key. Required when any block uses SVI (i.e. its optimizer is not
+            ``"least_squares"``) or when ``initial_params`` is None, where it is used to
+            sample starting values from the priors.
+        initial_params
+            Initial parameter values. If None and ``fixed_pars`` is given, built by
+            merging ``fixed_pars`` with zero-initialized optimized params. If both are
+            None, initialized from the priors.
+        latents_prior
+            Prior distribution for the latents. If None, uses ``Normal(0, 1)``. This
+            also sets the regularization strength of the closed-form latent solve.
+        progress
+            Whether to display a progress bar.
+
+        Returns
+        -------
+        IterativeOptimizationResult
+            Holds ``params`` (the optimized parameters, including any ``fixed_pars``),
+            ``losses_per_cycle``, ``n_cycles``, ``converged``, and ``blocks`` as they
+            were actually run.
+
+        Examples
+        --------
+        Default blocks, letting the model decide what can be solved exactly::
+
+            result = model.optimize_iterative(train_data, max_cycles=20)
+            opt_pars = result.params
+
+        Applying a trained model to new objects: fit only the latents, holding
+        everything that carries over fixed::
+
+            test_result = model.optimize_iterative(
+                test_data, blocks=["latents"], fixed_pars=model.output_pars(opt_pars)
+            )
+
+        **Controlling the SVI blocks.** Any block that cannot be solved in closed form
+        runs Adam at ``step_size=1e-3`` for 1000 steps. Both are usually worth raising.
+        Pass :class:`~pollux.models.ParameterBlock` instances instead of strings to set
+        them per block, and mix in ``optimizer="least_squares"`` for the blocks that do
+        have an exact solve::
+
+            from pollux.models import ParameterBlock
+
+            result = model.optimize_iterative(
+                train_data,
+                blocks=[
+                    ParameterBlock(
+                        "latents", "latents",
+                        num_steps=500, optimizer_kwargs={"step_size": 1e-2},
+                    ),
+                    ParameterBlock("flux:data", "flux:data", optimizer="least_squares"),
+                    ParameterBlock(
+                        "flux:err", "flux:err",
+                        num_steps=500, optimizer_kwargs={"step_size": 1e-2},
+                    ),
+                ],
+                max_cycles=20,
+                rng_key=jax.random.PRNGKey(42),
+            )
+
+        A different optimizer entirely goes in the same place::
+
+            import numpyro.optim
+
+            block = ParameterBlock(
+                "flux:err", "flux:err",
+                optimizer=numpyro.optim.SGD, optimizer_kwargs={"step_size": 1e-4},
+            )
+
+        See Also
+        --------
+        pollux.models.optimize_iterative : the underlying function.
+        pollux.models.ParameterBlock : per-block optimizer, step size and step count.
         """
         return optimize_iterative(
             model=self,
