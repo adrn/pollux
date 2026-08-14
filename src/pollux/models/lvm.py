@@ -635,6 +635,7 @@ class LVM(eqx.Module):
         names: list[str] | None = None,
         svi_run_kwargs: dict[str, Any] | None = None,
         guide: type[AutoGuide] | AutoGuide | None = None,
+        init_loc_fn: Callable[..., Any] | None = None,
     ) -> tuple[UnpackedParamsT, Any]:
         """Optimize the model parameters using SVI.
 
@@ -668,6 +669,28 @@ class LVM(eqx.Module):
               model function.
             - A guide instance: used directly (must already be constructed with
               the model function).
+        init_loc_fn
+            Where the guide starts from, as one of numpyro's ``init_to_*`` functions.
+            If ``None``, the guide's own default is used, which for ``AutoDelta`` is
+            ``init_to_median`` -- a draw from the priors, which is a poor starting
+            point for anything with a badly multi-modal or highly structured
+            optimum. Cannot be combined with an already-constructed ``guide``
+            instance, which carries its own.
+
+            To start from a set of parameters, pass them through
+            :meth:`pack_numpyro_pars` to get the names numpyro knows them by. A
+            partial dict is fine: any site not listed falls back to the default::
+
+                from numpyro.infer.initialization import init_to_value
+
+                pars, _ = model.optimize(
+                    data,
+                    num_steps=1000,
+                    rng_key=key,
+                    init_loc_fn=init_to_value(
+                        values=model.pack_numpyro_pars(start, ignore_missing=True)
+                    ),
+                )
 
         """
 
@@ -695,11 +718,21 @@ class LVM(eqx.Module):
 
         svi_run_kwargs = svi_run_kwargs or {}
 
+        # init_loc_fn is keyword-only on every numpyro AutoGuide, so this is uniform
+        guide_kwargs = {} if init_loc_fn is None else {"init_loc_fn": init_loc_fn}
+
         if guide is None:
-            _guide = AutoDelta(model)
+            _guide = AutoDelta(model, **guide_kwargs)
         elif isinstance(guide, type) and issubclass(guide, AutoGuide):
-            _guide = guide(model)
+            _guide = guide(model, **guide_kwargs)
         elif isinstance(guide, AutoGuide):
+            if init_loc_fn is not None:
+                msg = (
+                    "init_loc_fn has no effect on an already-constructed guide, which "
+                    "has picked its starting point. Pass init_loc_fn to the guide's own "
+                    "constructor, or pass a guide class here and let optimize() build it."
+                )
+                raise ValueError(msg)
             _guide = guide
         else:
             msg = (

@@ -8,6 +8,7 @@ import numpyro.distributions as dist
 import numpyro.optim
 import pytest
 from numpyro.infer.autoguide import AutoNormal
+from numpyro.infer.initialization import init_to_value
 
 import pollux as plx
 from pollux.models.transforms import (
@@ -746,3 +747,74 @@ class TestOptimizeGuide:
 
         # Latents should have the same shape
         assert pars_delta["latents"].shape == pars_normal["latents"].shape
+
+
+class TestOptimizeInitLocFn:
+    """Tests for the init_loc_fn parameter on LVM.optimize."""
+
+    @pytest.fixture
+    def model_and_data(self):
+        """A tiny linear model and some data to optimize it against."""
+        rng = np.random.default_rng(42)
+        model = plx.LVM(latent_size=3)
+        model.register_output("flux", LinearTransform(output_size=6))
+
+        flux = rng.normal(size=(20, 6))
+        data = plx.data.PolluxData(
+            flux=plx.data.OutputData(flux, err=np.full_like(flux, 0.1)),
+        )
+        return model, data
+
+    def test_starts_from_the_given_values(self, model_and_data):
+        """One step at a negligible step size should barely move off the start."""
+        model, data = model_and_data
+
+        start = {
+            "latents": jnp.full((20, 3), 0.3),
+            "flux": {"data": {"A": jnp.full((6, 3), 0.7)}},
+        }
+        pars, _ = model.optimize(
+            data,
+            num_steps=1,
+            rng_key=jax.random.PRNGKey(0),
+            optimizer=numpyro.optim.Adam(1e-8),
+            init_loc_fn=init_to_value(values=model.pack_numpyro_pars(start)),
+        )
+
+        assert np.allclose(pars["latents"], 0.3, atol=1e-5)
+        assert np.allclose(pars["flux"]["data"]["A"], 0.7, atol=1e-5)
+
+    def test_partial_values_fall_back_to_the_default(self, model_and_data):
+        """Sites left out of the values dict get the guide's own initialization."""
+        model, data = model_and_data
+
+        start = {"flux": {"data": {"A": jnp.full((6, 3), 0.7)}}}
+        pars, _ = model.optimize(
+            data,
+            num_steps=1,
+            rng_key=jax.random.PRNGKey(0),
+            optimizer=numpyro.optim.Adam(1e-8),
+            init_loc_fn=init_to_value(
+                values=model.pack_numpyro_pars(start, ignore_missing=True)
+            ),
+        )
+
+        assert np.allclose(pars["flux"]["data"]["A"], 0.7, atol=1e-5)
+        assert pars["latents"].shape == (20, 3)
+
+    def test_guide_instance_raises(self, model_and_data):
+        """An already-constructed guide has picked its own starting point."""
+        model, data = model_and_data
+
+        numpyro_model = partial(
+            model.default_numpyro_model, latents_prior=None, custom_model=None
+        )
+
+        with pytest.raises(ValueError, match="init_loc_fn has no effect"):
+            model.optimize(
+                data,
+                num_steps=1,
+                rng_key=jax.random.PRNGKey(0),
+                guide=AutoNormal(numpyro_model),
+                init_loc_fn=init_to_value(values={}),
+            )
