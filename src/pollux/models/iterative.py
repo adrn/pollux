@@ -150,9 +150,19 @@ def _split_param_layer(
 
     Returns ``(prefix, layer)``, with ``prefix`` None when the transform is already
     a bare linear layer, or None when the transform cannot be solved this way.
+
+    The solve reads the layer's parameters, and writes the answer back, by the names
+    ``"A"`` for the matrix and ``"b"`` for the bias -- and it relies on the bias
+    occupying the appended column of the design matrix. Those names normally come from
+    :class:`~pollux.models.transforms.LinearTransform` and
+    :class:`~pollux.models.transforms.AffineTransform`, but a caller can pass a
+    different ``transform`` function to either, in which case the parameter names come
+    from *that* function's signature and no longer match. So the names are checked here
+    rather than assumed: a layer that does not use them is refused, and the block falls
+    back to an optimizer that reads parameters generically.
     """
     if isinstance(transform, (LinearTransform, AffineTransform)):
-        return None, transform
+        return (None, transform) if _has_solvable_names(transform) else None
 
     if not isinstance(transform, TransformSequence):
         return None
@@ -165,7 +175,16 @@ def _split_param_layer(
     if any(transform.names_nested[:-1]):
         return None
 
+    if not _has_solvable_names(last):
+        return None
+
     return TransformSequence(tuple(head)), last
+
+
+def _has_solvable_names(layer: LinearTransform | AffineTransform) -> bool:
+    """Whether the layer's parameters are the ``A`` (and ``b``) the solve expects."""
+    expected = ("A", "b") if "b" in layer.shapes else ("A",)
+    return tuple(layer._param_names) == expected
 
 
 #: Relative tolerance for deciding that a prediction map is affine in the latents.
@@ -381,6 +400,31 @@ def _inverse_variance(
     if jnp.all(err <= 0):
         return jnp.ones_like(output_data.data)
     return 1.0 / err**2
+
+
+def _broadcast_prior(
+    value: jax.Array | float, shape: tuple[int, ...], name: str
+) -> jax.Array:
+    """Spread a prior's precision or mean over the parameter it describes.
+
+    An elementwise prior may be a single number, one number per output dimension, or
+    one number per element of the parameter -- a different regularization strength for
+    each stellar label, say, or for each coefficient individually. All of those
+    broadcast to the parameter's own shape.
+
+    Anything else is a shape the solve cannot use. Reporting it here, against the shape
+    that was expected, beats letting it surface as a bare broadcasting error from
+    inside the linear algebra several frames down.
+    """
+    try:
+        return jnp.broadcast_to(jnp.asarray(value, dtype=float), shape)
+    except (ValueError, TypeError) as exc:
+        msg = (
+            f"The prior on '{name}' has shape {jnp.shape(value)}, which does not fit "
+            f"the parameter it describes. Expected something broadcastable to {shape}: "
+            "a scalar, one value per output dimension, or one value per element."
+        )
+        raise ValueError(msg) from exc
 
 
 def _solve_priors(model: LVM, spec: str) -> dict[str, dist.Distribution]:
@@ -604,6 +648,11 @@ def _solve_output_params_least_squares(
     assert term_A is not None
     latent_size = n_design - 1 if has_bias else n_design
 
+    term_b = None
+    if has_bias:
+        term_b = prior_term(layer.priors.get("b", dist.Normal(0, 1)))
+        assert term_b is not None
+
     if term_A.correlated:
         # A correlated prior over the latent axis: its precision matrix replaces the
         # scalar ridge, occupying the leading block when a bias column is appended.
@@ -613,21 +662,30 @@ def _solve_output_params_least_squares(
         )
         row = prec @ jnp.broadcast_to(term_A.mean, (latent_size,))
         rhs_extra = jnp.zeros((output_size, n_design)).at[:, :latent_size].set(row)
+        if term_b is not None:
+            reg_matrix = reg_matrix.at[-1, -1].set(term_b.precision)
+            rhs_extra = rhs_extra.at[:, -1].set(term_b.precision * term_b.mean)
+        reg_matrix = jnp.broadcast_to(reg_matrix, (output_size, n_design, n_design))
     else:
-        reg_matrix = term_A.precision * jnp.eye(n_design)
-        rhs_extra = term_A.precision * jnp.broadcast_to(
-            term_A.mean, (output_size, n_design)
-        )
+        # An elementwise prior contributes a diagonal ridge, and it may differ from one
+        # output dimension to the next -- a different regularization strength for each
+        # stellar label, say. The solve is already one system per output dimension, so
+        # give each its own diagonal rather than sharing a single matrix.
+        prec = _broadcast_prior(term_A.precision, (output_size, latent_size), "A")
+        mean = _broadcast_prior(term_A.mean, (output_size, latent_size), "A")
+        if term_b is not None:
+            # b is one value per output dimension, so its prior spreads over a column
+            bias_prec = _broadcast_prior(term_b.precision, (output_size,), "b")
+            bias_mean = _broadcast_prior(term_b.mean, (output_size,), "b")
+            prec = jnp.concatenate([prec, bias_prec[:, None]], axis=1)
+            mean = jnp.concatenate([mean, bias_mean[:, None]], axis=1)
+        reg_matrix = jax.vmap(jnp.diag)(prec)  # (output_size, n_design, n_design)
+        rhs_extra = prec * mean
 
     lower = jnp.full(n_design, term_A.lower, dtype=float)
     upper = jnp.full(n_design, term_A.upper, dtype=float)
     bounded = term_A.bounded
-
-    if has_bias:
-        term_b = prior_term(layer.priors.get("b", dist.Normal(0, 1)))
-        assert term_b is not None
-        reg_matrix = reg_matrix.at[-1, -1].set(term_b.precision)
-        rhs_extra = rhs_extra.at[:, -1].set(term_b.precision * term_b.mean)
+    if term_b is not None:
         lower = lower.at[-1].set(term_b.lower)
         upper = upper.at[-1].set(term_b.upper)
         bounded = bounded or term_b.bounded
@@ -640,12 +698,14 @@ def _solve_output_params_least_squares(
         b = jnp.einsum("dpn,nd->dp", DtW, y) + rhs_extra
         solution = box_constrained_normal_equations(H, b, lower, upper)
     else:
-        # One independent solve per output dimension -> (output_size, n_design)
+        # One independent solve per output dimension -> (output_size, n_design). The
+        # regularization is vmapped along with the data, so a prior that differs from
+        # one output dimension to the next is carried through rather than shared.
         solution = jax.vmap(
-            lambda y_dim, ivar_dim, rhs_row: weighted_least_squares(
-                design, y_dim, ivar_dim, reg_matrix, rhs_row
+            lambda y_dim, ivar_dim, reg_dim, rhs_row: weighted_least_squares(
+                design, y_dim, ivar_dim, reg_dim, rhs_row
             )
-        )(y.T, output_ivar.T, rhs_extra)
+        )(y.T, output_ivar.T, reg_matrix, rhs_extra)
 
     solved = (
         {"A": solution[:, :-1], "b": solution[:, -1]} if has_bias else {"A": solution}

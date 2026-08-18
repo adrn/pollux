@@ -1667,3 +1667,170 @@ class TestConstrainedPriors:
             )
         flux_block = next(b for b in result.blocks if b.name == "flux:data")
         assert flux_block.optimizer != "least_squares"
+
+
+def _predicts_well(model, data, params, rtol=0.05):
+    """Whether the fit reproduces each output column to within a fraction of its spread.
+
+    The right invariant for these models: the parameters themselves are identified only
+    up to a rotation of the latent space, and alternating least squares on a jointly
+    non-convex problem need not land on the same optimum twice, but the predictions are
+    invariant under both.
+    """
+    pred = np.asarray(model.predict_outputs(params)[next(iter(data.keys()))])
+    obs = np.asarray(data[next(iter(data.keys()))].data)
+    resid = np.sqrt(np.mean((pred - obs) ** 2, axis=0))
+    return bool(np.all(resid < rtol * obs.std(axis=0)))
+
+
+class TestPerOutputPriors:
+    """A prior on a linear layer may differ from one output dimension to the next.
+
+    The closed-form solve is already one system per output dimension, so it can carry
+    a different regularization for each. It used to build a single shared reg matrix
+    and died with a bare broadcasting error the moment a prior was not scalar.
+    """
+
+    @pytest.fixture
+    def two_scale_data(self):
+        """Outputs whose natural scales span a couple of orders of magnitude.
+
+        More output dimensions than latents, so each object's latents are determined by
+        its own data: with fewer observations than latents per object the offset becomes
+        degenerate with the latent mean and the alternating solve has nothing to lock on
+        to.
+        """
+        n_stars, n_latents, n_out = 512, 3, 8
+        rng = np.random.default_rng(42)
+
+        scales = np.array([10.0, 10.0, 1.0, 1.0, 0.1, 0.1, 0.05, 0.05])
+        latents = rng.normal(size=(n_stars, n_latents))
+        A_true = rng.normal(size=(n_out, n_latents)) * scales[:, None]
+        b_true = rng.normal(size=n_out) * scales
+        err = np.tile(0.02 * scales, (n_stars, 1))
+        y = latents @ A_true.T + b_true + rng.normal(scale=err)
+
+        data = plx.data.PolluxData(y=plx.data.OutputData(y, err=err))
+        return data, n_latents, n_out, b_true, scales
+
+    def test_per_output_row_prior(self, two_scale_data):
+        """One scale per output dimension: shape (n_out, 1)."""
+        data, n_latents, n_out, _b_true, scales = two_scale_data
+
+        model = plx.LVM(latent_size=n_latents)
+        model.register_output(
+            "y",
+            AffineTransform(
+                output_size=n_out,
+                priors={
+                    "A": dist.Normal(scale=scales.reshape(n_out, 1)),
+                    "b": dist.Normal(scale=scales),
+                },
+            ),
+        )
+        result = model.optimize_iterative(
+            data, max_cycles=64, rng_key=jax.random.PRNGKey(0), progress=False
+        )
+
+        # the block keeps its closed-form solve rather than crashing or falling back
+        assert all(b.optimizer == "least_squares" for b in result.blocks)
+        # and the fit describes the data, whose columns span four orders of magnitude
+        assert _predicts_well(model, data, result.params)
+
+    def test_fully_elementwise_prior(self, two_scale_data):
+        """One scale per element of A: shape (n_out, n_latents), A's own shape."""
+        data, n_latents, n_out, _b_true, row_scales = two_scale_data
+        scales = np.tile(row_scales.reshape(n_out, 1), (1, n_latents))
+        assert scales.shape == (n_out, n_latents)
+
+        model = plx.LVM(latent_size=n_latents)
+        model.register_output(
+            "y",
+            AffineTransform(
+                output_size=n_out,
+                priors={
+                    "A": dist.Normal(scale=scales),
+                    "b": dist.Normal(scale=row_scales),
+                },
+            ),
+        )
+        result = model.optimize_iterative(
+            data, max_cycles=64, rng_key=jax.random.PRNGKey(0), progress=False
+        )
+        assert all(b.optimizer == "least_squares" for b in result.blocks)
+        assert _predicts_well(model, data, result.params)
+
+    def test_the_prior_is_actually_applied_per_row(self):
+        """Not just accepted -- each row must feel its own regularization.
+
+        Two identical outputs, given priors differing by orders of magnitude: the
+        tightly-regularized row must be shrunk far harder toward zero.
+        """
+        n_stars, n_latents, n_out = 256, 2, 2
+        rng = np.random.default_rng(7)
+        latents = rng.normal(size=(n_stars, n_latents))
+        A_true = rng.normal(size=(n_out, n_latents))
+        y = np.repeat((latents @ A_true.T)[:, :1], n_out, axis=1)  # identical columns
+        err = np.full((n_stars, n_out), 0.1)
+
+        data = plx.data.PolluxData(
+            y=plx.data.OutputData(y + rng.normal(scale=err), err=err)
+        )
+        model = plx.LVM(latent_size=n_latents)
+        model.register_output(
+            "y",
+            LinearTransform(
+                output_size=n_out,
+                # row 0 barely regularized, row 1 crushed
+                priors={"A": dist.Normal(scale=np.array([[10.0], [1e-3]]))},
+            ),
+        )
+        result = model.optimize_iterative(
+            data, max_cycles=64, rng_key=jax.random.PRNGKey(0), progress=False
+        )
+        A_fit = np.asarray(result.params["y"]["data"]["A"])
+        assert np.abs(A_fit[1]).max() < 0.1 * np.abs(A_fit[0]).max()
+
+    def test_scalar_prior_still_works(self, two_scale_data):
+        """The shared-prior path must be unchanged."""
+        data, n_latents, n_out, _, scales = two_scale_data
+        model = plx.LVM(latent_size=n_latents)
+        model.register_output(
+            "y",
+            LinearTransform(output_size=n_out, priors={"A": dist.Normal(0.0, 2.0)}),
+        )
+        result = model.optimize_iterative(
+            data, max_cycles=32, rng_key=jax.random.PRNGKey(0), progress=False
+        )
+        assert all(b.optimizer == "least_squares" for b in result.blocks)
+        assert np.all(np.isfinite(result.params["y"]["data"]["A"]))
+
+    def test_misshaped_prior_reports_the_shape(self, two_scale_data):
+        """A prior that cannot describe the parameter names the shape it needed."""
+        data, n_latents, n_out, _, scales = two_scale_data
+        model = plx.LVM(latent_size=n_latents)
+        model.register_output(
+            "y",
+            LinearTransform(
+                output_size=n_out, priors={"A": dist.Normal(scale=np.ones(5))}
+            ),
+        )
+        with pytest.raises(ValueError, match=r"shape"):
+            model.optimize_iterative(
+                data, max_cycles=2, rng_key=jax.random.PRNGKey(0), progress=False
+            )
+
+    def test_layer_with_renamed_parameters_is_refused(self):
+        """The solve reads and writes 'A' and 'b' by name, so it checks them.
+
+        A LinearTransform built with a different transform function takes its parameter
+        names from that function's signature, and they no longer match what the solve
+        assumes -- so the block must fall back rather than silently use the wrong prior.
+        """
+
+        def renamed(z, M):
+            return M @ z
+
+        layer = LinearTransform(output_size=3, transform=renamed)
+        assert layer._param_names == ("M",)  # but layer.shapes still says "A"
+        assert _split_param_layer(layer) is None
