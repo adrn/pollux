@@ -92,10 +92,6 @@ class TestPriorTerm:
         """Anything that is not a bounded quadratic is refused rather than approximated."""
         assert prior_term(prior) is None
 
-    def test_multivariate_normal_is_refused_for_now(self):
-        mvn = dist.MultivariateNormal(jnp.zeros(3), covariance_matrix=jnp.eye(3))
-        assert prior_term(mvn) is None
-
     def test_unwraps_expanded(self):
         """An expanded prior hides its parameters behind a wrapper."""
         term = prior_term(dist.Normal(1.0, 2.0).expand((4,)))
@@ -181,3 +177,31 @@ class TestBoxConstrainedSolve:
         for i in range(2):
             single = box_constrained_normal_equations(Hs[i], bs[i], lower, upper)
             assert jnp.allclose(x[i], single, atol=1e-8)
+
+
+class TestCorrelatedPriors:
+    """MultivariateNormal is quadratic, but couples a whole axis."""
+
+    def test_reports_a_precision_matrix_and_its_event_shape(self):
+        cov = jnp.array([[2.0, 0.5], [0.5, 1.0]])
+        term = prior_term(dist.MultivariateNormal(jnp.array([1.0, -1.0]), cov))
+        assert term is not None
+        assert term.correlated
+        assert term.event_shape == (2,)
+        assert jnp.allclose(term.precision, jnp.linalg.inv(cov))
+        assert jnp.allclose(term.mean, jnp.array([1.0, -1.0]))
+        assert not term.bounded
+
+    def test_elementwise_priors_are_not_correlated(self):
+        """Even when their precision happens to be two-dimensional."""
+        term = prior_term(dist.Normal(jnp.zeros((3, 2)), jnp.ones((3, 2))))
+        assert not term.correlated
+        assert term.precision.shape == (3, 2)
+
+    def test_diagonal_covariance_matches_the_equivalent_normal(self):
+        mvn = prior_term(
+            dist.MultivariateNormal(jnp.zeros(3), covariance_matrix=0.25 * jnp.eye(3))
+        )
+        normal = prior_term(dist.Normal(0.0, 0.5))
+        assert jnp.allclose(jnp.diag(mvn.precision), normal.precision)
+        assert jnp.allclose(mvn.precision - jnp.diag(jnp.diag(mvn.precision)), 0.0)

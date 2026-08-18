@@ -53,6 +53,17 @@ class PriorTerm:
     mean: jax.Array | float
     lower: jax.Array | float
     upper: jax.Array | float
+    event_shape: tuple[int, ...] = ()
+
+    @property
+    def correlated(self) -> bool:
+        """Whether ``precision`` is a matrix coupling one axis of the parameter.
+
+        Cannot be inferred from ``precision.ndim``: an elementwise prior on a matrix
+        parameter has a two-dimensional precision too, it just is not a matrix in the
+        linear-algebra sense.
+        """
+        return bool(self.event_shape)
 
     @property
     def bounded(self) -> bool:
@@ -157,6 +168,18 @@ def prior_term(prior: dist.Distribution) -> PriorTerm | None:
         if not isinstance(base, dist.Normal):
             return None
         return gaussian(base.scale, base.loc)
+
+    # Quadratic, but coupling a whole axis rather than acting element by element.
+    # Which axis of the parameter that is depends on where the prior is used, so the
+    # event shape is reported and the caller matches it up.
+    if isinstance(prior, dist.MultivariateNormal):
+        return PriorTerm(
+            jnp.asarray(prior.precision_matrix),
+            jnp.asarray(prior.loc),
+            lower,
+            upper,
+            event_shape=tuple(prior.event_shape),
+        )
 
     # Flat priors contribute no quadratic term at all, only (possibly) a box
     if isinstance(prior, (dist.Uniform, dist.ImproperUniform)):

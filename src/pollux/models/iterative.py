@@ -491,14 +491,25 @@ def _solve_latents_least_squares(
             "quadratic, so it cannot be folded into a linear solve"
         )
 
-    # Add regularization: (A^T W A + λI) z = A^T W y + λ μ
-    # For N(0, 1) prior, this reduces to (A^T W A + I) z = A^T W y
-    reg_matrix = term.precision * jnp.eye(latent_size)
+    # Add regularization: (A^T W A + Λ) z = A^T W y + Λ μ
+    # For N(0, 1) prior, Λ is the identity and this reduces to (A^T W A + I) z = A^T W y
+    if term.correlated:
+        if term.event_shape != (latent_size,):
+            return (
+                f"the latents prior correlates {term.event_shape[0]} values, but the "
+                f"latent vectors have size {latent_size}"
+            )
+        reg_matrix = jnp.asarray(term.precision)
+        prior_rhs = reg_matrix @ jnp.broadcast_to(term.mean, (latent_size,))
+    else:
+        reg_matrix = term.precision * jnp.eye(latent_size)
+        prior_rhs = term.precision * jnp.broadcast_to(term.mean, (latent_size,))
+
     AtWA = AtWA + reg_matrix[None, :, :]
 
     # Add prior mean contribution to RHS if non-zero
-    if not jnp.allclose(term.mean, 0.0):
-        AtWy = AtWy + term.precision * term.mean
+    if not jnp.allclose(prior_rhs, 0.0):
+        AtWy = AtWy + prior_rhs
 
     if term.bounded:
         lower = jnp.broadcast_to(jnp.asarray(term.lower, float), (latent_size,))
@@ -591,10 +602,23 @@ def _solve_output_params_least_squares(
     # quadratic, so prior_term is not None here.
     term_A = prior_term(layer.priors.get("A", dist.Normal(0, 1)))
     assert term_A is not None
-    reg_matrix = term_A.precision * jnp.eye(n_design)
-    rhs_extra = term_A.precision * jnp.broadcast_to(
-        term_A.mean, (output_size, n_design)
-    )
+    latent_size = n_design - 1 if has_bias else n_design
+
+    if term_A.correlated:
+        # A correlated prior over the latent axis: its precision matrix replaces the
+        # scalar ridge, occupying the leading block when a bias column is appended.
+        prec = jnp.asarray(term_A.precision)
+        reg_matrix = (
+            jnp.zeros((n_design, n_design)).at[:latent_size, :latent_size].set(prec)
+        )
+        row = prec @ jnp.broadcast_to(term_A.mean, (latent_size,))
+        rhs_extra = jnp.zeros((output_size, n_design)).at[:, :latent_size].set(row)
+    else:
+        reg_matrix = term_A.precision * jnp.eye(n_design)
+        rhs_extra = term_A.precision * jnp.broadcast_to(
+            term_A.mean, (output_size, n_design)
+        )
+
     lower = jnp.full(n_design, term_A.lower, dtype=float)
     upper = jnp.full(n_design, term_A.upper, dtype=float)
     bounded = term_A.bounded
@@ -681,11 +705,21 @@ def _least_squares_blocker(
         # equations. Dropping it silently would return a fit that violates it, so the
         # block is refused and falls back to an optimizer that can honor it.
         for name, prior in _solve_priors(model, spec).items():
-            if prior_term(prior) is None:
+            term = prior_term(prior)
+            if term is None:
                 return (
                     f"the prior on '{output_name}:{name}' is a "
                     f"{type(prior).__name__}, which is not a bounded quadratic and so "
                     "cannot enter a linear solve"
+                )
+            # A correlated prior can only replace the ridge if it correlates the axis
+            # the solve is over. Correlating the output axis instead would couple the
+            # per-output-dimension solves into one system, which this path cannot do.
+            if term.correlated and term.event_shape != (model.latent_size,):
+                return (
+                    f"the prior on '{output_name}:{name}' correlates "
+                    f"{term.event_shape} values, but a closed-form solve can only use "
+                    f"a prior correlating the latent axis, of size {model.latent_size}"
                 )
     return None
 

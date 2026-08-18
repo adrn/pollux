@@ -83,6 +83,45 @@ def _resolve_shape(shape: ShapeT, **dim_sizes: int | None) -> tuple[int, ...]:
     return tuple(resolved)
 
 
+def _expand_prior(
+    prior: dist.Distribution, shape: tuple[int, ...]
+) -> dist.Distribution:
+    """Expand a prior so that a draw from it has shape ``shape``.
+
+    :meth:`~numpyro.distributions.Distribution.expand` takes a *batch* shape, so a
+    prior carrying event dimensions of its own -- a ``MultivariateNormal`` correlating
+    one axis of a parameter -- must only be expanded over the leading axes, with its
+    event shape accounting for the rest. Expanding it over the full shape instead
+    would silently give draws an extra trailing axis.
+
+    Examples
+    --------
+    >>> import jax.numpy as jnp
+    >>> import numpyro.distributions as dist
+    >>> from pollux.models.transforms import _expand_prior
+    >>> mvn = dist.MultivariateNormal(jnp.zeros(3), covariance_matrix=jnp.eye(3))
+    >>> expanded = _expand_prior(mvn, (8, 3))
+    >>> expanded.batch_shape, expanded.event_shape
+    ((8,), (3,))
+    >>> _expand_prior(dist.Normal(), (8, 3)).batch_shape
+    (8, 3)
+    """
+    event = tuple(prior.event_shape)
+    if not event:
+        return prior.expand(shape)
+
+    if len(event) > len(shape) or tuple(shape[-len(event) :]) != event:
+        msg = (
+            f"A prior with event shape {event} cannot describe a parameter of shape "
+            f"{shape}: its event shape has to match the trailing axes. A "
+            "MultivariateNormal correlating an axis of length n needs event shape "
+            "(n,), and that axis has to be the last one."
+        )
+        raise ValueError(msg)
+
+    return prior.expand(shape[: -len(event)])
+
+
 #: Type alias for parameter priors: maps parameter names to distributions.
 #: Used with :class:`FunctionTransform` to specify priors for learnable parameters.
 type ParamPriorsT = ImmutableMap[str, dist.Distribution]
@@ -224,7 +263,7 @@ class AbstractSingleTransform(AbstractTransform):
                     latent_size=latent_size,
                     data_size=data_size,
                 )
-                expanded_priors[name] = prior.expand(shape)
+                expanded_priors[name] = _expand_prior(prior, shape)
             else:
                 expanded_priors[name] = prior
         return ImmutableMap(**expanded_priors)

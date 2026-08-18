@@ -18,6 +18,7 @@ from pollux.models.transforms import (
     PolyFeatureTransform,
     ScatterTransform,
     TransformSequence,
+    _expand_prior,
 )
 
 
@@ -1375,3 +1376,31 @@ class TestParamNamesOnPolyFeature:
         )
         assert seq.names_nested == ((), ("A",))
         assert seq.names_flat == ("1:A",)
+
+
+class TestExpandPriorWithEventShape:
+    """A prior with event dimensions covers trailing axes rather than being broadcast."""
+
+    def test_elementwise_prior_expands_over_the_whole_shape(self):
+        expanded = _expand_prior(dist.Normal(), (8, 3))
+        assert expanded.batch_shape == (8, 3)
+        assert expanded.event_shape == ()
+
+    def test_event_shape_eats_the_trailing_axis(self):
+        mvn = dist.MultivariateNormal(jnp.zeros(3), covariance_matrix=jnp.eye(3))
+        expanded = _expand_prior(mvn, (8, 3))
+        assert expanded.batch_shape == (8,)
+        assert expanded.event_shape == (3,)
+        # a draw has the shape the parameter needs, not an extra axis
+        assert expanded.sample(jax.random.PRNGKey(0)).shape == (8, 3)
+
+    def test_mismatched_event_shape_is_refused(self):
+        mvn = dist.MultivariateNormal(jnp.zeros(5), covariance_matrix=jnp.eye(5))
+        with pytest.raises(ValueError, match="event shape"):
+            _expand_prior(mvn, (8, 3))
+
+    def test_linear_transform_accepts_a_correlated_prior(self):
+        mvn = dist.MultivariateNormal(jnp.zeros(4), covariance_matrix=jnp.eye(4))
+        trans = LinearTransform(output_size=6, priors={"A": mvn})
+        priors = trans.get_expanded_priors(latent_size=4)
+        assert priors["A"].shape() == (6, 4)
