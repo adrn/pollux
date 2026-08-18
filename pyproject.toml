@@ -49,6 +49,7 @@ test = [
 ]
 docs = [
   "astropy>=7.2.0",
+  "daft-pgm>=0.1.4",            # probabilistic graphical models, imported as `daft`
   "h5py>=3.16.0",
   "ipykernel>=6.30.1",
   "ipywidgets>=8.1.7",

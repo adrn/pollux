@@ -203,6 +203,7 @@ else:
 tutorial_sections = {
     "Latent Variable Models": [
         "tutorials/LVM-getting-started.ipynb",
+        "tutorials/LVM-math-notes.ipynb",
         "tutorials/LVM-iterative-optimization.ipynb",
         "tutorials/LVM-error-models.ipynb",
         "tutorials/LVM-hierarchical-missing-labels.ipynb",
