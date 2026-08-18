@@ -1,6 +1,6 @@
 """Linear algebra stuff."""
 
-__all__ = ("nmf", "weighted_least_squares")
+__all__ = ("box_constrained_normal_equations", "nmf", "weighted_least_squares")
 
 from typing import Any
 
@@ -43,6 +43,86 @@ def weighted_least_squares(
     DtW = design.T * ivar  # (n_features, n_data)
     result: jax.Array = jnp.linalg.solve(DtW @ design + reg_matrix, DtW @ y + rhs_extra)
     return result
+
+
+def box_constrained_normal_equations(
+    H: jax.Array,
+    b: jax.Array,
+    lower: jax.Array,
+    upper: jax.Array,
+    n_sweeps: int = 100,
+) -> jax.Array:
+    """Minimize ``½ xᵀ H x - bᵀ x`` subject to ``lower <= x <= upper``.
+
+    This is the constrained counterpart to :func:`weighted_least_squares`: the same
+    normal equations, but with a box the solution has to stay inside. It is what a
+    prior with bounded support -- a ``HalfNormal``, a ``TruncatedNormal`` -- turns the
+    sub-problem into. Solving the unconstrained system and clipping afterwards is
+    *not* equivalent and generally gives the wrong answer, because clipping one
+    coordinate changes the optimum of the others.
+
+    Uses cyclic coordinate descent. Each coordinate's update is the exact minimizer
+    along that coordinate, clamped to its bounds::
+
+        x_j <- clip((b_j - sum_{k != j} H_jk x_k) / H_jj, lower_j, upper_j)
+
+    which needs no step size and decreases the objective monotonically. The systems
+    here are small -- one per object or per output dimension, of size ``latent_size``
+    -- so the coordinate loop is unrolled and the whole thing stays jittable with a
+    fixed iteration count.
+
+    Parameters
+    ----------
+    H
+        Normal-equation matrices, shape ``(..., n, n)``. Assumed positive definite,
+        which the prior's precision guarantees whenever it is nonzero.
+    b
+        Right-hand sides, shape ``(..., n)``.
+    lower, upper
+        Bounds, shape ``(n,)``. Infinities for unbounded sides.
+    n_sweeps
+        Number of coordinate sweeps.
+
+    Returns
+    -------
+    array
+        The constrained minimizer, shape ``(..., n)``.
+
+    Examples
+    --------
+    The unconstrained minimum here is at ``(-1, 2)``, so a non-negativity constraint
+    pins the first coordinate to zero:
+
+    >>> import jax.numpy as jnp
+    >>> from pollux._linalg import box_constrained_normal_equations
+    >>> H = jnp.eye(2)
+    >>> b = jnp.array([-1.0, 2.0])
+    >>> lower, upper = jnp.zeros(2), jnp.full(2, jnp.inf)
+    >>> box_constrained_normal_equations(H, b, lower, upper)
+    Array([0., 2.], dtype=float32)
+    """
+    n = b.shape[-1]
+
+    # Warm start from the unconstrained solution, clipped into the box: often already
+    # optimal, and never worse than starting from the corner. A singular H gives
+    # non-finite entries here, which fall back to zero.
+    guess = jnp.linalg.solve(H, b[..., None])[..., 0]
+    x0 = jnp.clip(jnp.where(jnp.isfinite(guess), guess, 0.0), lower, upper)
+
+    def sweep(x: jax.Array, _: Any) -> tuple[jax.Array, None]:
+        for j in range(n):
+            # b_j - sum_{k != j} H_jk x_k, written as a full row product plus the
+            # diagonal term back, so it stays one einsum rather than a masked gather
+            off = (
+                jnp.einsum("...k,...k->...", H[..., j, :], x) - H[..., j, j] * x[..., j]
+            )
+            x = x.at[..., j].set(
+                jnp.clip((b[..., j] - off) / H[..., j, j], lower[j], upper[j])
+            )
+        return x, None
+
+    x, _ = jax.lax.scan(sweep, x0, xs=None, length=n_sweeps)
+    return x
 
 
 def nmf(

@@ -27,7 +27,8 @@ from numpyro.infer.autoguide import AutoDelta
 from numpyro.infer.initialization import init_to_value
 from tqdm.auto import tqdm
 
-from .._linalg import weighted_least_squares
+from .._linalg import box_constrained_normal_equations, weighted_least_squares
+from .._priors import prior_term
 from ..data import PolluxData
 from ..data.data import warn_if_unprocessed
 from ..exceptions import PolluxLinearizationWarning
@@ -382,39 +383,22 @@ def _inverse_variance(
     return 1.0 / err**2
 
 
-def _get_regularization_from_prior(
-    prior: dist.Distribution,
-) -> tuple[jax.Array | float, jax.Array | float]:
-    """Extract regularization parameters from a prior distribution.
+def _solve_priors(model: LVM, spec: str) -> dict[str, dist.Distribution]:
+    """The priors a closed-form solve for ``spec`` would have to honor.
 
-    Parameters
-    ----------
-    prior
-        A numpyro distribution. For Normal distributions, extracts the precision.
-        For other distributions, returns a negligible fallback regularization.
-
-    Returns
-    -------
-    regularization
-        The regularization strength alpha = 1 / scale**2.
-    prior_mean
-        The prior mean μ (for regularization toward non-zero mean).
-
-    Notes
-    -----
-    Currently only supports Normal distributions. For other priors,
-    uses a negligible regularization with zero mean.
+    ``spec`` is a block parameter specification: ``"latents"`` has its prior supplied
+    by the caller rather than the model, so it is handled separately and comes back
+    empty here.
     """
-    if isinstance(prior, dist.Normal):
-        # Normal(loc, scale): regularization is 1/scale^2
-        scale = prior.scale
-        loc = prior.loc
-        return 1.0 / (scale**2), loc
-    if isinstance(prior, dist.ImproperUniform):
-        # No regularization for improper uniform
-        return 0.0, 0.0
-    # Fallback for other distributions
-    return 1e-6, 0.0
+    output_name, _, param_type = spec.partition(":")
+    if output_name not in model.outputs or param_type != "data":
+        return {}
+
+    split = _split_param_layer(model.outputs[output_name].data_transform)
+    if split is None:
+        return {}
+    _, layer = split
+    return {name: layer.priors[name] for name in layer.shapes if name in layer.priors}
 
 
 def _solve_latents_least_squares(
@@ -500,16 +484,26 @@ def _solve_latents_least_squares(
     # Get regularization from latents prior
     if latents_prior is None:
         latents_prior = dist.Normal(0.0, 1.0)
-    reg_strength, prior_mean = _get_regularization_from_prior(latents_prior)
+    term = prior_term(latents_prior)
+    if term is None:
+        return (
+            f"the latents prior {type(latents_prior).__name__} is not a bounded "
+            "quadratic, so it cannot be folded into a linear solve"
+        )
 
     # Add regularization: (A^T W A + λI) z = A^T W y + λ μ
     # For N(0, 1) prior, this reduces to (A^T W A + I) z = A^T W y
-    reg_matrix = reg_strength * jnp.eye(latent_size)
+    reg_matrix = term.precision * jnp.eye(latent_size)
     AtWA = AtWA + reg_matrix[None, :, :]
 
     # Add prior mean contribution to RHS if non-zero
-    if not jnp.allclose(prior_mean, 0.0):
-        AtWy = AtWy + reg_strength * prior_mean
+    if not jnp.allclose(term.mean, 0.0):
+        AtWy = AtWy + term.precision * term.mean
+
+    if term.bounded:
+        lower = jnp.broadcast_to(jnp.asarray(term.lower, float), (latent_size,))
+        upper = jnp.broadcast_to(jnp.asarray(term.upper, float), (latent_size,))
+        return box_constrained_normal_equations(AtWA, AtWy, lower, upper)
 
     # Solve for each data point: z[i] = solve(AtWA[i], AtWy[i])
     result: jax.Array = jax.vmap(jnp.linalg.solve)(AtWA, AtWy)
@@ -592,23 +586,42 @@ def _solve_output_params_least_squares(
     )
     n_design = design.shape[1]
 
-    # Regularization from the layer's own priors; the bias column gets its own entry
-    alpha, mu = _get_regularization_from_prior(layer.priors.get("A", dist.Normal(0, 1)))
-    reg_matrix = alpha * jnp.eye(n_design)
-    rhs_extra = alpha * jnp.broadcast_to(mu, (output_size, n_design))
-    if has_bias:
-        alpha_b, mu_b = _get_regularization_from_prior(
-            layer.priors.get("b", dist.Normal(0, 1))
-        )
-        reg_matrix = reg_matrix.at[-1, -1].set(alpha_b)
-        rhs_extra = rhs_extra.at[:, -1].set(alpha_b * mu_b)
+    # Regularization from the layer's own priors; the bias column gets its own entry.
+    # _least_squares_blocker has already refused any prior that is not a bounded
+    # quadratic, so prior_term is not None here.
+    term_A = prior_term(layer.priors.get("A", dist.Normal(0, 1)))
+    assert term_A is not None
+    reg_matrix = term_A.precision * jnp.eye(n_design)
+    rhs_extra = term_A.precision * jnp.broadcast_to(
+        term_A.mean, (output_size, n_design)
+    )
+    lower = jnp.full(n_design, term_A.lower, dtype=float)
+    upper = jnp.full(n_design, term_A.upper, dtype=float)
+    bounded = term_A.bounded
 
-    # One independent solve per output dimension -> (output_size, n_design)
-    solution: jax.Array = jax.vmap(
-        lambda y_dim, ivar_dim, rhs_row: weighted_least_squares(
-            design, y_dim, ivar_dim, reg_matrix, rhs_row
-        )
-    )(y.T, output_ivar.T, rhs_extra)
+    if has_bias:
+        term_b = prior_term(layer.priors.get("b", dist.Normal(0, 1)))
+        assert term_b is not None
+        reg_matrix = reg_matrix.at[-1, -1].set(term_b.precision)
+        rhs_extra = rhs_extra.at[:, -1].set(term_b.precision * term_b.mean)
+        lower = lower.at[-1].set(term_b.lower)
+        upper = upper.at[-1].set(term_b.upper)
+        bounded = bounded or term_b.bounded
+
+    if bounded:
+        # The design matrix is shared across output dimensions, so the normal-equation
+        # matrix is too; only the right-hand side varies.
+        DtW = design.T * output_ivar.T[:, None, :]  # (output_size, n_design, n_data)
+        H = DtW @ design + reg_matrix
+        b = jnp.einsum("dpn,nd->dp", DtW, y) + rhs_extra
+        solution = box_constrained_normal_equations(H, b, lower, upper)
+    else:
+        # One independent solve per output dimension -> (output_size, n_design)
+        solution = jax.vmap(
+            lambda y_dim, ivar_dim, rhs_row: weighted_least_squares(
+                design, y_dim, ivar_dim, reg_matrix, rhs_row
+            )
+        )(y.T, output_ivar.T, rhs_extra)
 
     solved = (
         {"A": solution[:, :-1], "b": solution[:, -1]} if has_bias else {"A": solution}
@@ -641,6 +654,7 @@ def _least_squares_blocker(
     data: PolluxData,
     current_params: dict[str, Any],
     block: ParameterBlock,
+    latents_prior: dist.Distribution | None = None,
 ) -> str | None:
     """Why this block cannot be solved in closed form, or None if it can be."""
     for spec in block.params_list:
@@ -648,6 +662,11 @@ def _least_squares_blocker(
             linearized = _linearize_outputs(model, data, current_params)
             if isinstance(linearized, str):
                 return f"{linearized}, so the latents cannot be solved in closed form"
+            if prior_term(latents_prior or dist.Normal(0.0, 1.0)) is None:
+                return (
+                    f"the latents prior is a {type(latents_prior).__name__}, which is "
+                    "not a bounded quadratic and so cannot enter a linear solve"
+                )
             continue
 
         output_name, _, param_type = spec.partition(":")
@@ -658,6 +677,16 @@ def _least_squares_blocker(
                 f"output '{output_name}' does not end in a linear layer holding all "
                 "of its parameters"
             )
+        # A prior that is not a bounded quadratic cannot be represented in the normal
+        # equations. Dropping it silently would return a fit that violates it, so the
+        # block is refused and falls back to an optimizer that can honor it.
+        for name, prior in _solve_priors(model, spec).items():
+            if prior_term(prior) is None:
+                return (
+                    f"the prior on '{output_name}:{name}' is a "
+                    f"{type(prior).__name__}, which is not a bounded quadratic and so "
+                    "cannot enter a linear solve"
+                )
     return None
 
 
@@ -666,6 +695,7 @@ def _resolve_blocks(
     data: PolluxData,
     current_params: dict[str, Any],
     blocks: list[ParameterBlock],
+    latents_prior: dist.Distribution | None = None,
 ) -> list[ParameterBlock]:
     """Verify every block that wants a closed-form solve, downgrading those that can't.
 
@@ -676,7 +706,9 @@ def _resolve_blocks(
     fallbacks = []
     for block in blocks:
         if block.optimizer == "least_squares":
-            reason = _least_squares_blocker(model, data, current_params, block)
+            reason = _least_squares_blocker(
+                model, data, current_params, block, latents_prior
+            )
             if reason is not None:
                 block = replace(block, optimizer=None)  # noqa: PLW2901
                 fallbacks.append((block.name, reason))
@@ -953,7 +985,7 @@ def optimize_iterative(
     # closed-form solve. This is not settled for good: whether a transform is affine
     # in the latents can depend on its parameters, and those move during the fit, so
     # the cycle loop downgrades a block if the closed form stops applying.
-    _blocks = _resolve_blocks(model, data, current_params, _blocks)
+    _blocks = _resolve_blocks(model, data, current_params, _blocks, latents_prior)
 
     losses_per_cycle: list[float] = []
 
