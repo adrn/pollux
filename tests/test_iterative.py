@@ -1,5 +1,6 @@
 """Tests for iterative optimization."""
 
+import dataclasses
 import inspect
 import warnings
 
@@ -29,6 +30,7 @@ from pollux.models.iterative import (
     _solve_latents_least_squares,
     _solve_output_params_least_squares,
     _split_param_layer,
+    default_blocks,
     optimize_iterative,
 )
 from pollux.models.transforms import (
@@ -1834,3 +1836,103 @@ class TestPerOutputPriors:
         layer = LinearTransform(output_size=3, transform=renamed)
         assert layer._param_names == ("M",)  # but layer.shapes still says "A"
         assert _split_param_layer(layer) is None
+
+
+class TestDefaultBlocksAndOptions:
+    """Adjusting one block should not mean respecifying every other one."""
+
+    @pytest.fixture
+    def model_and_data(self):
+        n_stars, n_latents, n_out, n_lab = 64, 3, 12, 2
+        rng = np.random.default_rng(0)
+        latents = rng.normal(size=(n_stars, n_latents))
+        flux = latents @ rng.normal(size=(n_out, n_latents)).T
+        label = latents @ rng.normal(size=(n_lab, n_latents)).T
+        data = plx.data.PolluxData(
+            flux=plx.data.OutputData(flux, err=np.full((n_stars, n_out), 0.1)),
+            label=plx.data.OutputData(label, err=np.full((n_stars, n_lab), 0.1)),
+        )
+        model = plx.LVM(latent_size=n_latents)
+        model.register_output(
+            "flux",
+            LinearTransform(output_size=n_out),
+            err_transform=ScatterTransform(output_size=n_out),
+        )
+        model.register_output("label", LinearTransform(output_size=n_lab))
+        return model, data
+
+    def test_default_blocks_matches_what_a_default_fit_runs(self, model_and_data):
+        model, data = model_and_data
+        declared = default_blocks(model, data)
+        result = model.optimize_iterative(
+            data, max_cycles=1, rng_key=jax.random.PRNGKey(0), progress=False
+        )
+        assert [b.name for b in declared] == [b.name for b in result.blocks]
+
+    def test_error_blocks_are_born_svi(self, model_and_data):
+        """They enter through the variance, so there is no closed form to fall from."""
+        model, data = model_and_data
+        by_name = {b.name: b for b in default_blocks(model, data)}
+        assert by_name["flux:err"].optimizer is None
+        assert by_name["flux:data"].optimizer == "least_squares"
+        assert by_name["latents"].optimizer == "least_squares"
+
+    def test_block_options_adjusts_one_block_only(self, model_and_data):
+        model, data = model_and_data
+        result = model.optimize_iterative(
+            data,
+            max_cycles=1,
+            rng_key=jax.random.PRNGKey(0),
+            progress=False,
+            block_options={
+                "flux:err": {"num_steps": 7, "optimizer_kwargs": {"step_size": 0.05}}
+            },
+        )
+        blocks = {b.name: b for b in result.blocks}
+        assert blocks["flux:err"].num_steps == 7
+        assert blocks["flux:err"].optimizer_kwargs == {"step_size": 0.05}
+        # every other block is untouched, including ones never named
+        for name in ("latents", "flux:data", "label:data"):
+            assert blocks[name].num_steps == ParameterBlock("x", "x").num_steps
+            assert blocks[name].optimizer == "least_squares"
+
+    def test_block_options_composes_with_an_explicit_block_list(self, model_and_data):
+        model, data = model_and_data
+        result = model.optimize_iterative(
+            data,
+            blocks=["latents", "flux:err"],
+            max_cycles=1,
+            rng_key=jax.random.PRNGKey(0),
+            progress=False,
+            block_options={"flux:err": {"num_steps": 3}},
+        )
+        assert [b.name for b in result.blocks] == ["latents", "flux:err"]
+        assert result.blocks[1].num_steps == 3
+
+    def test_unknown_block_name_is_refused(self, model_and_data):
+        """A typo must not silently do nothing."""
+        model, data = model_and_data
+        with pytest.raises(ValueError, match="not blocks of this fit"):
+            model.optimize_iterative(
+                data,
+                max_cycles=1,
+                rng_key=jax.random.PRNGKey(0),
+                progress=False,
+                block_options={"flux:errr": {"num_steps": 10}},
+            )
+
+    def test_round_trip_through_default_blocks(self, model_and_data):
+        """The documented alternative: take the defaults, replace one, hand them back."""
+        model, data = model_and_data
+        blocks = [
+            dataclasses.replace(b, num_steps=5) if b.name == "flux:err" else b
+            for b in default_blocks(model, data)
+        ]
+        result = model.optimize_iterative(
+            data,
+            blocks=blocks,
+            max_cycles=1,
+            rng_key=jax.random.PRNGKey(0),
+            progress=False,
+        )
+        assert next(b for b in result.blocks if b.name == "flux:err").num_steps == 5

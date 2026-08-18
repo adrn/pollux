@@ -9,6 +9,7 @@ from __future__ import annotations
 __all__ = [
     "IterativeOptimizationResult",
     "ParameterBlock",
+    "default_blocks",
     "optimize_iterative",
 ]
 
@@ -721,6 +722,82 @@ def _solve_output_params_least_squares(
     )
 
 
+def default_blocks(model: LVM, data: PolluxData) -> list[ParameterBlock]:
+    """The parameter blocks :func:`optimize_iterative` fits when given none.
+
+    The latents, plus every transform that has something to fit -- error transforms
+    included, since their parameters are as much a part of the model as the data
+    transforms'. A transform carrying no learnable parameters (a
+    :class:`~pollux.models.transforms.NoOpTransform`, a bare
+    :class:`~pollux.models.transforms.PolyFeatureTransform`) gets no block.
+
+    Call this to see what a fit is going to do, or to adjust one block and hand the
+    list back::
+
+        from dataclasses import replace
+
+        blocks = pollux.models.default_blocks(model, train_data)
+        blocks = [
+            replace(b, num_steps=100) if b.name == "flux:err" else b for b in blocks
+        ]
+        model.optimize_iterative(train_data, blocks=blocks)
+
+    For the common case of adjusting one block, ``block_options`` does the same thing
+    in one line -- see :func:`optimize_iterative`.
+
+    Parameters
+    ----------
+    model
+        The LVM instance.
+    data
+        The data to be fitted, which decides which outputs participate.
+
+    Returns
+    -------
+    list
+        The blocks, in the order they would be cycled through.
+    """
+    participating = _participating_outputs(model, data)
+    output_blocks = [
+        f"{name}:{kind}"
+        for name in participating
+        for kind, transform in (
+            ("data", model.outputs[name].data_transform),
+            ("err", model.outputs[name].err_transform),
+        )
+        if _has_learnable_params(transform, model.latent_size, len(data))
+    ]
+    # Start from whichever end the data pins down. With the latents already at their
+    # observed values, fit the outputs to them first: going the other way would spend
+    # the first latents step chasing prior-sampled output parameters and undo the
+    # head start.
+    names = (
+        [*output_blocks, "latents"]
+        if _latents_from_data(model, data) is not None
+        else ["latents", *output_blocks]
+    )
+    return [_string_to_parameter_block(model, name) for name in names]
+
+
+def _apply_block_options(
+    blocks: list[ParameterBlock], options: dict[str, dict[str, Any]]
+) -> list[ParameterBlock]:
+    """Merge per-block settings onto blocks, keyed by block name."""
+    unknown = set(options) - {block.name for block in blocks}
+    if unknown:
+        msg = (
+            f"block_options names {sorted(unknown)}, which are not blocks of this "
+            f"fit. The blocks are {[b.name for b in blocks]} -- see "
+            "pollux.models.default_blocks to inspect them."
+        )
+        raise ValueError(msg)
+
+    return [
+        replace(block, **options[block.name]) if block.name in options else block
+        for block in blocks
+    ]
+
+
 def _string_to_parameter_block(model: LVM, name: str) -> ParameterBlock:
     """A block that asks for a closed form; :func:`_resolve_blocks` decides if it gets
     one, once there are parameters to test the transform with."""
@@ -851,6 +928,7 @@ def optimize_iterative(
     initial_params: dict[str, Any] | None = None,
     latents_prior: dist.Distribution | None = None,
     progress: bool = True,
+    block_options: dict[str, dict[str, Any]] | None = None,
 ) -> IterativeOptimizationResult:
     """Optimize model using iterative block coordinate descent.
 
@@ -985,38 +1063,20 @@ def optimize_iterative(
     # which end of the model it makes sense to start from
     observed_latents = _latents_from_data(model, data)
 
-    # Default blocks: the latents and every transform that has something to fit --
-    # error transforms included, since their parameters are as much a part of the
-    # model as the data transforms'. A transform carrying no learnable parameters
-    # (NoOpTransform, a bare PolyFeatureTransform) gets no block.
     participating = _participating_outputs(model, data)
 
     if blocks is None:
-        output_blocks = [
-            f"{name}:{kind}"
-            for name in participating
-            for kind, transform in (
-                ("data", model.outputs[name].data_transform),
-                ("err", model.outputs[name].err_transform),
-            )
-            if _has_learnable_params(transform, model.latent_size, len(data))
+        _blocks = default_blocks(model, data)
+    else:
+        # String specs are converted per element rather than by sniffing blocks[0],
+        # so a mixed list works.
+        _blocks = [
+            _string_to_parameter_block(model, b) if isinstance(b, str) else b
+            for b in blocks
         ]
-        # Start from whichever end the data pins down. With the latents already at
-        # their observed values, fit the outputs to them first: going the other way
-        # would spend the first latents step chasing prior-sampled output parameters
-        # and undo the head start.
-        blocks = (
-            [*output_blocks, "latents"]
-            if observed_latents is not None
-            else ["latents", *output_blocks]
-        )
 
-    # String specs are converted per element rather than by sniffing blocks[0], so a
-    # mixed list works.
-    _blocks: list[ParameterBlock] = [
-        _string_to_parameter_block(model, b) if isinstance(b, str) else b
-        for b in blocks
-    ]
+    if block_options:
+        _blocks = _apply_block_options(_blocks, block_options)
 
     # Build initial_params from fixed_pars if not provided
     if initial_params is None and fixed_pars is not None:
