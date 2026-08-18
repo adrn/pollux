@@ -18,7 +18,6 @@ from pollux.models.iterative import (
     ParameterBlock,
     _build_fixed_pars,
     _compute_loss,
-    _get_regularization_from_prior,
     _inverse_variance,
     _latents_from_data,
     _latents_probe_points,
@@ -77,38 +76,6 @@ def linear_model_and_data():
     }
 
 
-class TestGetRegularizationFromPrior:
-    """Tests for _get_regularization_from_prior helper."""
-
-    def test_normal_prior_standard(self):
-        """Normal(0, 1) should give regularization strength 1.0."""
-        prior = dist.Normal(0.0, 1.0)
-        reg_strength, prior_mean = _get_regularization_from_prior(prior)
-        assert jnp.isclose(reg_strength, 1.0)
-        assert jnp.isclose(prior_mean, 0.0)
-
-    def test_normal_prior_custom_scale(self):
-        """Normal(0, 0.5) should give regularization strength 4.0 (1/0.25)."""
-        prior = dist.Normal(0.0, 0.5)
-        reg_strength, prior_mean = _get_regularization_from_prior(prior)
-        assert jnp.isclose(reg_strength, 4.0)
-        assert jnp.isclose(prior_mean, 0.0)
-
-    def test_normal_prior_nonzero_mean(self):
-        """Normal(1.0, 2.0) should have mean 1.0 and regularization 0.25."""
-        prior = dist.Normal(1.0, 2.0)
-        reg_strength, prior_mean = _get_regularization_from_prior(prior)
-        assert jnp.isclose(reg_strength, 0.25)
-        assert jnp.isclose(prior_mean, 1.0)
-
-    def test_improper_uniform_no_regularization(self):
-        """ImproperUniform should give zero regularization."""
-        prior = dist.ImproperUniform(dist.constraints.real, (), ())
-        reg_strength, prior_mean = _get_regularization_from_prior(prior)
-        assert jnp.isclose(reg_strength, 0.0)
-        assert jnp.isclose(prior_mean, 0.0)
-
-
 class TestLeastSquaresBlocker:
     """Which blocks get a closed-form solve is decided by structure, not by type."""
 
@@ -147,6 +114,50 @@ class TestLeastSquaresBlocker:
         reason = _least_squares_blocker(model, data, {}, block)
         assert reason is not None
         assert "error transform" in reason
+
+    def test_a_prior_that_is_not_a_bounded_quadratic_is_declined(self):
+        """Silently dropping such a prior would return a fit that violates it."""
+        n_stars, n_out = 8, 5
+        model = plx.LVM(latent_size=2)
+        model.register_output(
+            "flux",
+            LinearTransform(output_size=n_out, priors={"A": dist.Laplace(0.0, 1.0)}),
+        )
+        data = plx.data.PolluxData(
+            flux=plx.data.OutputData(
+                jnp.ones((n_stars, n_out)), err=jnp.full((n_stars, n_out), 0.1)
+            )
+        )
+        block = ParameterBlock("flux", "flux:data", optimizer="least_squares")
+        reason = _least_squares_blocker(model, data, {}, block)
+        assert reason is not None
+        assert "Laplace" in reason
+
+    def test_a_bounded_quadratic_prior_is_accepted(self, linear_model_and_data):
+        """A HalfNormal is solvable -- with a constrained solver, not by dropping it."""
+        data = linear_model_and_data["data"]
+        n_out = data["flux"].data.shape[1]
+        model = plx.LVM(latent_size=2)
+        model.register_output(
+            "flux",
+            LinearTransform(output_size=n_out, priors={"A": dist.HalfNormal(1.0)}),
+        )
+        params = {"flux": {"data": {"A": jnp.ones((n_out, 2))}}}
+        block = ParameterBlock("flux", "flux:data", optimizer="least_squares")
+        assert _least_squares_blocker(model, data, params, block) is None
+
+    def test_a_non_quadratic_latents_prior_is_declined(self, linear_model_and_data):
+        model, data = linear_model_and_data["model"], linear_model_and_data["data"]
+        params = {
+            "flux": {"data": {"A": jnp.array(linear_model_and_data["true_A"])}},
+            "latents": jnp.zeros((len(data), model.latent_size)),
+        }
+        block = ParameterBlock("latents", "latents", optimizer="least_squares")
+        reason = _least_squares_blocker(
+            model, data, params, block, latents_prior=dist.StudentT(3.0)
+        )
+        assert reason is not None
+        assert "latents prior" in reason
 
 
 class TestParameterBlock:
@@ -1564,3 +1575,95 @@ class TestPartialData:
         latents = result.params["latents"]
         assert latents.shape == (len(data), model.latent_size)
         assert jnp.all(jnp.isfinite(latents))
+
+
+class TestConstrainedPriors:
+    """Closed-form solves must honor a prior's support, not quietly drop it.
+
+    Regression tests for a bug where any prior other than Normal or ImproperUniform
+    fell through to a negligible ridge with no constraint, so ``optimize_iterative``
+    returned fits that violated the priors they were given, without warning.
+    """
+
+    @pytest.fixture(scope="class")
+    def absorption_data(self):
+        """Non-negative basis vectors with one-signed weights -- i.e. an NMF."""
+        n_stars, n_pix, n_latents = 256, 64, 3
+        rng = np.random.default_rng(123)
+
+        pix = np.arange(n_pix)
+        A = np.stack(
+            [
+                np.exp(-0.5 * (pix - 32) ** 2 / 5**2),
+                np.exp(-0.5 * (pix - 16) ** 2 / 2**2),
+                np.exp(-0.5 * (pix - 48) ** 2 / 3**2),
+            ],
+            axis=1,
+        )
+        z = -np.abs(rng.normal(size=(n_stars, n_latents)))
+        err = 10 ** rng.uniform(-1.5, -0.7, size=(n_stars, n_pix))
+        y = z @ A.T + rng.normal(scale=err)
+
+        data = plx.data.PolluxData(flux=plx.data.OutputData(y, err=err))
+        return data, A, n_pix, n_latents
+
+    @staticmethod
+    def _fit(data, n_pix, n_latents):
+        model = plx.LVM(latent_size=n_latents)
+        model.register_output(
+            "flux",
+            LinearTransform(output_size=n_pix, priors={"A": dist.HalfNormal(1.0)}),
+        )
+        result = model.optimize_iterative(
+            data,
+            max_cycles=64,
+            rng_key=jax.random.PRNGKey(0),
+            progress=False,
+            latents_prior=dist.TruncatedNormal(scale=1.0, high=0.0),
+        )
+        return model, result
+
+    def test_bounds_are_respected(self, absorption_data):
+        data, _, n_pix, n_latents = absorption_data
+        _, result = self._fit(data, n_pix, n_latents)
+
+        assert jnp.all(result.params["flux"]["data"]["A"] >= 0.0)
+        assert jnp.all(result.params["latents"] <= 0.0)
+
+    def test_still_uses_the_closed_form(self, absorption_data):
+        """A bounded prior downgrades the solver, not the block."""
+        data, _, n_pix, n_latents = absorption_data
+        _, result = self._fit(data, n_pix, n_latents)
+        assert {b.optimizer for b in result.blocks} == {"least_squares"}
+
+    def test_non_negativity_recovers_the_true_basis(self, absorption_data):
+        """The payoff: the rotation degeneracy is broken by the constraint.
+
+        Without it the fit returns some rotation of the true basis, and the recovered
+        vectors are mixtures of the input absorption lines.
+        """
+        data, A_true, n_pix, n_latents = absorption_data
+        _, result = self._fit(data, n_pix, n_latents)
+        A_fit = np.asarray(result.params["flux"]["data"]["A"])
+
+        for j in range(n_latents):
+            truth = A_true[:, j] / np.linalg.norm(A_true[:, j])
+            best = max(
+                abs(float(truth @ (col / np.linalg.norm(col)))) for col in A_fit.T
+            )
+            assert best > 0.95, f"basis vector {j} recovered at only {best:.3f}"
+
+    def test_unrecognized_prior_falls_back_with_a_warning(self, absorption_data):
+        """Refused, not silently approximated."""
+        data, _, n_pix, n_latents = absorption_data
+        model = plx.LVM(latent_size=n_latents)
+        model.register_output(
+            "flux",
+            LinearTransform(output_size=n_pix, priors={"A": dist.Laplace(0.0, 1.0)}),
+        )
+        with pytest.warns(PolluxLinearizationWarning, match="Laplace"):
+            result = model.optimize_iterative(
+                data, max_cycles=1, rng_key=jax.random.PRNGKey(0), progress=False
+            )
+        flux_block = next(b for b in result.blocks if b.name == "flux:data")
+        assert flux_block.optimizer != "least_squares"

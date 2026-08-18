@@ -578,7 +578,19 @@ class LVM(eqx.Module):
         else:
             prior = latents_prior
 
-        if prior.batch_shape != (self.latent_size,):
+        # A prior with event dimensions of its own -- a MultivariateNormal over the
+        # whole latent vector -- already covers the latent axis, so there is nothing
+        # to expand; expanding it would add a trailing axis instead.
+        event = tuple(prior.event_shape)
+        if event:
+            if event != (self.latent_size,):
+                msg = (
+                    f"latents_prior has event shape {event}, but the latent vectors "
+                    f"have size {self.latent_size}. A correlated prior over the "
+                    f"latents needs event shape ({self.latent_size},)."
+                )
+                raise ValueError(msg)
+        elif prior.batch_shape != (self.latent_size,):
             prior = prior.expand((self.latent_size,))
 
         return prior
