@@ -1936,3 +1936,121 @@ class TestDefaultBlocksAndOptions:
             progress=False,
         )
         assert next(b for b in result.blocks if b.name == "flux:err").num_steps == 5
+
+
+class TestMultiSpecBlocks:
+    """One block may name several parameter specs, fitting them jointly with SVI.
+
+    ParameterBlock.params is typed ``str | list[str]`` and has a params_list property
+    for exactly this, but the err-transform warning read ``.params`` directly and blew
+    up on an unhashable list before any fitting happened.
+    """
+
+    @pytest.fixture
+    def model_and_data(self):
+        n_stars, n_latents, n_out, n_lab = 128, 3, 10, 2
+        rng = np.random.default_rng(3)
+        latents = rng.normal(size=(n_stars, n_latents))
+        flux = latents @ rng.normal(size=(n_out, n_latents)).T
+        label = latents @ rng.normal(size=(n_lab, n_latents)).T
+        data = plx.data.PolluxData(
+            flux=plx.data.OutputData(
+                flux + rng.normal(scale=0.1, size=flux.shape),
+                err=np.full((n_stars, n_out), 0.1),
+            ),
+            label=plx.data.OutputData(label, err=np.full((n_stars, n_lab), 0.1)),
+        )
+        model = plx.LVM(latent_size=n_latents)
+        model.register_output(
+            "flux",
+            LinearTransform(output_size=n_out),
+            err_transform=ScatterTransform(output_size=n_out),
+        )
+        model.register_output("label", LinearTransform(output_size=n_lab))
+        return model, data
+
+    def test_a_block_naming_several_specs_runs(self, model_and_data):
+        """Regression: this raised TypeError: unhashable type: 'list'."""
+        model, data = model_and_data
+        result = model.optimize_iterative(
+            data,
+            blocks=[
+                "latents",
+                ParameterBlock("flux-joint", ["flux:data", "flux:err"], num_steps=50),
+                "label:data",
+            ],
+            max_cycles=2,
+            rng_key=jax.random.PRNGKey(0),
+            progress=False,
+        )
+        assert [b.name for b in result.blocks] == [
+            "latents",
+            "flux-joint",
+            "label:data",
+        ]
+
+    def test_both_specs_in_the_block_are_optimized(self, model_and_data):
+        """Not just accepted -- both sets of parameters have to move."""
+        model, data = model_and_data
+        start = {
+            # nonzero: with zero latents the prediction is A @ 0, so A has no gradient
+            "latents": jax.random.normal(
+                jax.random.PRNGKey(1), (len(data), model.latent_size)
+            ),
+            "flux": {"data": {"A": jnp.zeros((10, 3))}, "err": {"s": jnp.ones(10)}},
+            "label": {"data": {"A": jnp.zeros((2, 3))}, "err": {}},
+        }
+        result = model.optimize_iterative(
+            data,
+            blocks=[
+                ParameterBlock("flux-joint", ["flux:data", "flux:err"], num_steps=200)
+            ],
+            initial_params=start,
+            max_cycles=2,
+            rng_key=jax.random.PRNGKey(0),
+            progress=False,
+        )
+        assert not jnp.allclose(result.params["flux"]["data"]["A"], 0.0)
+        assert not jnp.allclose(result.params["flux"]["err"]["s"], 1.0)
+
+    def test_a_bare_output_name_covers_both_of_its_specs(self, model_and_data):
+        """params='flux' means all of flux's parameters, data and err alike."""
+        model, data = model_and_data
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")  # any err_transform warning would fail here
+            model.optimize_iterative(
+                data,
+                blocks=["latents", ParameterBlock("flux-all", "flux", num_steps=50)],
+                max_cycles=1,
+                rng_key=jax.random.PRNGKey(0),
+                progress=False,
+            )
+
+    def test_no_spurious_warning_when_err_is_inside_a_multi_spec_block(
+        self, model_and_data
+    ):
+        model, data = model_and_data
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            model.optimize_iterative(
+                data,
+                blocks=[
+                    "latents",
+                    ParameterBlock("j", ["flux:data", "flux:err"], num_steps=50),
+                ],
+                max_cycles=1,
+                rng_key=jax.random.PRNGKey(0),
+                progress=False,
+            )
+        assert not [w for w in caught if "err_transform" in str(w.message)]
+
+    def test_the_warning_still_fires_when_err_really_is_left_out(self, model_and_data):
+        model, data = model_and_data
+        with pytest.warns(UserWarning, match="err_transform"):
+            model.optimize_iterative(
+                data,
+                blocks=["latents", "flux:data"],
+                max_cycles=1,
+                rng_key=jax.random.PRNGKey(0),
+                progress=False,
+            )

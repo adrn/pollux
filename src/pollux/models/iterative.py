@@ -96,6 +96,32 @@ class ParameterBlock:
     ...     num_steps=1000,
     ... )
 
+    Fit several parameter groups together in one block, by naming more than one spec.
+    Take a flux output with both a linear ``data`` transform and a fitted scatter in
+    its ``err`` transform: by default those are two separate blocks, cycled one after
+    the other, and ``flux:data`` gets an exact least-squares solve while ``flux:err``
+    gets SVI. Naming both in a single block optimizes them *jointly* with SVI instead:
+
+    >>> joint = ParameterBlock(  # doctest: +SKIP
+    ...     name="flux",
+    ...     params=["flux:data", "flux:err"],
+    ...     num_steps=2000,
+    ...     optimizer_kwargs={"step_size": 1e-2},
+    ... )
+    >>> result = model.optimize_iterative(  # doctest: +SKIP
+    ...     data, blocks=["latents", joint, "label:data"]
+    ... )
+
+    Naming the output on its own is equivalent and shorter -- ``params="flux"`` covers
+    both ``flux:data`` and ``flux:err``.
+
+    This is worth trying when the coefficients and the scatter are coupled tightly
+    enough that alternating between them converges slowly, since each one's optimum
+    depends on the other. It is not automatically better, though: joining them gives
+    up the exact solve that ``flux:data`` would have had on its own, in exchange for
+    gradient descent on both. Compare ``result.losses_per_cycle[-1]`` against the
+    default before keeping it.
+
     """
 
     name: str
@@ -1085,8 +1111,15 @@ def optimize_iterative(
         )
 
     # Warn if any output has err_transform parameters that are neither being
-    # optimized (in active blocks) nor intentionally held fixed (in fixed_pars)
-    active_block_params = {b.params for b in _blocks}
+    # optimized (in active blocks) nor intentionally held fixed (in fixed_pars).
+    # A block may name several parameter specs, so read params_list rather than
+    # params -- and a bare output name covers both of that output's specs.
+    active_block_params: set[str] = set()
+    for block in _blocks:
+        for spec in block.params_list:
+            active_block_params.add(spec)
+            if spec in model.outputs:
+                active_block_params.update({f"{spec}:data", f"{spec}:err"})
     for output_name in participating:
         output = model.outputs[output_name]
         err_key = f"{output_name}:err"
