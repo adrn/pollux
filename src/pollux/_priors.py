@@ -114,8 +114,13 @@ def prior_term(prior: dist.Distribution) -> PriorTerm | None:
     a precision and a mean, and quietly approximating it by one would silently change
     the model. The caller is expected to fall back to an optimizer that can handle it.
 
-    ``MultivariateNormal`` is quadratic but correlates whole axes, which the scalar
-    ``precision`` here cannot express; it is refused for now and handled separately.
+    A ``MultivariateNormal`` is quadratic too, and comes back with a precision
+    *matrix* and the event shape it correlates. Whether that axis is one the solve can
+    use is for the caller to decide: correlating the latent axis replaces the ridge,
+    whereas correlating an output axis would couple what are otherwise independent
+    per-output-dimension solves into a single system, which no closed-form path here
+    can do. See :func:`~pollux.models.iterative.optimize_iterative`, which refuses the
+    latter and falls back to SVI.
 
     Parameters
     ----------

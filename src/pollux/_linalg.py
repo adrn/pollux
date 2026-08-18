@@ -98,8 +98,8 @@ def box_constrained_normal_equations(
     >>> H = jnp.eye(2)
     >>> b = jnp.array([-1.0, 2.0])
     >>> lower, upper = jnp.zeros(2), jnp.full(2, jnp.inf)
-    >>> box_constrained_normal_equations(H, b, lower, upper)
-    Array([0., 2.], dtype=float32)
+    >>> box_constrained_normal_equations(H, b, lower, upper)  # doctest: +ELLIPSIS
+    Array([0., 2.], dtype=float...)
     """
     n = b.shape[-1]
 
