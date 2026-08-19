@@ -1,41 +1,39 @@
 name: Tutorials
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - main
   pull_request:
     branches:
       - main
+    # "labeled" is required: without it, adding the `tutorials` label to an
+    # already-open PR would never trigger a run. Listing types overrides the
+    # default set, so the other three have to be spelled out too.
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - labeled
   release:
     types:
       - published
 
-jobs:
-  check_skip_flags:
-    name: Check skip flags
-    runs-on: ubuntu-latest
-    outputs:
-      head-commit-message:
-        ${{ steps.get_head_commit_message.outputs.HEAD_COMMIT_MESSAGE }}
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ env.GITHUB_SHA }}
-      - name: Get head commit message
-        id: get_head_commit_message
-        run: echo "HEAD_COMMIT_MESSAGE=$(git show -s --format=%s)" >> "$GITHUB_OUTPUT"
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
+jobs:
+  # Executing the notebooks is the most expensive job in the repo, so on a PR it
+  # is opt-in via the "tutorials" label. Pushes to main and published releases
+  # always run it.
   notebooks:
     name: "Build the notebooks for the docs"
     runs-on: ubuntu-latest
-    needs: check_skip_flags
-    if:
-      ${{ github.event.pull_request.draft == false &&
-      !contains(github.event.pull_request.labels.*.name, 'skip tutorials') &&
-      !contains(needs.check_skip_flags.outputs.head-commit-message, '[skip tutorials]')
-      }}
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'tutorials')
     steps:
       - uses: actions/checkout@v7
 

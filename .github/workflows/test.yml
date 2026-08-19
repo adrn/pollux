@@ -6,12 +6,36 @@ on:
   push:
     branches:
       - main
+  release:
+    types:
+      - published
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  # Tests and docs can each be skipped on a PR, either with a label or with a
+  # flag in the head commit subject. Both are PR-only by design: pushes to main
+  # and published releases always run everything.
+  check_skip_flags:
+    name: Check skip flags
+    runs-on: ubuntu-latest
+    outputs:
+      head-commit-message:
+        ${{ steps.get_head_commit_message.outputs.HEAD_COMMIT_MESSAGE }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # On a pull_request event github.sha is the *merge* commit, whose
+          # subject is "Merge <sha> into <sha>" - we want the branch head.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Get head commit message
+        id: get_head_commit_message
+        run: echo "HEAD_COMMIT_MESSAGE=$(git show -s --format=%s)" >> "$GITHUB_OUTPUT"
+
+  # Always runs: it is the formatting gate, and it is cheap.
   pre-commit:
     name: Format
     runs-on: ubuntu-latest
@@ -36,7 +60,12 @@ jobs:
   checks:
     name: Check Python ${{ matrix.python-version }} on ${{ matrix.runs-on }}
     runs-on: ${{ matrix.runs-on }}
-    needs: [pre-commit]
+    needs: [pre-commit, check_skip_flags]
+    # Skip with the "skip tests" label or a "[skip tests]" commit subject.
+    if: >-
+      github.event_name != 'pull_request' ||
+      (!contains(github.event.pull_request.labels.*.name, 'skip tests') &&
+      !contains(needs.check_skip_flags.outputs.head-commit-message, '[skip tests]'))
     strategy:
       fail-fast: false
       matrix:
@@ -65,3 +94,46 @@ jobs:
         uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
+
+  # Notebooks are *not* executed here (nb_execution_mode = "off" in
+  # docs/conf.py), so this only checks that the docs build. Executing the
+  # tutorials is the separate, label-gated Tutorials workflow.
+  docs:
+    name: Docs
+    runs-on: ubuntu-latest
+    # Deliberately does not need pre-commit, so docs feedback arrives in
+    # parallel. Skip with the "skip docs" label or a "[skip docs]" commit
+    # subject.
+    needs: [check_skip_flags]
+    if: >-
+      github.event_name != 'pull_request' ||
+      (!contains(github.event.pull_request.labels.*.name, 'skip docs') &&
+      !contains(needs.check_skip_flags.outputs.head-commit-message, '[skip docs]'))
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install
+
+      - name: Install dependencies
+        run: uv sync --no-default-groups --group docs
+
+      # docs/conf.py urlretrieves this at import time if it is missing, so
+      # fetching it here just means the runner cache serves it instead.
+      - name: Download APOGEE data
+        uses: ethanjli/cached-download-action@v0.1.4
+        with:
+          url: https://users.flatironinstitute.org/~apricewhelan/pollux/rgb-highSNR-1k-1chip.h5
+          destination: docs/_data/rgb-highSNR-1k-1chip.h5
+
+      # No -W yet: the build currently emits ~22 warnings (docstring RST errors,
+      # a notebook in two toctrees, missing myst xrefs). Clean those up, then
+      # turn on -W --keep-going here.
+      - name: Build docs
+        run: uv run --no-sync sphinx-build -b html docs docs/_build/html
