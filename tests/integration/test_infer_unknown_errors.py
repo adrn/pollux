@@ -58,6 +58,7 @@ def test_infer_error_intrinsic_scatter():
         num_steps=50_000,
         rng_key=jax.random.PRNGKey(0),
         optimizer=numpyro.optim.Adam(1e-3),
+        progress=False,
     )
     res.losses.block_until_ready()
 

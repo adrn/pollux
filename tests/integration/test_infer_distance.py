@@ -74,6 +74,7 @@ def test_infer_distance():
         num_steps=10000,
         rng_key=jax.random.PRNGKey(0),
         optimizer=numpyro.optim.Adam(1e-3),
+        progress=False,
     )
     res.losses.block_until_ready()
 
