@@ -977,7 +977,7 @@ def optimize_iterative(
     tol: float = 1e-6,
     rng_key: jax.Array | None = None,
     initial_params: dict[str, Any] | None = None,
-    latents_prior: dist.Distribution | None = None,
+    latents_prior: dist.Distribution | bool | None = None,
     progress: bool = True,
     block_options: dict[str, dict[str, Any]] | None = None,
 ) -> IterativeOptimizationResult:
@@ -1057,6 +1057,9 @@ def optimize_iterative(
     latents_prior
         Prior distribution for latents. If None, uses Normal(0, 1).
         Used to determine regularization strength for latent least squares.
+        ``False`` means an improper uniform, which regularizes not at all: the latent
+        solve becomes a plain weighted least squares, and can be singular for an
+        object the data barely constrain.
     progress
         Whether to display a tqdm progress bar showing optimization progress.
 
@@ -1113,6 +1116,11 @@ def optimize_iterative(
 
     """
     warn_if_unprocessed(data, "optimize_iterative()")
+
+    # Resolved once, here, rather than in each of the block solves, the blocker and the
+    # loss below: they all take a distribution, and only this boundary should have to
+    # know that None means a unit Gaussian and False means an improper uniform.
+    latents_prior = model._resolve_latents_prior(latents_prior)
 
     # Latents the data reports directly beat a draw from the prior, and also decide
     # which end of the model it makes sense to start from

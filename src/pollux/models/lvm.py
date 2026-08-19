@@ -918,7 +918,7 @@ class LVM(eqx.Module):
         tol: float = 1e-6,
         rng_key: jax.Array | None = None,
         initial_params: UnpackedParamsT | None = None,
-        latents_prior: dist.Distribution | None = None,
+        latents_prior: dist.Distribution | bool | None = None,
         progress: bool = True,
         block_options: "dict[str, dict[str, Any]] | None" = None,
     ) -> "IterativeOptimizationResult":
@@ -984,6 +984,9 @@ class LVM(eqx.Module):
         latents_prior
             Prior distribution for the latents. If None, uses ``Normal(0, 1)``. This
             also sets the regularization strength of the closed-form latent solve.
+            ``False`` means an improper uniform, which regularizes not at all: the
+            latent solve becomes a plain weighted least squares, and can be singular
+            for an object the data barely constrain.
         progress
             Whether to display a progress bar.
 

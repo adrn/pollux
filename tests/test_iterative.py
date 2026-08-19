@@ -2253,3 +2253,66 @@ class TestLogPrior:
 
         with pytest.raises(ValueError, match="No parameter values"):
             _log_prior(model, data, {"latents": latents})
+
+
+class TestImproperLatentsPrior:
+    """``latents_prior=False`` -- the improper uniform every other method accepts."""
+
+    def test_it_runs_and_keeps_the_closed_form_solve(self, linear_model_and_data):
+        """An improper prior contributes no quadratic term, which is not the same as
+        contributing one a linear solve cannot use: a flat prior just drops the ridge,
+        leaving a plain weighted least squares."""
+        model = linear_model_and_data["model"]
+        data = linear_model_and_data["data"]
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", PolluxLinearizationWarning)
+            result = optimize_iterative(
+                model,
+                data,
+                max_cycles=10,
+                rng_key=jax.random.PRNGKey(0),
+                latents_prior=False,
+            )
+
+        assert all(block.optimizer == "least_squares" for block in result.blocks)
+        assert np.all(np.isfinite(result.losses_per_cycle))
+
+    def test_it_regularizes_less_than_a_unit_gaussian(self, linear_model_and_data):
+        model = linear_model_and_data["model"]
+        data = linear_model_and_data["data"]
+
+        def fit(latents_prior):
+            return optimize_iterative(
+                model,
+                data,
+                max_cycles=10,
+                rng_key=jax.random.PRNGKey(0),
+                latents_prior=latents_prior,
+            ).params
+
+        def chi2(params):
+            pred = model.predict_outputs(params, params["latents"], names=["flux"])
+            resid = pred["flux"] - data["flux"].data
+            return float(jnp.sum(resid**2 / data["flux"].err ** 2))
+
+        flat, shrunk = fit(False), fit(None)
+
+        # No ridge, so the latents are free to be larger and to fit the data closer
+        assert jnp.linalg.norm(flat["latents"]) > jnp.linalg.norm(shrunk["latents"])
+        assert chi2(flat) <= chi2(shrunk)
+
+    def test_a_prior_that_is_neither_a_distribution_nor_the_sentinel_is_refused(
+        self, linear_model_and_data
+    ):
+        model = linear_model_and_data["model"]
+        data = linear_model_and_data["data"]
+
+        with pytest.raises(TypeError, match="must be a numpyro distribution"):
+            optimize_iterative(
+                model,
+                data,
+                max_cycles=1,
+                rng_key=jax.random.PRNGKey(0),
+                latents_prior=1.0,
+            )
