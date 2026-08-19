@@ -159,6 +159,8 @@ def test_bias_transforms_run_in_a_model():
         data,
         num_steps=2,
         rng_key=jax.random.PRNGKey(0),
+        # deliberately not progress=False: this is the only place checking that an
+        # explicit svi_run_kwargs["progress_bar"] still wins over progress=
         svi_run_kwargs={"progress_bar": False},
     )
     assert pars["flux"]["data"]["b"].shape == (n_out,)
