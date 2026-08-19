@@ -12,6 +12,7 @@ import numpyro
 import numpyro.distributions as dist
 from numpyro.infer import SVI, Trace_ELBO
 from numpyro.infer.autoguide import AutoDelta, AutoGuide
+from numpyro.infer.initialization import init_to_value
 
 from ..data import PolluxData
 from ..data.data import warn_if_unprocessed
@@ -787,8 +788,10 @@ class LVM(eqx.Module):
         custom_model: Callable[[BatchedLatentsT, dict[str, Any], PolluxData], None]
         | None = None,
         fixed_pars: UnpackedParamsT | None = None,
+        initial_params: UnpackedParamsT | None = None,
         names: list[str] | None = None,
         svi_run_kwargs: dict[str, Any] | None = None,
+        progress: bool = True,
         guide: type[AutoGuide] | AutoGuide | None = None,
         init_loc_fn: Callable[..., Any] | None = None,
     ) -> tuple[UnpackedParamsT, Any]:
@@ -812,10 +815,34 @@ class LVM(eqx.Module):
             Optional callable for custom modeling components.
         fixed_pars
             Parameters to hold fixed during optimization.
+        initial_params
+            Where to start the fit, as an unpacked parameter dict of the same shape
+            :meth:`optimize_iterative` takes and this method returns, so the output of
+            one fit can seed the next. If ``None``, the guide picks its own starting
+            point, which for ``AutoDelta`` is ``init_to_median`` -- a draw from the
+            priors, and a poor start for anything with a badly multi-modal or highly
+            structured optimum.
+
+            A partial dict is allowed, but mind what it costs: naming *any* site here
+            switches every site to numpyro's ``init_to_value``, and the ones left out
+            fall back to ``init_to_uniform`` -- a uniform draw on ``(-2, 2)`` in
+            *unconstrained* space, not the prior median. So ``{"latents": z}`` alone
+            leaves a linear map at a random draw rather than at its median. Pass the
+            full dict unless you mean that.
+
+            Values have to lie inside each site's support. A scatter parameter
+            warm-started at exactly zero becomes ``log(0)`` and surfaces as numpyro's
+            unhelpful "Cannot find valid initial parameters".
+
+            Mutually exclusive with ``init_loc_fn``, which is the same knob spelled out
+            longhand.
         names
             Output names to include. If ``None``, includes all outputs.
         svi_run_kwargs
-            Additional keyword arguments passed to ``SVI.run()``.
+            Additional keyword arguments passed to ``SVI.run()``. An explicit
+            ``progress_bar`` here wins over ``progress``.
+        progress
+            Whether to display a progress bar.
         guide
             The autoguide to use for variational inference. Can be:
 
@@ -825,27 +852,21 @@ class LVM(eqx.Module):
             - A guide instance: used directly (must already be constructed with
               the model function).
         init_loc_fn
-            Where the guide starts from, as one of numpyro's ``init_to_*`` functions.
-            If ``None``, the guide's own default is used, which for ``AutoDelta`` is
-            ``init_to_median`` -- a draw from the priors, which is a poor starting
-            point for anything with a badly multi-modal or highly structured
-            optimum. Cannot be combined with an already-constructed ``guide``
-            instance, which carries its own.
+            Where the guide starts from, as one of numpyro's ``init_to_*`` functions --
+            the escape hatch for the strategies ``initial_params`` cannot express, such
+            as ``init_to_sample`` or a non-default ``init_to_uniform`` radius. To start
+            from known parameter values, use ``initial_params`` instead; it builds the
+            ``init_to_value`` strategy for you. Mutually exclusive with
+            ``initial_params``, and cannot be combined with an already-constructed
+            ``guide`` instance, which carries its own.
 
-            To start from a set of parameters, pass them through
-            :meth:`pack_numpyro_pars` to get the names numpyro knows them by. A
-            partial dict is fine: any site not listed falls back to the default::
+        Examples
+        --------
+        Seed a fit with the parameters from a previous one::
 
-                from numpyro.infer.initialization import init_to_value
-
-                pars, _ = model.optimize(
-                    data,
-                    num_steps=1000,
-                    rng_key=key,
-                    init_loc_fn=init_to_value(
-                        values=model.pack_numpyro_pars(start, ignore_missing=True)
-                    ),
-                )
+            pars, _ = model.optimize(
+                data, num_steps=1000, rng_key=key, initial_params=earlier_pars
+            )
 
         """
 
@@ -873,7 +894,24 @@ class LVM(eqx.Module):
         # internally by stochastic optimizers:
         svi_key, sample_key = jax.random.split(rng_key, 2)
 
-        svi_run_kwargs = svi_run_kwargs or {}
+        # An explicit svi_run_kwargs['progress_bar'] still wins over progress=
+        svi_run_kwargs = {"progress_bar": progress, **(svi_run_kwargs or {})}
+
+        # Assigning init_loc_fn here rather than branching later means the
+        # already-constructed-guide check below covers initial_params too
+        if initial_params:
+            if init_loc_fn is not None:
+                msg = (
+                    "Pass initial_params or init_loc_fn, one or the other: "
+                    "initial_params is a shorthand for building an init_to_value "
+                    "strategy, so passing both is ambiguous."
+                )
+                raise ValueError(msg)
+            # ignore_missing=True: a partial dict is allowed, e.g. carrying only the
+            # output parameters over from an earlier fit
+            init_loc_fn = init_to_value(
+                values=self.pack_numpyro_pars(initial_params, ignore_missing=True)
+            )
 
         # init_loc_fn is keyword-only on every numpyro AutoGuide, so this is uniform
         guide_kwargs = {} if init_loc_fn is None else {"init_loc_fn": init_loc_fn}
@@ -885,9 +923,10 @@ class LVM(eqx.Module):
         elif isinstance(guide, AutoGuide):
             if init_loc_fn is not None:
                 msg = (
-                    "init_loc_fn has no effect on an already-constructed guide, which "
-                    "has picked its starting point. Pass init_loc_fn to the guide's own "
-                    "constructor, or pass a guide class here and let optimize() build it."
+                    "initial_params/init_loc_fn has no effect on an already-constructed "
+                    "guide, which has picked its starting point. Pass init_loc_fn to the "
+                    "guide's own constructor, or pass a guide class here and let "
+                    "optimize() build it."
                 )
                 raise ValueError(msg)
             _guide = guide
