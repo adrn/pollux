@@ -920,6 +920,7 @@ class LVM(eqx.Module):
         initial_params: UnpackedParamsT | None = None,
         latents_prior: dist.Distribution | None = None,
         progress: bool = True,
+        block_options: "dict[str, dict[str, Any]] | None" = None,
     ) -> "IterativeOptimizationResult":
         """Optimize using iterative parameter block coordinate descent.
 
@@ -1053,6 +1054,7 @@ class LVM(eqx.Module):
             initial_params=initial_params,
             latents_prior=latents_prior,
             progress=progress,
+            block_options=block_options,
         )
 
     def unpack_numpyro_pars(

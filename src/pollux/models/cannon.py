@@ -110,17 +110,25 @@ class Cannon(LVM):
     ``C(n_labels + degree, degree) = C(3 + 2, 2) = 10``.
 
     Training is the classic Cannon step: pin the latents to the observed labels and
-    solve the coefficients exactly, which costs one linear solve.
+    solve the coefficients exactly, which costs one linear solve. Add the scatter block
+    to fit the per-pixel jitter alongside them, which alternates that solve with
+    gradient descent:
 
     >>> res = cannon.optimize_iterative(  # doctest: +SKIP
     ...     train_data,
-    ...     blocks=["flux:data"],
+    ...     blocks=["flux:data", "flux:err"],
     ...     fixed_pars={"latents": train_data["label"].data},
-    ...     max_cycles=1,
+    ...     max_cycles=8,
     ... )
 
-    From there you can let the latents and the scatters float too, by running the
-    default blocks from that starting point with ``initial_params=res.params``.
+    Note that the latents are passed as ``fixed_pars``, not fitted. Running the default
+    blocks instead would add a ``"latents"`` block, which lets the *training* labels
+    move away from the catalog values that are supposed to anchor them -- each star
+    contributes far more spectral pixels than label measurements, so the flux term
+    dominates and pulls them. That is a defensible model (the Cannon with errors in the
+    labels), but it is not the classic one, and left unweighted it measurably degrades
+    label predictions for new stars. Weight the two likelihoods deliberately if you
+    want it.
 
     To infer labels for stars with only a spectrum, optimize the latents with the
     trained output parameters held fixed:

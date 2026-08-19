@@ -202,15 +202,14 @@ else:
 # on it.
 tutorial_sections = {
     "Latent Variable Models": [
-        "tutorials/LVM-getting-started.ipynb",
         "tutorials/LVM-math-notes.ipynb",
-        "tutorials/LVM-iterative-optimization.ipynb",
+        "tutorials/LVM-getting-started.ipynb",
         "tutorials/LVM-error-models.ipynb",
-        "tutorials/LVM-hierarchical-missing-labels.ipynb",
+        # "tutorials/LVM-hierarchical-missing-labels.ipynb",
     ],
-    "The Lux Model": [
+    "Lux": [
         "tutorials/Lux-getting-started-apogee.ipynb",
-        "tutorials/Lux-apogee-uncertainties.ipynb",
+        # "tutorials/Lux-apogee-uncertainties.ipynb",
     ],
     "The Cannon": [
         "tutorials/Cannon-getting-started-apogee.ipynb",

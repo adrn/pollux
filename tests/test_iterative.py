@@ -1,5 +1,6 @@
 """Tests for iterative optimization."""
 
+import dataclasses
 import inspect
 import warnings
 
@@ -29,6 +30,7 @@ from pollux.models.iterative import (
     _solve_latents_least_squares,
     _solve_output_params_least_squares,
     _split_param_layer,
+    default_blocks,
     optimize_iterative,
 )
 from pollux.models.transforms import (
@@ -1049,6 +1051,49 @@ class TestOptimizeIterative:
         # Providing initial params should work and produce finite losses
         assert all(jnp.isfinite(loss) for loss in result.losses_per_cycle)
 
+    def test_initial_params_is_not_mutated(self, linear_model_and_data):
+        """A fit must not write back into the dict it was handed.
+
+        The per-output parameters live in nested dicts, so a shallow copy of
+        ``initial_params`` shares them with the caller. Writing a solved value into one
+        of those would silently overwrite the caller's own result -- which matters
+        because passing one fit's params as the next fit's starting point is the
+        documented way to refine a model.
+        """
+        data = linear_model_and_data["data"]
+        n_flux = linear_model_and_data["n_flux"]
+
+        # Both an exact-solve block (flux:data) and an SVI block (flux:err), since the
+        # two took separate paths to the same mistake.
+        model = plx.LVM(latent_size=linear_model_and_data["n_latents"])
+        model.register_output(
+            "flux",
+            LinearTransform(output_size=n_flux),
+            err_transform=ScatterTransform(output_size=n_flux),
+        )
+
+        first = optimize_iterative(
+            model, data, max_cycles=3, rng_key=jax.random.PRNGKey(0)
+        )
+        snapshot = jax.tree.map(np.array, first.params)
+
+        optimize_iterative(
+            model,
+            data,
+            initial_params=first.params,
+            max_cycles=3,
+            rng_key=jax.random.PRNGKey(1),
+        )
+
+        for kind in ("data", "err"):
+            for name, before in snapshot["flux"][kind].items():
+                np.testing.assert_array_equal(
+                    before,
+                    first.params["flux"][kind][name],
+                    err_msg=f"the second fit overwrote the first's flux:{kind} {name!r}",
+                )
+        np.testing.assert_array_equal(snapshot["latents"], first.params["latents"])
+
 
 class TestLuxOptimizeIterativeSignature:
     """The LVM.optimize_iterative method's parameter order."""
@@ -1667,3 +1712,388 @@ class TestConstrainedPriors:
             )
         flux_block = next(b for b in result.blocks if b.name == "flux:data")
         assert flux_block.optimizer != "least_squares"
+
+
+def _predicts_well(model, data, params, rtol=0.05):
+    """Whether the fit reproduces each output column to within a fraction of its spread.
+
+    The right invariant for these models: the parameters themselves are identified only
+    up to a rotation of the latent space, and alternating least squares on a jointly
+    non-convex problem need not land on the same optimum twice, but the predictions are
+    invariant under both.
+    """
+    pred = np.asarray(model.predict_outputs(params)[next(iter(data.keys()))])
+    obs = np.asarray(data[next(iter(data.keys()))].data)
+    resid = np.sqrt(np.mean((pred - obs) ** 2, axis=0))
+    return bool(np.all(resid < rtol * obs.std(axis=0)))
+
+
+class TestPerOutputPriors:
+    """A prior on a linear layer may differ from one output dimension to the next.
+
+    The closed-form solve is already one system per output dimension, so it can carry
+    a different regularization for each. It used to build a single shared reg matrix
+    and died with a bare broadcasting error the moment a prior was not scalar.
+    """
+
+    @pytest.fixture
+    def two_scale_data(self):
+        """Outputs whose natural scales span a couple of orders of magnitude.
+
+        More output dimensions than latents, so each object's latents are determined by
+        its own data: with fewer observations than latents per object the offset becomes
+        degenerate with the latent mean and the alternating solve has nothing to lock on
+        to.
+        """
+        n_stars, n_latents, n_out = 512, 3, 8
+        rng = np.random.default_rng(42)
+
+        scales = np.array([10.0, 10.0, 1.0, 1.0, 0.1, 0.1, 0.05, 0.05])
+        latents = rng.normal(size=(n_stars, n_latents))
+        A_true = rng.normal(size=(n_out, n_latents)) * scales[:, None]
+        b_true = rng.normal(size=n_out) * scales
+        err = np.tile(0.02 * scales, (n_stars, 1))
+        y = latents @ A_true.T + b_true + rng.normal(scale=err)
+
+        data = plx.data.PolluxData(y=plx.data.OutputData(y, err=err))
+        return data, n_latents, n_out, b_true, scales
+
+    def test_per_output_row_prior(self, two_scale_data):
+        """One scale per output dimension: shape (n_out, 1)."""
+        data, n_latents, n_out, _b_true, scales = two_scale_data
+
+        model = plx.LVM(latent_size=n_latents)
+        model.register_output(
+            "y",
+            AffineTransform(
+                output_size=n_out,
+                priors={
+                    "A": dist.Normal(scale=scales.reshape(n_out, 1)),
+                    "b": dist.Normal(scale=scales),
+                },
+            ),
+        )
+        result = model.optimize_iterative(
+            data, max_cycles=64, rng_key=jax.random.PRNGKey(0), progress=False
+        )
+
+        # the block keeps its closed-form solve rather than crashing or falling back
+        assert all(b.optimizer == "least_squares" for b in result.blocks)
+        # and the fit describes the data, whose columns span four orders of magnitude
+        assert _predicts_well(model, data, result.params)
+
+    def test_fully_elementwise_prior(self, two_scale_data):
+        """One scale per element of A: shape (n_out, n_latents), A's own shape."""
+        data, n_latents, n_out, _b_true, row_scales = two_scale_data
+        scales = np.tile(row_scales.reshape(n_out, 1), (1, n_latents))
+        assert scales.shape == (n_out, n_latents)
+
+        model = plx.LVM(latent_size=n_latents)
+        model.register_output(
+            "y",
+            AffineTransform(
+                output_size=n_out,
+                priors={
+                    "A": dist.Normal(scale=scales),
+                    "b": dist.Normal(scale=row_scales),
+                },
+            ),
+        )
+        result = model.optimize_iterative(
+            data, max_cycles=64, rng_key=jax.random.PRNGKey(0), progress=False
+        )
+        assert all(b.optimizer == "least_squares" for b in result.blocks)
+        assert _predicts_well(model, data, result.params)
+
+    def test_the_prior_is_actually_applied_per_row(self):
+        """Not just accepted -- each row must feel its own regularization.
+
+        Two identical outputs, given priors differing by orders of magnitude: the
+        tightly-regularized row must be shrunk far harder toward zero.
+        """
+        n_stars, n_latents, n_out = 256, 2, 2
+        rng = np.random.default_rng(7)
+        latents = rng.normal(size=(n_stars, n_latents))
+        A_true = rng.normal(size=(n_out, n_latents))
+        y = np.repeat((latents @ A_true.T)[:, :1], n_out, axis=1)  # identical columns
+        err = np.full((n_stars, n_out), 0.1)
+
+        data = plx.data.PolluxData(
+            y=plx.data.OutputData(y + rng.normal(scale=err), err=err)
+        )
+        model = plx.LVM(latent_size=n_latents)
+        model.register_output(
+            "y",
+            LinearTransform(
+                output_size=n_out,
+                # row 0 barely regularized, row 1 crushed
+                priors={"A": dist.Normal(scale=np.array([[10.0], [1e-3]]))},
+            ),
+        )
+        result = model.optimize_iterative(
+            data, max_cycles=64, rng_key=jax.random.PRNGKey(0), progress=False
+        )
+        A_fit = np.asarray(result.params["y"]["data"]["A"])
+        assert np.abs(A_fit[1]).max() < 0.1 * np.abs(A_fit[0]).max()
+
+    def test_scalar_prior_still_works(self, two_scale_data):
+        """The shared-prior path must be unchanged."""
+        data, n_latents, n_out, _, scales = two_scale_data
+        model = plx.LVM(latent_size=n_latents)
+        model.register_output(
+            "y",
+            LinearTransform(output_size=n_out, priors={"A": dist.Normal(0.0, 2.0)}),
+        )
+        result = model.optimize_iterative(
+            data, max_cycles=32, rng_key=jax.random.PRNGKey(0), progress=False
+        )
+        assert all(b.optimizer == "least_squares" for b in result.blocks)
+        assert np.all(np.isfinite(result.params["y"]["data"]["A"]))
+
+    def test_misshaped_prior_reports_the_shape(self, two_scale_data):
+        """A prior that cannot describe the parameter names the shape it needed."""
+        data, n_latents, n_out, _, scales = two_scale_data
+        model = plx.LVM(latent_size=n_latents)
+        model.register_output(
+            "y",
+            LinearTransform(
+                output_size=n_out, priors={"A": dist.Normal(scale=np.ones(5))}
+            ),
+        )
+        with pytest.raises(ValueError, match=r"shape"):
+            model.optimize_iterative(
+                data, max_cycles=2, rng_key=jax.random.PRNGKey(0), progress=False
+            )
+
+    def test_layer_with_renamed_parameters_is_refused(self):
+        """The solve reads and writes 'A' and 'b' by name, so it checks them.
+
+        A LinearTransform built with a different transform function takes its parameter
+        names from that function's signature, and they no longer match what the solve
+        assumes -- so the block must fall back rather than silently use the wrong prior.
+        """
+
+        def renamed(z, M):
+            return M @ z
+
+        layer = LinearTransform(output_size=3, transform=renamed)
+        assert layer._param_names == ("M",)  # but layer.shapes still says "A"
+        assert _split_param_layer(layer) is None
+
+
+class TestDefaultBlocksAndOptions:
+    """Adjusting one block should not mean respecifying every other one."""
+
+    @pytest.fixture
+    def model_and_data(self):
+        n_stars, n_latents, n_out, n_lab = 64, 3, 12, 2
+        rng = np.random.default_rng(0)
+        latents = rng.normal(size=(n_stars, n_latents))
+        flux = latents @ rng.normal(size=(n_out, n_latents)).T
+        label = latents @ rng.normal(size=(n_lab, n_latents)).T
+        data = plx.data.PolluxData(
+            flux=plx.data.OutputData(flux, err=np.full((n_stars, n_out), 0.1)),
+            label=plx.data.OutputData(label, err=np.full((n_stars, n_lab), 0.1)),
+        )
+        model = plx.LVM(latent_size=n_latents)
+        model.register_output(
+            "flux",
+            LinearTransform(output_size=n_out),
+            err_transform=ScatterTransform(output_size=n_out),
+        )
+        model.register_output("label", LinearTransform(output_size=n_lab))
+        return model, data
+
+    def test_default_blocks_matches_what_a_default_fit_runs(self, model_and_data):
+        model, data = model_and_data
+        declared = default_blocks(model, data)
+        result = model.optimize_iterative(
+            data, max_cycles=1, rng_key=jax.random.PRNGKey(0), progress=False
+        )
+        assert [b.name for b in declared] == [b.name for b in result.blocks]
+
+    def test_error_blocks_are_born_svi(self, model_and_data):
+        """They enter through the variance, so there is no closed form to fall from."""
+        model, data = model_and_data
+        by_name = {b.name: b for b in default_blocks(model, data)}
+        assert by_name["flux:err"].optimizer is None
+        assert by_name["flux:data"].optimizer == "least_squares"
+        assert by_name["latents"].optimizer == "least_squares"
+
+    def test_block_options_adjusts_one_block_only(self, model_and_data):
+        model, data = model_and_data
+        result = model.optimize_iterative(
+            data,
+            max_cycles=1,
+            rng_key=jax.random.PRNGKey(0),
+            progress=False,
+            block_options={
+                "flux:err": {"num_steps": 7, "optimizer_kwargs": {"step_size": 0.05}}
+            },
+        )
+        blocks = {b.name: b for b in result.blocks}
+        assert blocks["flux:err"].num_steps == 7
+        assert blocks["flux:err"].optimizer_kwargs == {"step_size": 0.05}
+        # every other block is untouched, including ones never named
+        for name in ("latents", "flux:data", "label:data"):
+            assert blocks[name].num_steps == ParameterBlock("x", "x").num_steps
+            assert blocks[name].optimizer == "least_squares"
+
+    def test_block_options_composes_with_an_explicit_block_list(self, model_and_data):
+        model, data = model_and_data
+        result = model.optimize_iterative(
+            data,
+            blocks=["latents", "flux:err"],
+            max_cycles=1,
+            rng_key=jax.random.PRNGKey(0),
+            progress=False,
+            block_options={"flux:err": {"num_steps": 3}},
+        )
+        assert [b.name for b in result.blocks] == ["latents", "flux:err"]
+        assert result.blocks[1].num_steps == 3
+
+    def test_unknown_block_name_is_refused(self, model_and_data):
+        """A typo must not silently do nothing."""
+        model, data = model_and_data
+        with pytest.raises(ValueError, match="not blocks of this fit"):
+            model.optimize_iterative(
+                data,
+                max_cycles=1,
+                rng_key=jax.random.PRNGKey(0),
+                progress=False,
+                block_options={"flux:errr": {"num_steps": 10}},
+            )
+
+    def test_round_trip_through_default_blocks(self, model_and_data):
+        """The documented alternative: take the defaults, replace one, hand them back."""
+        model, data = model_and_data
+        blocks = [
+            dataclasses.replace(b, num_steps=5) if b.name == "flux:err" else b
+            for b in default_blocks(model, data)
+        ]
+        result = model.optimize_iterative(
+            data,
+            blocks=blocks,
+            max_cycles=1,
+            rng_key=jax.random.PRNGKey(0),
+            progress=False,
+        )
+        assert next(b for b in result.blocks if b.name == "flux:err").num_steps == 5
+
+
+class TestMultiSpecBlocks:
+    """One block may name several parameter specs, fitting them jointly with SVI.
+
+    ParameterBlock.params is typed ``str | list[str]`` and has a params_list property
+    for exactly this, but the err-transform warning read ``.params`` directly and blew
+    up on an unhashable list before any fitting happened.
+    """
+
+    @pytest.fixture
+    def model_and_data(self):
+        n_stars, n_latents, n_out, n_lab = 128, 3, 10, 2
+        rng = np.random.default_rng(3)
+        latents = rng.normal(size=(n_stars, n_latents))
+        flux = latents @ rng.normal(size=(n_out, n_latents)).T
+        label = latents @ rng.normal(size=(n_lab, n_latents)).T
+        data = plx.data.PolluxData(
+            flux=plx.data.OutputData(
+                flux + rng.normal(scale=0.1, size=flux.shape),
+                err=np.full((n_stars, n_out), 0.1),
+            ),
+            label=plx.data.OutputData(label, err=np.full((n_stars, n_lab), 0.1)),
+        )
+        model = plx.LVM(latent_size=n_latents)
+        model.register_output(
+            "flux",
+            LinearTransform(output_size=n_out),
+            err_transform=ScatterTransform(output_size=n_out),
+        )
+        model.register_output("label", LinearTransform(output_size=n_lab))
+        return model, data
+
+    def test_a_block_naming_several_specs_runs(self, model_and_data):
+        """Regression: this raised TypeError: unhashable type: 'list'."""
+        model, data = model_and_data
+        result = model.optimize_iterative(
+            data,
+            blocks=[
+                "latents",
+                ParameterBlock("flux-joint", ["flux:data", "flux:err"], num_steps=50),
+                "label:data",
+            ],
+            max_cycles=2,
+            rng_key=jax.random.PRNGKey(0),
+            progress=False,
+        )
+        assert [b.name for b in result.blocks] == [
+            "latents",
+            "flux-joint",
+            "label:data",
+        ]
+
+    def test_both_specs_in_the_block_are_optimized(self, model_and_data):
+        """Not just accepted -- both sets of parameters have to move."""
+        model, data = model_and_data
+        start = {
+            # nonzero: with zero latents the prediction is A @ 0, so A has no gradient
+            "latents": jax.random.normal(
+                jax.random.PRNGKey(1), (len(data), model.latent_size)
+            ),
+            "flux": {"data": {"A": jnp.zeros((10, 3))}, "err": {"s": jnp.ones(10)}},
+            "label": {"data": {"A": jnp.zeros((2, 3))}, "err": {}},
+        }
+        result = model.optimize_iterative(
+            data,
+            blocks=[
+                ParameterBlock("flux-joint", ["flux:data", "flux:err"], num_steps=200)
+            ],
+            initial_params=start,
+            max_cycles=2,
+            rng_key=jax.random.PRNGKey(0),
+            progress=False,
+        )
+        assert not jnp.allclose(result.params["flux"]["data"]["A"], 0.0)
+        assert not jnp.allclose(result.params["flux"]["err"]["s"], 1.0)
+
+    def test_a_bare_output_name_covers_both_of_its_specs(self, model_and_data):
+        """params='flux' means all of flux's parameters, data and err alike."""
+        model, data = model_and_data
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")  # any err_transform warning would fail here
+            model.optimize_iterative(
+                data,
+                blocks=["latents", ParameterBlock("flux-all", "flux", num_steps=50)],
+                max_cycles=1,
+                rng_key=jax.random.PRNGKey(0),
+                progress=False,
+            )
+
+    def test_no_spurious_warning_when_err_is_inside_a_multi_spec_block(
+        self, model_and_data
+    ):
+        model, data = model_and_data
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            model.optimize_iterative(
+                data,
+                blocks=[
+                    "latents",
+                    ParameterBlock("j", ["flux:data", "flux:err"], num_steps=50),
+                ],
+                max_cycles=1,
+                rng_key=jax.random.PRNGKey(0),
+                progress=False,
+            )
+        assert not [w for w in caught if "err_transform" in str(w.message)]
+
+    def test_the_warning_still_fires_when_err_really_is_left_out(self, model_and_data):
+        model, data = model_and_data
+        with pytest.warns(UserWarning, match="err_transform"):
+            model.optimize_iterative(
+                data,
+                blocks=["latents", "flux:data"],
+                max_cycles=1,
+                rng_key=jax.random.PRNGKey(0),
+                progress=False,
+            )

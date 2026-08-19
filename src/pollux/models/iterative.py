@@ -9,6 +9,7 @@ from __future__ import annotations
 __all__ = [
     "IterativeOptimizationResult",
     "ParameterBlock",
+    "default_blocks",
     "optimize_iterative",
 ]
 
@@ -95,6 +96,32 @@ class ParameterBlock:
     ...     num_steps=1000,
     ... )
 
+    Fit several parameter groups together in one block, by naming more than one spec.
+    Take a flux output with both a linear ``data`` transform and a fitted scatter in
+    its ``err`` transform: by default those are two separate blocks, cycled one after
+    the other, and ``flux:data`` gets an exact least-squares solve while ``flux:err``
+    gets SVI. Naming both in a single block optimizes them *jointly* with SVI instead:
+
+    >>> joint = ParameterBlock(  # doctest: +SKIP
+    ...     name="flux",
+    ...     params=["flux:data", "flux:err"],
+    ...     num_steps=2000,
+    ...     optimizer_kwargs={"step_size": 1e-2},
+    ... )
+    >>> result = model.optimize_iterative(  # doctest: +SKIP
+    ...     data, blocks=["latents", joint, "label:data"]
+    ... )
+
+    Naming the output on its own is equivalent and shorter -- ``params="flux"`` covers
+    both ``flux:data`` and ``flux:err``.
+
+    This is worth trying when the coefficients and the scatter are coupled tightly
+    enough that alternating between them converges slowly, since each one's optimum
+    depends on the other. It is not automatically better, though: joining them gives
+    up the exact solve that ``flux:data`` would have had on its own, in exchange for
+    gradient descent on both. Compare ``result.losses_per_cycle[-1]`` against the
+    default before keeping it.
+
     """
 
     name: str
@@ -150,9 +177,19 @@ def _split_param_layer(
 
     Returns ``(prefix, layer)``, with ``prefix`` None when the transform is already
     a bare linear layer, or None when the transform cannot be solved this way.
+
+    The solve reads the layer's parameters, and writes the answer back, by the names
+    ``"A"`` for the matrix and ``"b"`` for the bias -- and it relies on the bias
+    occupying the appended column of the design matrix. Those names normally come from
+    :class:`~pollux.models.transforms.LinearTransform` and
+    :class:`~pollux.models.transforms.AffineTransform`, but a caller can pass a
+    different ``transform`` function to either, in which case the parameter names come
+    from *that* function's signature and no longer match. So the names are checked here
+    rather than assumed: a layer that does not use them is refused, and the block falls
+    back to an optimizer that reads parameters generically.
     """
     if isinstance(transform, (LinearTransform, AffineTransform)):
-        return None, transform
+        return (None, transform) if _has_solvable_names(transform) else None
 
     if not isinstance(transform, TransformSequence):
         return None
@@ -165,7 +202,16 @@ def _split_param_layer(
     if any(transform.names_nested[:-1]):
         return None
 
+    if not _has_solvable_names(last):
+        return None
+
     return TransformSequence(tuple(head)), last
+
+
+def _has_solvable_names(layer: LinearTransform | AffineTransform) -> bool:
+    """Whether the layer's parameters are the ``A`` (and ``b``) the solve expects."""
+    expected = ("A", "b") if "b" in layer.shapes else ("A",)
+    return tuple(layer._param_names) == expected
 
 
 #: Relative tolerance for deciding that a prediction map is affine in the latents.
@@ -381,6 +427,31 @@ def _inverse_variance(
     if jnp.all(err <= 0):
         return jnp.ones_like(output_data.data)
     return 1.0 / err**2
+
+
+def _broadcast_prior(
+    value: jax.Array | float, shape: tuple[int, ...], name: str
+) -> jax.Array:
+    """Spread a prior's precision or mean over the parameter it describes.
+
+    An elementwise prior may be a single number, one number per output dimension, or
+    one number per element of the parameter -- a different regularization strength for
+    each stellar label, say, or for each coefficient individually. All of those
+    broadcast to the parameter's own shape.
+
+    Anything else is a shape the solve cannot use. Reporting it here, against the shape
+    that was expected, beats letting it surface as a bare broadcasting error from
+    inside the linear algebra several frames down.
+    """
+    try:
+        return jnp.broadcast_to(jnp.asarray(value, dtype=float), shape)
+    except (ValueError, TypeError) as exc:
+        msg = (
+            f"The prior on '{name}' has shape {jnp.shape(value)}, which does not fit "
+            f"the parameter it describes. Expected something broadcastable to {shape}: "
+            "a scalar, one value per output dimension, or one value per element."
+        )
+        raise ValueError(msg) from exc
 
 
 def _solve_priors(model: LVM, spec: str) -> dict[str, dist.Distribution]:
@@ -604,6 +675,11 @@ def _solve_output_params_least_squares(
     assert term_A is not None
     latent_size = n_design - 1 if has_bias else n_design
 
+    term_b = None
+    if has_bias:
+        term_b = prior_term(layer.priors.get("b", dist.Normal(0, 1)))
+        assert term_b is not None
+
     if term_A.correlated:
         # A correlated prior over the latent axis: its precision matrix replaces the
         # scalar ridge, occupying the leading block when a bias column is appended.
@@ -613,21 +689,30 @@ def _solve_output_params_least_squares(
         )
         row = prec @ jnp.broadcast_to(term_A.mean, (latent_size,))
         rhs_extra = jnp.zeros((output_size, n_design)).at[:, :latent_size].set(row)
+        if term_b is not None:
+            reg_matrix = reg_matrix.at[-1, -1].set(term_b.precision)
+            rhs_extra = rhs_extra.at[:, -1].set(term_b.precision * term_b.mean)
+        reg_matrix = jnp.broadcast_to(reg_matrix, (output_size, n_design, n_design))
     else:
-        reg_matrix = term_A.precision * jnp.eye(n_design)
-        rhs_extra = term_A.precision * jnp.broadcast_to(
-            term_A.mean, (output_size, n_design)
-        )
+        # An elementwise prior contributes a diagonal ridge, and it may differ from one
+        # output dimension to the next -- a different regularization strength for each
+        # stellar label, say. The solve is already one system per output dimension, so
+        # give each its own diagonal rather than sharing a single matrix.
+        prec = _broadcast_prior(term_A.precision, (output_size, latent_size), "A")
+        mean = _broadcast_prior(term_A.mean, (output_size, latent_size), "A")
+        if term_b is not None:
+            # b is one value per output dimension, so its prior spreads over a column
+            bias_prec = _broadcast_prior(term_b.precision, (output_size,), "b")
+            bias_mean = _broadcast_prior(term_b.mean, (output_size,), "b")
+            prec = jnp.concatenate([prec, bias_prec[:, None]], axis=1)
+            mean = jnp.concatenate([mean, bias_mean[:, None]], axis=1)
+        reg_matrix = jax.vmap(jnp.diag)(prec)  # (output_size, n_design, n_design)
+        rhs_extra = prec * mean
 
     lower = jnp.full(n_design, term_A.lower, dtype=float)
     upper = jnp.full(n_design, term_A.upper, dtype=float)
     bounded = term_A.bounded
-
-    if has_bias:
-        term_b = prior_term(layer.priors.get("b", dist.Normal(0, 1)))
-        assert term_b is not None
-        reg_matrix = reg_matrix.at[-1, -1].set(term_b.precision)
-        rhs_extra = rhs_extra.at[:, -1].set(term_b.precision * term_b.mean)
+    if term_b is not None:
         lower = lower.at[-1].set(term_b.lower)
         upper = upper.at[-1].set(term_b.upper)
         bounded = bounded or term_b.bounded
@@ -640,12 +725,14 @@ def _solve_output_params_least_squares(
         b = jnp.einsum("dpn,nd->dp", DtW, y) + rhs_extra
         solution = box_constrained_normal_equations(H, b, lower, upper)
     else:
-        # One independent solve per output dimension -> (output_size, n_design)
+        # One independent solve per output dimension -> (output_size, n_design). The
+        # regularization is vmapped along with the data, so a prior that differs from
+        # one output dimension to the next is carried through rather than shared.
         solution = jax.vmap(
-            lambda y_dim, ivar_dim, rhs_row: weighted_least_squares(
-                design, y_dim, ivar_dim, reg_matrix, rhs_row
+            lambda y_dim, ivar_dim, reg_dim, rhs_row: weighted_least_squares(
+                design, y_dim, ivar_dim, reg_dim, rhs_row
             )
-        )(y.T, output_ivar.T, rhs_extra)
+        )(y.T, output_ivar.T, reg_matrix, rhs_extra)
 
     solved = (
         {"A": solution[:, :-1], "b": solution[:, -1]} if has_bias else {"A": solution}
@@ -659,6 +746,82 @@ def _solve_output_params_least_squares(
     return transform.unpack_pars(
         {f"{last}:{name}": value for name, value in solved.items()}, ignore_missing=True
     )
+
+
+def default_blocks(model: LVM, data: PolluxData) -> list[ParameterBlock]:
+    """The parameter blocks :func:`optimize_iterative` fits when given none.
+
+    The latents, plus every transform that has something to fit -- error transforms
+    included, since their parameters are as much a part of the model as the data
+    transforms'. A transform carrying no learnable parameters (a
+    :class:`~pollux.models.transforms.NoOpTransform`, a bare
+    :class:`~pollux.models.transforms.PolyFeatureTransform`) gets no block.
+
+    Call this to see what a fit is going to do, or to adjust one block and hand the
+    list back::
+
+        from dataclasses import replace
+
+        blocks = pollux.models.default_blocks(model, train_data)
+        blocks = [
+            replace(b, num_steps=100) if b.name == "flux:err" else b for b in blocks
+        ]
+        model.optimize_iterative(train_data, blocks=blocks)
+
+    For the common case of adjusting one block, ``block_options`` does the same thing
+    in one line -- see :func:`optimize_iterative`.
+
+    Parameters
+    ----------
+    model
+        The LVM instance.
+    data
+        The data to be fitted, which decides which outputs participate.
+
+    Returns
+    -------
+    list
+        The blocks, in the order they would be cycled through.
+    """
+    participating = _participating_outputs(model, data)
+    output_blocks = [
+        f"{name}:{kind}"
+        for name in participating
+        for kind, transform in (
+            ("data", model.outputs[name].data_transform),
+            ("err", model.outputs[name].err_transform),
+        )
+        if _has_learnable_params(transform, model.latent_size, len(data))
+    ]
+    # Start from whichever end the data pins down. With the latents already at their
+    # observed values, fit the outputs to them first: going the other way would spend
+    # the first latents step chasing prior-sampled output parameters and undo the
+    # head start.
+    names = (
+        [*output_blocks, "latents"]
+        if _latents_from_data(model, data) is not None
+        else ["latents", *output_blocks]
+    )
+    return [_string_to_parameter_block(model, name) for name in names]
+
+
+def _apply_block_options(
+    blocks: list[ParameterBlock], options: dict[str, dict[str, Any]]
+) -> list[ParameterBlock]:
+    """Merge per-block settings onto blocks, keyed by block name."""
+    unknown = set(options) - {block.name for block in blocks}
+    if unknown:
+        msg = (
+            f"block_options names {sorted(unknown)}, which are not blocks of this "
+            f"fit. The blocks are {[b.name for b in blocks]} -- see "
+            "pollux.models.default_blocks to inspect them."
+        )
+        raise ValueError(msg)
+
+    return [
+        replace(block, **options[block.name]) if block.name in options else block
+        for block in blocks
+    ]
 
 
 def _string_to_parameter_block(model: LVM, name: str) -> ParameterBlock:
@@ -791,6 +954,7 @@ def optimize_iterative(
     initial_params: dict[str, Any] | None = None,
     latents_prior: dist.Distribution | None = None,
     progress: bool = True,
+    block_options: dict[str, dict[str, Any]] | None = None,
 ) -> IterativeOptimizationResult:
     """Optimize model using iterative block coordinate descent.
 
@@ -925,38 +1089,20 @@ def optimize_iterative(
     # which end of the model it makes sense to start from
     observed_latents = _latents_from_data(model, data)
 
-    # Default blocks: the latents and every transform that has something to fit --
-    # error transforms included, since their parameters are as much a part of the
-    # model as the data transforms'. A transform carrying no learnable parameters
-    # (NoOpTransform, a bare PolyFeatureTransform) gets no block.
     participating = _participating_outputs(model, data)
 
     if blocks is None:
-        output_blocks = [
-            f"{name}:{kind}"
-            for name in participating
-            for kind, transform in (
-                ("data", model.outputs[name].data_transform),
-                ("err", model.outputs[name].err_transform),
-            )
-            if _has_learnable_params(transform, model.latent_size, len(data))
+        _blocks = default_blocks(model, data)
+    else:
+        # String specs are converted per element rather than by sniffing blocks[0],
+        # so a mixed list works.
+        _blocks = [
+            _string_to_parameter_block(model, b) if isinstance(b, str) else b
+            for b in blocks
         ]
-        # Start from whichever end the data pins down. With the latents already at
-        # their observed values, fit the outputs to them first: going the other way
-        # would spend the first latents step chasing prior-sampled output parameters
-        # and undo the head start.
-        blocks = (
-            [*output_blocks, "latents"]
-            if observed_latents is not None
-            else ["latents", *output_blocks]
-        )
 
-    # String specs are converted per element rather than by sniffing blocks[0], so a
-    # mixed list works.
-    _blocks: list[ParameterBlock] = [
-        _string_to_parameter_block(model, b) if isinstance(b, str) else b
-        for b in blocks
-    ]
+    if block_options:
+        _blocks = _apply_block_options(_blocks, block_options)
 
     # Build initial_params from fixed_pars if not provided
     if initial_params is None and fixed_pars is not None:
@@ -965,8 +1111,15 @@ def optimize_iterative(
         )
 
     # Warn if any output has err_transform parameters that are neither being
-    # optimized (in active blocks) nor intentionally held fixed (in fixed_pars)
-    active_block_params = {b.params for b in _blocks}
+    # optimized (in active blocks) nor intentionally held fixed (in fixed_pars).
+    # A block may name several parameter specs, so read params_list rather than
+    # params -- and a bare output name covers both of that output's specs.
+    active_block_params: set[str] = set()
+    for block in _blocks:
+        for spec in block.params_list:
+            active_block_params.add(spec)
+            if spec in model.outputs:
+                active_block_params.update({f"{spec}:data", f"{spec}:err"})
     for output_name in participating:
         output = model.outputs[output_name]
         err_key = f"{output_name}:err"
@@ -1130,11 +1283,15 @@ def _optimize_block_least_squares(
         if param_type not in ("", "data"):
             continue
 
-        if output_name not in new_params:
-            new_params[output_name] = {"data": {}, "err": {}}
-        new_params[output_name]["data"] = _solve_output_params_least_squares(
-            model, data, output_name, current_params
-        )
+        # Rebuild this output's dict rather than writing into it: the shallow copy
+        # above shares it with `current_params`, and on the first cycle that is the
+        # caller's `initial_params`, which must not be mutated.
+        new_params[output_name] = {
+            **new_params.get(output_name, {"data": {}, "err": {}}),
+            "data": _solve_output_params_least_squares(
+                model, data, output_name, current_params
+            ),
+        }
 
     return new_params
 
@@ -1233,13 +1390,15 @@ def _optimize_block_numpyro(
         elif ":" in param_spec:
             output_name, param_type = param_spec.split(":", 1)
             if output_name in optimized_subset:
-                if output_name not in new_params:
-                    new_params[output_name] = {"data": {}, "err": {}}
                 opt_output = optimized_subset[output_name]
+                # As above: replace the output's dict, never write into the one we
+                # were handed.
+                merged = dict(new_params.get(output_name, {"data": {}, "err": {}}))
                 if param_type == "data" and "data" in opt_output:
-                    new_params[output_name]["data"] = opt_output["data"]
+                    merged["data"] = opt_output["data"]
                 elif param_type == "err" and "err" in opt_output:
-                    new_params[output_name]["err"] = opt_output["err"]
+                    merged["err"] = opt_output["err"]
+                new_params[output_name] = merged
         elif param_spec in optimized_subset:
             new_params[param_spec] = optimized_subset[param_spec]
 
