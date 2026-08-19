@@ -44,6 +44,25 @@ The APOGEE tutorials need `docs/_data/rgb-highSNR-1k-1chip.h5`, which the `tutor
 workflow downloads from <https://users.flatironinstitute.org/~apricewhelan/pollux/>. On
 Read the Docs the notebooks come from that workflow's artifact, not from a local run.
 
+## CI
+
+`CI` runs pre-commit, the test matrix, and a Sphinx build; `Tutorials` executes the
+notebooks. On a pull request each can be turned on or off:
+
+| Job                   | PR default  | How to change it                                            |
+| --------------------- | ----------- | ----------------------------------------------------------- |
+| Tests                 | runs        | `skip tests` label, or `[skip tests]` in the commit subject |
+| Docs (Sphinx build)   | runs        | `skip docs` label, or `[skip docs]` in the commit subject   |
+| Tutorials (notebooks) | **skipped** | add the `tutorials` label to opt in                         |
+
+The commit-subject flags are read from the branch head, not the PR merge commit. All of
+this is PR-only: pushes to `main` and published releases always run everything, so
+`[skip tests]` on a commit that lands on `main` has no effect.
+
+Notebook execution is opt-in because it is the slowest job in the repo — and because
+Read the Docs pulls the executed notebooks from that workflow's artifact, as described
+above. The `Docs` job never executes notebooks, so it only checks that the docs build.
+
 ## Release
 
 The version comes from the git tag via `hatch-vcs`, so there is no version number to

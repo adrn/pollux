@@ -1082,18 +1082,21 @@ class LVM(eqx.Module):
         dict
             A nested dictionary with keys as output names. Each output name is a key with
             a dict value containing "data" and "err" keys:
+
             - For single transforms, "data" values are parameter dictionaries
             - For TransformSequence, "data" values are tuples of parameter dictionaries
             - "err" values follow the same structure as "data" for the error transforms
             - "err" will be an empty dict {} if there are no error parameters
             - Non-output parameters (like "latents") are passed through at the top level
 
-            Example structure:
-            {
-                "flux": {"data": {...} or (...), "err": {}},  # err empty if no error pars
-                "label": {"data": {...}, "err": {...}},
-                "latents": array
-            }
+            Example structure::
+
+                {
+                    # "err" is empty if the output has no error parameters
+                    "flux": {"data": {...} or (...), "err": {}},
+                    "label": {"data": {...}, "err": {...}},
+                    "latents": array
+                }
         """
         unpacked_pars: dict[str, Any] = {}
 
@@ -1143,12 +1146,13 @@ class LVM(eqx.Module):
             parameter dictionaries. Non-output parameters (like "latents") can exist at
             the top level.
 
-            Example structure:
-            {
-                "flux": {"data": {...} or (...)},  # err key optional
-                "label": {"data": {...}, "err": {...}},  # err key included
-                "latents": array
-            }
+            Example structure::
+
+                {
+                    "flux": {"data": {...} or (...)},  # err key optional
+                    "label": {"data": {...}, "err": {...}},  # err key included
+                    "latents": array
+                }
 
         Returns
         -------

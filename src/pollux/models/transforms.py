@@ -431,6 +431,7 @@ class TransformSequence(AbstractMultiTransform):
         """Apply the sequence of transforms to input latent vectors.
 
         Parameters can be provided in two ways:
+
         1. As positional arguments: One dictionary per transform in sequence order
         2. As keyword arguments: Using "{transform_index}:{param}" naming scheme, so a
            parameter named "A" in transform 0 of the sequence would be "0:A".

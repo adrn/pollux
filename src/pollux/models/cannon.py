@@ -87,12 +87,6 @@ class Cannon(LVM):
         :func:`~pollux.models.optimize_iterative` turns it into the ridge term of the
         closed-form solve. Defaults to the standard unit Gaussian.
 
-    Attributes
-    ----------
-    n_features
-        Number of polynomial features, computed from ``label_size``, ``poly_degree``
-        and ``include_bias``.
-
     Examples
     --------
     A Cannon for 3 labels and 100 spectral pixels:
@@ -222,7 +216,10 @@ class Cannon(LVM):
 
     @property
     def n_features(self) -> int:
-        """Number of polynomial features."""
+        """Number of polynomial features.
+
+        Computed from ``label_size``, ``poly_degree`` and ``include_bias``.
+        """
         return _compute_n_poly_features(
             self.latent_size, self.poly_degree, self.include_bias
         )
