@@ -918,7 +918,7 @@ class LVM(eqx.Module):
         tol: float = 1e-6,
         rng_key: jax.Array | None = None,
         initial_params: UnpackedParamsT | None = None,
-        latents_prior: dist.Distribution | None = None,
+        latents_prior: dist.Distribution | bool | None = None,
         progress: bool = True,
         block_options: "dict[str, dict[str, Any]] | None" = None,
     ) -> "IterativeOptimizationResult":
@@ -968,7 +968,11 @@ class LVM(eqx.Module):
             Maximum number of full optimization cycles. Note this method defaults to
             10, where :func:`~pollux.models.optimize_iterative` defaults to 100.
         tol
-            Convergence tolerance. Stops when the relative change in loss is below it.
+            Convergence tolerance. Each cycle is measured by the fraction of the total
+            loss improvement so far that it contributed, and the fit stops once that
+            fraction stays below ``tol`` for two consecutive cycles. Being a ratio of
+            two differences it is free of the constant in the loss, so it does not
+            depend on the units of the data or the size of the uncertainties.
         rng_key
             JAX random key. Required when any block uses SVI (i.e. its optimizer is not
             ``"least_squares"``) or when ``initial_params`` is None, where it is used to
@@ -980,6 +984,9 @@ class LVM(eqx.Module):
         latents_prior
             Prior distribution for the latents. If None, uses ``Normal(0, 1)``. This
             also sets the regularization strength of the closed-form latent solve.
+            ``False`` means an improper uniform, which regularizes not at all: the
+            latent solve becomes a plain weighted least squares, and can be singular
+            for an object the data barely constrain.
         progress
             Whether to display a progress bar.
 

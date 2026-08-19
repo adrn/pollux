@@ -149,7 +149,12 @@ class IterativeOptimizationResult:
     n_cycles
         Number of full cycles completed.
     converged
-        Whether the optimization converged according to tolerance.
+        Whether the loss stopped changing, by the ``tol`` test in
+        :func:`optimize_iterative`. This says the fit stopped moving, not that where
+        it stopped is any good: every block solve is exact, so alternating them
+        reaches a stationary point in few cycles with nothing to push it off one. An
+        under-determined fit can report ``True`` after a cycle or two at a useless
+        answer, and be right to.
     blocks
         The parameter blocks as they were actually run, after checking which ones
         could use a closed-form solve. Inspect ``block.optimizer`` to see what each
@@ -943,16 +948,36 @@ def _build_initial_params_from_fixed(
     return initial
 
 
+def _relative_change(losses: list[float]) -> float:
+    """The last cycle's change in loss, as a fraction of the total change so far.
+
+    Numerator and denominator are both differences, so any constant in the loss
+    cancels. That is the point: the ``-0.5 * sum(log ivar)`` normalization is constant
+    whenever the uncertainties are, and it is not small -- on a spectroscopic fit it
+    can exceed the whole loss and flip its sign. Dividing by ``abs(loss)`` instead
+    would leave the threshold depending on the units of the data and the size of the
+    uncertainties rather than on how converged the fit is.
+
+    Returns ``inf`` for a single cycle, there being no change to measure yet.
+    """
+    if len(losses) < 2:
+        return float("inf")
+    change = losses[-2] - losses[-1]
+    total = losses[0] - losses[-1]
+    scale = max(abs(total), abs(change))
+    return abs(change) / scale if scale > 0 else 0.0
+
+
 def optimize_iterative(
     model: LVM,
     data: PolluxData,
     blocks: list[ParameterBlock] | list[str] | None = None,
     fixed_pars: dict[str, Any] | None = None,
     max_cycles: int = 100,
-    tol: float = 1e-4,
+    tol: float = 1e-6,
     rng_key: jax.Array | None = None,
     initial_params: dict[str, Any] | None = None,
-    latents_prior: dist.Distribution | None = None,
+    latents_prior: dist.Distribution | bool | None = None,
     progress: bool = True,
     block_options: dict[str, dict[str, Any]] | None = None,
 ) -> IterativeOptimizationResult:
@@ -1015,7 +1040,11 @@ def optimize_iterative(
     max_cycles
         Maximum number of full optimization cycles.
     tol
-        Convergence tolerance. Stops when relative change in loss < tol.
+        Convergence tolerance. Each cycle is measured by the fraction of the total
+        loss improvement so far that it contributed, and the fit stops once that
+        fraction stays below ``tol`` for two consecutive cycles. Being a ratio of
+        two differences it is free of the constant in the loss, so it does not
+        depend on the units of the data or the size of the uncertainties.
     rng_key
         JAX random key. Required when any block uses SVI (i.e., ``optimizer !=
         "least_squares"``) or when ``initial_params`` is None (used to sample
@@ -1028,6 +1057,9 @@ def optimize_iterative(
     latents_prior
         Prior distribution for latents. If None, uses Normal(0, 1).
         Used to determine regularization strength for latent least squares.
+        ``False`` means an improper uniform, which regularizes not at all: the latent
+        solve becomes a plain weighted least squares, and can be singular for an
+        object the data barely constrain.
     progress
         Whether to display a tqdm progress bar showing optimization progress.
 
@@ -1084,6 +1116,11 @@ def optimize_iterative(
 
     """
     warn_if_unprocessed(data, "optimize_iterative()")
+
+    # Resolved once, here, rather than in each of the block solves, the blocker and the
+    # loss below: they all take a distribution, and only this boundary should have to
+    # know that None means a unit Gaussian and False means an improper uniform.
+    latents_prior = model._resolve_latents_prior(latents_prior)
 
     # Latents the data reports directly beat a draw from the prior, and also decide
     # which end of the model it makes sense to start from
@@ -1176,8 +1213,6 @@ def optimize_iterative(
 
     losses_per_cycle: list[float] = []
 
-    prev_loss = float("inf")
-
     # Set up progress bar
     pbar = tqdm(
         range(max_cycles),
@@ -1187,6 +1222,7 @@ def optimize_iterative(
 
     n_cycles = 0
     converged = False
+    n_below_tol = 0
 
     for cycle in pbar:
         n_cycles = cycle + 1
@@ -1223,24 +1259,26 @@ def optimize_iterative(
             )
 
         # Compute loss at end of cycle
-        loss = _compute_loss(model, data, current_params)
+        loss = _compute_loss(model, data, current_params, latents_prior)
         losses_per_cycle.append(float(loss))
 
         # Update progress bar with loss info
-        rel_change = abs(prev_loss - loss) / (abs(prev_loss) + 1e-8)
+        rel_change = _relative_change(losses_per_cycle)
         pbar.set_postfix(
             loss=f"{loss:.4g}",
             rel_change=f"{rel_change:.2e}",
         )
 
-        # Check convergence
-        converged = bool(rel_change < tol)
+        # Check convergence. Two cycles in a row, not one: the SVI blocks take a fixed
+        # number of stochastic steps, so a single quiet cycle is not evidence that the
+        # fit has stopped moving.
+        n_below_tol = n_below_tol + 1 if rel_change < tol else 0
+        converged = n_below_tol >= 2
         if converged:
             pbar.set_description("Converged")
             pbar.update(max_cycles - pbar.n)  # Complete the bar
             pbar.set_postfix(loss=f"{loss:.4g}")
             break
-        prev_loss = loss
 
     pbar.colour = "green" if converged else "red"
     pbar.close()
@@ -1433,12 +1471,61 @@ def _build_fixed_pars(
     return fixed
 
 
+def _log_prior(
+    model: LVM,
+    data: PolluxData,
+    params: dict[str, Any],
+    latents_prior: dist.Distribution | bool | None = None,
+) -> float:
+    """Total log prior density over every parameter the model samples.
+
+    Taken from the model's own numpyro model rather than re-derived here, so it stays
+    in step with the priors the block solves actually regularize towards.
+    """
+    participating = _participating_outputs(model, data)
+    packed = model.pack_numpyro_pars(params, ignore_missing=True)
+    model_fn = partial(
+        model.default_numpyro_model, latents_prior=latents_prior, names=participating
+    )
+    # Seeded so that a site params did not cover is drawn rather than tripping an
+    # opaque assert inside numpyro; the check below turns it into a real message.
+    site_trace = numpyro.handlers.trace(
+        numpyro.handlers.seed(numpyro.handlers.substitute(model_fn, packed), rng_seed=0)
+    ).get_trace(data)
+
+    sites = [
+        site
+        for site in site_trace.values()
+        if site["type"] == "sample" and not site.get("is_observed", False)
+    ]
+
+    # An unsubstituted site would have been drawn at random, which would put noise
+    # into the loss rather than raising -- so insist that params covered them all.
+    absent = [site["name"] for site in sites if site["name"] not in packed]
+    if absent:
+        msg = f"No parameter values given for prior site(s) {sorted(absent)}"
+        raise ValueError(msg)
+
+    return sum(float(jnp.sum(site["fn"].log_prob(site["value"]))) for site in sites)
+
+
 def _compute_loss(
     model: LVM,
     data: PolluxData,
     params: dict[str, Any],
+    latents_prior: dist.Distribution | bool | None = None,
 ) -> float:
-    """Compute the negative log likelihood loss."""
+    """Compute the negative log posterior density.
+
+    This is the objective the block solves descend: the closed-form solves minimize
+    chi-squared *plus* the quadratic prior term, and the SVI blocks descend the same
+    log joint. A likelihood-only loss is not the objective, and so is not guaranteed
+    to decrease from cycle to cycle -- which makes it useless to test convergence on.
+
+    When the latents are observed rather than free (as in
+    :class:`~pollux.models.Cannon`) their prior contributes a term the solves do not
+    see, but it is constant across cycles and so does not affect convergence.
+    """
     latents = params["latents"]
     participating = _participating_outputs(model, data)
     # Predicting an absent output would demand parameters it was never fitted with,
@@ -1458,4 +1545,4 @@ def _compute_loss(
         chi2 = (pred - obs) ** 2 * ivar
         total_loss = float(total_loss) + float(0.5 * jnp.sum(chi2 - jnp.log(ivar)))
 
-    return total_loss
+    return total_loss - _log_prior(model, data, params, latents_prior)

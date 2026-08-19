@@ -2,6 +2,7 @@
 
 import dataclasses
 import inspect
+import itertools
 import warnings
 
 import jax
@@ -24,9 +25,11 @@ from pollux.models.iterative import (
     _latents_probe_points,
     _least_squares_blocker,
     _linearize_latents,
+    _log_prior,
     _optimize_block_numpyro,
     _output_predict_fn,
     _participating_outputs,
+    _relative_change,
     _solve_latents_least_squares,
     _solve_output_params_least_squares,
     _split_param_layer,
@@ -1009,21 +1012,70 @@ class TestOptimizeIterative:
         assert result.losses_per_cycle[-1] <= result.losses_per_cycle[0]
 
     def test_optimize_iterative_convergence(self, linear_model_and_data):
-        """Test that optimization can converge."""
+        """It stops on its own, and says so, before running out of cycles."""
         model = linear_model_and_data["model"]
         data = linear_model_and_data["data"]
 
         result = optimize_iterative(
             model,
             data,
-            max_cycles=50,
-            tol=1e-6,
+            max_cycles=200,
+            tol=1e-3,
             rng_key=jax.random.PRNGKey(0),
         )
 
-        # Should converge before max_cycles for this simple problem
-        # (or at least show decreasing loss)
+        assert result.converged
+        assert result.n_cycles < 200
+        assert len(result.losses_per_cycle) == result.n_cycles
         assert result.losses_per_cycle[-1] < result.losses_per_cycle[0]
+
+    def test_tol_zero_does_not_converge(self, linear_model_and_data):
+        """Nothing can be below a zero tolerance while the loss is still moving."""
+        model = linear_model_and_data["model"]
+        data = linear_model_and_data["data"]
+
+        result = optimize_iterative(
+            model,
+            data,
+            max_cycles=8,
+            tol=0.0,
+            rng_key=jax.random.PRNGKey(0),
+        )
+
+        assert not result.converged
+        assert result.n_cycles == 8
+
+    def test_loss_does_not_increase_under_a_tight_prior(self, linear_model_and_data):
+        """The tracked loss is the objective the blocks descend, prior included.
+
+        Started from the optimum of a nearly-flat prior and then given a tight one,
+        every cycle has to pull the fit away from the likelihood optimum. A loss that
+        left the prior out would climb here, and the convergence test -- which only
+        sees the size of the change -- would read that climb as progress.
+        """
+        model = linear_model_and_data["model"]
+        data = linear_model_and_data["data"]
+
+        loose = optimize_iterative(
+            model,
+            data,
+            max_cycles=40,
+            tol=0.0,
+            rng_key=jax.random.PRNGKey(0),
+            latents_prior=dist.Normal(0.0, 50.0),
+        )
+        result = optimize_iterative(
+            model,
+            data,
+            max_cycles=8,
+            tol=0.0,
+            rng_key=jax.random.PRNGKey(0),
+            latents_prior=dist.Normal(0.0, 0.05),
+            initial_params=loose.params,
+        )
+
+        losses = result.losses_per_cycle
+        assert all(b <= a + 1e-8 for a, b in itertools.pairwise(losses))
 
     def test_optimize_iterative_with_initial_params(self, linear_model_and_data):
         """Test optimization with initial parameters."""
@@ -2096,4 +2148,171 @@ class TestMultiSpecBlocks:
                 max_cycles=1,
                 rng_key=jax.random.PRNGKey(0),
                 progress=False,
+            )
+
+
+def _converged_cycle(losses: list[float], tol: float) -> int | None:
+    """The cycle `optimize_iterative` would stop on for this loss trace."""
+    n_below = 0
+    for i in range(len(losses)):
+        n_below = n_below + 1 if _relative_change(losses[: i + 1]) < tol else 0
+        if n_below >= 2:
+            return i + 1
+    return None
+
+
+class TestRelativeChange:
+    """The convergence criterion, tested apart from any fit."""
+
+    def test_a_constant_offset_does_not_move_the_stopping_point(self):
+        """The reason the criterion is a ratio of two differences.
+
+        ``_compute_loss`` carries ``-0.5 * sum(log ivar)``, which is constant when the
+        uncertainties are and is not small -- it can exceed the whole loss. Scaling the
+        per-cycle change by ``abs(loss)`` made the threshold depend on that constant,
+        and so on the units of the data.
+        """
+        losses = [100.0, 50.0, 25.0, 24.9, 24.85, 24.8]
+
+        for offset in (0.0, -1e5, 1e9):
+            shifted = [value + offset for value in losses]
+            assert _converged_cycle(shifted, 1e-2) == _converged_cycle(losses, 1e-2)
+            for a, b in zip(losses, shifted, strict=True):
+                assert _relative_change([a]) == _relative_change([b])
+
+    def test_scaling_the_whole_loss_does_not_move_it_either(self):
+        losses = [100.0, 50.0, 25.0, 24.9, 24.85, 24.8]
+        scaled = [value * 1e6 for value in losses]
+        assert _converged_cycle(scaled, 1e-2) == _converged_cycle(losses, 1e-2)
+
+    def test_one_cycle_has_no_change_to_measure(self):
+        assert _relative_change([-12.3]) == float("inf")
+
+    def test_an_exact_fixed_point_reads_as_no_change(self):
+        """A block solve that cannot move reports zero, not nan.
+
+        Dividing by a total change of zero is how an under-determined fit -- one that
+        lands on an exact fixed point after a single cycle -- used to print ``nan``.
+        """
+        assert _relative_change([5.0, 5.0]) == 0.0
+        assert _converged_cycle([5.0, 5.0, 5.0], 1e-6) == 3
+
+    def test_the_second_cycle_is_never_convergence(self):
+        """With one change recorded, that change is all the progress there is."""
+        assert _relative_change([10.0, 5.0]) == 1.0
+        assert _converged_cycle([10.0, 5.0], 0.5) is None
+
+    def test_a_single_quiet_cycle_is_not_convergence(self):
+        """The SVI blocks take a fixed number of stochastic steps, so one small
+        cycle is not evidence the fit has stopped moving -- hence two in a row."""
+        stalled_then_moved = [100.0, 50.0, 25.0, 24.999, 10.0, 5.0]
+        assert _relative_change(stalled_then_moved[:4]) < 1e-3
+        assert _converged_cycle(stalled_then_moved, 1e-3) is None
+
+    def test_a_loss_that_climbs_is_not_convergence(self):
+        assert _relative_change([100.0, 50.0, 90.0]) > 0.5
+
+
+class TestLogPrior:
+    """The prior half of the objective."""
+
+    def test_it_covers_the_output_parameters_and_the_latents(
+        self, linear_model_and_data
+    ):
+        model = linear_model_and_data["model"]
+        data = linear_model_and_data["data"]
+        result = optimize_iterative(
+            model, data, max_cycles=2, rng_key=jax.random.PRNGKey(0)
+        )
+
+        value = _log_prior(model, data, result.params)
+        assert jnp.isfinite(value)
+        # Unit-normal priors on every site, so the density is a sum of negative terms
+        assert value < 0
+
+    def test_a_tighter_prior_penalises_the_same_parameters_more(
+        self, linear_model_and_data
+    ):
+        model = linear_model_and_data["model"]
+        data = linear_model_and_data["data"]
+        result = optimize_iterative(
+            model, data, max_cycles=2, rng_key=jax.random.PRNGKey(0)
+        )
+
+        wide = _log_prior(model, data, result.params, dist.Normal(0.0, 10.0))
+        tight = _log_prior(model, data, result.params, dist.Normal(0.0, 0.01))
+        assert tight < wide
+
+    def test_missing_parameters_raise_rather_than_being_drawn(
+        self, linear_model_and_data
+    ):
+        """An unsubstituted site would be sampled, putting noise into the loss."""
+        model = linear_model_and_data["model"]
+        data = linear_model_and_data["data"]
+        latents = jnp.zeros((linear_model_and_data["n_stars"], model.latent_size))
+
+        with pytest.raises(ValueError, match="No parameter values"):
+            _log_prior(model, data, {"latents": latents})
+
+
+class TestImproperLatentsPrior:
+    """``latents_prior=False`` -- the improper uniform every other method accepts."""
+
+    def test_it_runs_and_keeps_the_closed_form_solve(self, linear_model_and_data):
+        """An improper prior contributes no quadratic term, which is not the same as
+        contributing one a linear solve cannot use: a flat prior just drops the ridge,
+        leaving a plain weighted least squares."""
+        model = linear_model_and_data["model"]
+        data = linear_model_and_data["data"]
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", PolluxLinearizationWarning)
+            result = optimize_iterative(
+                model,
+                data,
+                max_cycles=10,
+                rng_key=jax.random.PRNGKey(0),
+                latents_prior=False,
+            )
+
+        assert all(block.optimizer == "least_squares" for block in result.blocks)
+        assert np.all(np.isfinite(result.losses_per_cycle))
+
+    def test_it_regularizes_less_than_a_unit_gaussian(self, linear_model_and_data):
+        model = linear_model_and_data["model"]
+        data = linear_model_and_data["data"]
+
+        def fit(latents_prior):
+            return optimize_iterative(
+                model,
+                data,
+                max_cycles=10,
+                rng_key=jax.random.PRNGKey(0),
+                latents_prior=latents_prior,
+            ).params
+
+        def chi2(params):
+            pred = model.predict_outputs(params, params["latents"], names=["flux"])
+            resid = pred["flux"] - data["flux"].data
+            return float(jnp.sum(resid**2 / data["flux"].err ** 2))
+
+        flat, shrunk = fit(False), fit(None)
+
+        # No ridge, so the latents are free to be larger and to fit the data closer
+        assert jnp.linalg.norm(flat["latents"]) > jnp.linalg.norm(shrunk["latents"])
+        assert chi2(flat) <= chi2(shrunk)
+
+    def test_a_prior_that_is_neither_a_distribution_nor_the_sentinel_is_refused(
+        self, linear_model_and_data
+    ):
+        model = linear_model_and_data["model"]
+        data = linear_model_and_data["data"]
+
+        with pytest.raises(TypeError, match="must be a numpyro distribution"):
+            optimize_iterative(
+                model,
+                data,
+                max_cycles=1,
+                rng_key=jax.random.PRNGKey(0),
+                latents_prior=1.0,
             )
