@@ -211,9 +211,9 @@ tutorial_sections = {
         "tutorials/Lux-getting-started-apogee.ipynb",
         # "tutorials/Lux-apogee-uncertainties.ipynb",
     ],
-    # "The Cannon": [
-    #     "tutorials/Cannon-getting-started-apogee.ipynb",
-    # ],
+    "The Cannon": [
+        "tutorials/Cannon-getting-started-apogee.ipynb",
+    ],
 }
 tutorial_files = [fn for group in tutorial_sections.values() for fn in group]
 
