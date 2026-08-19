@@ -54,7 +54,6 @@ extensions = [
     "sphinxext.opengraph",
     "sphinx_togglebutton",
     # "sphinx_tippy",
-    "rtds_action",
 ]
 
 python_use_unqualified_type_names = True
@@ -168,8 +167,13 @@ html_theme_options: dict[str, Any] = {
 
 # -- rtds-action --
 
+# Only load rtds_action when a token is available, i.e. on Read the Docs. Without
+# one it queries the GitHub API for an empty repository name and warns "Can't list
+# files (404)", which would fail the docs build under -W.
 if "GITHUB_TOKEN" in os.environ:
     print("GitHub Token found: retrieving artifact")
+
+    extensions.append("rtds_action")
 
     # The name of your GitHub repository
     rtds_action_github_repo = "adrn/pollux"
@@ -190,9 +194,6 @@ if "GITHUB_TOKEN" in os.environ:
 
 else:
     print("No GitHub Token found: skipping artifact retrieval")
-    rtds_action_github_repo = ""
-    rtds_action_github_token = ""
-    rtds_action_path = ""
 
 
 # -- Check for executed tutorials and only add to toctree if they exist ------

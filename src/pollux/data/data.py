@@ -41,7 +41,7 @@ class OutputData(eqx.Module):
     stored in a 2D array with shape (128, 2048). You also have the errors on the fluxes,
     which are stored in a 2D array with the same shape. You can create an instance of
     ``OutputData`` to store this data. In the example below, we will generate some
-    random data to represent this case (for the sake of illustration)::
+    random data to represent this case (for the sake of illustration):
 
     >>> import jax.numpy as jnp
     >>> import jax.random as jrnd
@@ -56,7 +56,7 @@ class OutputData(eqx.Module):
 
     We did not specify a preprocessor, so the data are not preprocessed even if we call
     ``.preprocess()``. In this case, the processed data should equal the unprocessed
-    data::
+    data:
 
     >>> tmp = flux_data.preprocess()
     >>> assert tmp.processed
@@ -64,7 +64,7 @@ class OutputData(eqx.Module):
 
     We can instead specify a data preprocessor to rescale and center the input data. For
     this, we use the ``ShiftScalePreprocessor``, which centers the data on the specified
-    location and scales the data by default along ``axis=0``::
+    location and scales the data by default along ``axis=0``:
 
     >>> from pollux.data import ShiftScalePreprocessor
     >>> flux_data = OutputData(

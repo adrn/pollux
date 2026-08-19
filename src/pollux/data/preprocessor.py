@@ -105,7 +105,7 @@ class ShiftScalePreprocessor(AbstractPreprocessor):
     --------
     The default way of computing the preprocessing parameters uses the ``from_data()``
     class method, which computes the mean and standard deviation of the data along
-    axis=0::
+    axis=0:
 
     >>> import jax.numpy as jnp
     >>> data = jnp.array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
@@ -116,7 +116,7 @@ class ShiftScalePreprocessor(AbstractPreprocessor):
     >>> assert jnp.allclose(jnp.std(processed_data, axis=0), 1.0, atol=1e-5)
 
     To instead use the mean and standard deviation computed over all axes at the same
-    time, set the axis to None::
+    time, set the axis to None:
 
     >>> preprocessor = ShiftScalePreprocessor.from_data(data, axis=None)
     >>> processed_data = preprocessor.transform(data)
@@ -126,7 +126,7 @@ class ShiftScalePreprocessor(AbstractPreprocessor):
     ``from_data_percentiles()`` class method, which computes the median and the
     difference between the specified percentiles as the scale. Here we will specify
     using (1/2 times) the difference of the 84th and 16th percentile values as the
-    scale::
+    scale:
 
     >>> preprocessor = ShiftScalePreprocessor.from_data_percentiles(
     ...     data, scale_percentiles=(5.0, 95.0)
