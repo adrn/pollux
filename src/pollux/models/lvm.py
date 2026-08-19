@@ -968,7 +968,11 @@ class LVM(eqx.Module):
             Maximum number of full optimization cycles. Note this method defaults to
             10, where :func:`~pollux.models.optimize_iterative` defaults to 100.
         tol
-            Convergence tolerance. Stops when the relative change in loss is below it.
+            Convergence tolerance. Each cycle is measured by the fraction of the total
+            loss improvement so far that it contributed, and the fit stops once that
+            fraction stays below ``tol`` for two consecutive cycles. Being a ratio of
+            two differences it is free of the constant in the loss, so it does not
+            depend on the units of the data or the size of the uncertainties.
         rng_key
             JAX random key. Required when any block uses SVI (i.e. its optimizer is not
             ``"least_squares"``) or when ``initial_params`` is None, where it is used to
