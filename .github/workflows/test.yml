@@ -68,9 +68,24 @@ jobs:
       !contains(needs.check_skip_flags.outputs.head-commit-message, '[skip tests]'))
     strategy:
       fail-fast: false
+      # Every supported Python on Linux, plus the newest on macOS and Windows.
+      # Nothing here compiles, so the OS axis tests whether the JAX wheels work
+      # on a platform rather than testing our own code, and once per OS covers
+      # that. The newest Python is the one pinned across OSes because
+      # newest-Python x Windows is the riskiest cell: that is where jaxlib
+      # wheels lag furthest behind a new CPython.
       matrix:
-        python-version: ["3.12", "3.13", "3.14"]
-        runs-on: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - python-version: "3.12"
+            runs-on: ubuntu-latest
+          - python-version: "3.13"
+            runs-on: ubuntu-latest
+          - python-version: "3.14"
+            runs-on: ubuntu-latest
+          - python-version: "3.14"
+            runs-on: macos-latest
+          - python-version: "3.14"
+            runs-on: windows-latest
 
     steps:
       - uses: actions/checkout@v7
