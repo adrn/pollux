@@ -76,8 +76,13 @@ jobs:
       # wheels lag furthest behind a new CPython.
       matrix:
         include:
+          # Coverage is identical in every cell -- no platform-conditional code
+          # in the package, no skipif in the suite -- so it uploads from here
+          # only, rather than once per cell. If this entry ever goes away, move
+          # the flag rather than dropping it.
           - python-version: "3.12"
             runs-on: ubuntu-latest
+            coverage: true
           - python-version: "3.13"
             runs-on: ubuntu-latest
           - python-version: "3.14"
@@ -94,6 +99,8 @@ jobs:
         uses: astral-sh/setup-uv@v7
         with:
           python-version: ${{ matrix.python-version }}
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
 
       # --no-default-groups skips the "dev" group, which would otherwise pull in
       # the whole docs toolchain; --no-sync stops `uv run` from adding it back.
@@ -106,6 +113,7 @@ jobs:
           --durations=20 --color=yes
 
       - name: Upload coverage report
+        if: matrix.coverage
         uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
