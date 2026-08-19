@@ -1051,6 +1051,49 @@ class TestOptimizeIterative:
         # Providing initial params should work and produce finite losses
         assert all(jnp.isfinite(loss) for loss in result.losses_per_cycle)
 
+    def test_initial_params_is_not_mutated(self, linear_model_and_data):
+        """A fit must not write back into the dict it was handed.
+
+        The per-output parameters live in nested dicts, so a shallow copy of
+        ``initial_params`` shares them with the caller. Writing a solved value into one
+        of those would silently overwrite the caller's own result -- which matters
+        because passing one fit's params as the next fit's starting point is the
+        documented way to refine a model.
+        """
+        data = linear_model_and_data["data"]
+        n_flux = linear_model_and_data["n_flux"]
+
+        # Both an exact-solve block (flux:data) and an SVI block (flux:err), since the
+        # two took separate paths to the same mistake.
+        model = plx.LVM(latent_size=linear_model_and_data["n_latents"])
+        model.register_output(
+            "flux",
+            LinearTransform(output_size=n_flux),
+            err_transform=ScatterTransform(output_size=n_flux),
+        )
+
+        first = optimize_iterative(
+            model, data, max_cycles=3, rng_key=jax.random.PRNGKey(0)
+        )
+        snapshot = jax.tree.map(np.array, first.params)
+
+        optimize_iterative(
+            model,
+            data,
+            initial_params=first.params,
+            max_cycles=3,
+            rng_key=jax.random.PRNGKey(1),
+        )
+
+        for kind in ("data", "err"):
+            for name, before in snapshot["flux"][kind].items():
+                np.testing.assert_array_equal(
+                    before,
+                    first.params["flux"][kind][name],
+                    err_msg=f"the second fit overwrote the first's flux:{kind} {name!r}",
+                )
+        np.testing.assert_array_equal(snapshot["latents"], first.params["latents"])
+
 
 class TestLuxOptimizeIterativeSignature:
     """The LVM.optimize_iterative method's parameter order."""

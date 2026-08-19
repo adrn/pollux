@@ -1283,11 +1283,15 @@ def _optimize_block_least_squares(
         if param_type not in ("", "data"):
             continue
 
-        if output_name not in new_params:
-            new_params[output_name] = {"data": {}, "err": {}}
-        new_params[output_name]["data"] = _solve_output_params_least_squares(
-            model, data, output_name, current_params
-        )
+        # Rebuild this output's dict rather than writing into it: the shallow copy
+        # above shares it with `current_params`, and on the first cycle that is the
+        # caller's `initial_params`, which must not be mutated.
+        new_params[output_name] = {
+            **new_params.get(output_name, {"data": {}, "err": {}}),
+            "data": _solve_output_params_least_squares(
+                model, data, output_name, current_params
+            ),
+        }
 
     return new_params
 
@@ -1386,13 +1390,15 @@ def _optimize_block_numpyro(
         elif ":" in param_spec:
             output_name, param_type = param_spec.split(":", 1)
             if output_name in optimized_subset:
-                if output_name not in new_params:
-                    new_params[output_name] = {"data": {}, "err": {}}
                 opt_output = optimized_subset[output_name]
+                # As above: replace the output's dict, never write into the one we
+                # were handed.
+                merged = dict(new_params.get(output_name, {"data": {}, "err": {}}))
                 if param_type == "data" and "data" in opt_output:
-                    new_params[output_name]["data"] = opt_output["data"]
+                    merged["data"] = opt_output["data"]
                 elif param_type == "err" and "err" in opt_output:
-                    new_params[output_name]["err"] = opt_output["err"]
+                    merged["err"] = opt_output["err"]
+                new_params[output_name] = merged
         elif param_spec in optimized_subset:
             new_params[param_spec] = optimized_subset[param_spec]
 
