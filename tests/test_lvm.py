@@ -829,8 +829,8 @@ class TestLatentUncertainties:
             model.latent_uncertainties(data, pars, names="label")
 
 
-class TestOptimizeInitLocFn:
-    """Tests for the init_loc_fn parameter on LVM.optimize."""
+class TestOptimizeStartingPoint:
+    """Tests for initial_params and init_loc_fn on LVM.optimize."""
 
     @pytest.fixture
     def model_and_data(self):
@@ -864,8 +864,34 @@ class TestOptimizeInitLocFn:
         assert np.allclose(pars["latents"], 0.3, atol=1e-5)
         assert np.allclose(pars["flux"]["data"]["A"], 0.7, atol=1e-5)
 
-    def test_partial_values_fall_back_to_the_default(self, model_and_data):
-        """Sites left out of the values dict get the guide's own initialization."""
+    def test_initial_params_starts_from_the_given_values(self, model_and_data):
+        """initial_params is the same starting point, without the numpyro plumbing."""
+        model, data = model_and_data
+
+        start = {
+            "latents": jnp.full((20, 3), 0.3),
+            "flux": {"data": {"A": jnp.full((6, 3), 0.7)}},
+        }
+        pars, _ = model.optimize(
+            data,
+            num_steps=1,
+            rng_key=jax.random.PRNGKey(0),
+            optimizer=numpyro.optim.Adam(1e-8),
+            initial_params=start,
+        )
+
+        assert np.allclose(pars["latents"], 0.3, atol=1e-5)
+        assert np.allclose(pars["flux"]["data"]["A"], 0.7, atol=1e-5)
+
+    def test_partial_initial_params_randomizes_the_rest(self, model_and_data):
+        """Naming any site puts the sites left out on init_to_uniform, not the median.
+
+        This is numpyro's behavior, not ours: init_to_value replaces the strategy
+        wholesale and defers unlisted sites to init_to_uniform(radius=2) in
+        unconstrained space. AutoDelta's own init_to_median never runs. The latents
+        prior here is Normal(0, 1), so a median init would put them all at exactly
+        zero -- the spread is what shows the uniform draw happened.
+        """
         model, data = model_and_data
 
         start = {"flux": {"data": {"A": jnp.full((6, 3), 0.7)}}}
@@ -874,12 +900,90 @@ class TestOptimizeInitLocFn:
             num_steps=1,
             rng_key=jax.random.PRNGKey(0),
             optimizer=numpyro.optim.Adam(1e-8),
-            init_loc_fn=init_to_value(
-                values=model.pack_numpyro_pars(start, ignore_missing=True)
-            ),
+            initial_params=start,
         )
 
         assert np.allclose(pars["flux"]["data"]["A"], 0.7, atol=1e-5)
+        assert pars["latents"].shape == (20, 3)
+        assert np.abs(pars["latents"]).max() <= 2.0
+        assert pars["latents"].std() > 0.1
+
+    def test_initial_params_ignores_sites_that_are_conditioned_out(
+        self, model_and_data
+    ):
+        """fixed_pars removes a site from the guide; a value for it is harmless.
+
+        optimize_iterative leans on this too -- it hands the full parameter dict to
+        init_to_value every cycle, including the block it just conditioned out.
+        """
+        model, data = model_and_data
+
+        start = {
+            "latents": jnp.full((20, 3), 0.3),
+            "flux": {"data": {"A": jnp.full((6, 3), 0.7)}},
+        }
+        pars, _ = model.optimize(
+            data,
+            num_steps=1,
+            rng_key=jax.random.PRNGKey(0),
+            optimizer=numpyro.optim.Adam(1e-8),
+            fixed_pars={"latents": jnp.full((20, 3), 0.3)},
+            initial_params=start,
+        )
+
+        assert np.allclose(pars["flux"]["data"]["A"], 0.7, atol=1e-5)
+        assert "latents" not in pars
+
+    def test_initial_params_and_init_loc_fn_conflict(self, model_and_data):
+        """Two spellings of the same knob, so passing both is ambiguous."""
+        model, data = model_and_data
+
+        with pytest.raises(ValueError, match="one or the other"):
+            model.optimize(
+                data,
+                num_steps=1,
+                rng_key=jax.random.PRNGKey(0),
+                initial_params={"flux": {"data": {"A": jnp.zeros((6, 3))}}},
+                init_loc_fn=init_to_value(values={}),
+            )
+
+    def test_initial_params_with_guide_instance_raises(self, model_and_data):
+        """initial_params reaches the same guard as a hand-built init_loc_fn."""
+        model, data = model_and_data
+
+        numpyro_model = partial(
+            model.default_numpyro_model, latents_prior=None, custom_model=None
+        )
+
+        with pytest.raises(ValueError, match="has no effect"):
+            model.optimize(
+                data,
+                num_steps=1,
+                rng_key=jax.random.PRNGKey(0),
+                guide=AutoNormal(numpyro_model),
+                initial_params={"flux": {"data": {"A": jnp.zeros((6, 3))}}},
+            )
+
+    def test_empty_initial_params_is_a_no_op(self, model_and_data):
+        """An empty dict means "not given", not "put every site on init_to_uniform".
+
+        Checked through the guide-instance guard, which only trips once
+        initial_params has actually built an init_loc_fn.
+        """
+        model, data = model_and_data
+
+        numpyro_model = partial(
+            model.default_numpyro_model, latents_prior=None, custom_model=None
+        )
+        pars, _ = model.optimize(
+            data,
+            num_steps=1,
+            rng_key=jax.random.PRNGKey(0),
+            optimizer=numpyro.optim.Adam(1e-8),
+            guide=AutoNormal(numpyro_model),
+            initial_params={},
+        )
+
         assert pars["latents"].shape == (20, 3)
 
     def test_guide_instance_raises(self, model_and_data):
