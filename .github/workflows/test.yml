@@ -6,6 +6,11 @@ on:
   push:
     branches:
       - main
+    # Release tags too: a tag can point at a commit that never sat on main, and
+    # waiting for the GitHub release to be published would test it only after
+    # it was cut. branches and tags are ORed within one push trigger.
+    tags:
+      - "v*"
   release:
     types:
       - published
