@@ -93,10 +93,10 @@ def test_shift_scale_constant_pixels_raises():
     # APOGEE detector pixel
     data = np.array([[1.0, 5.0], [3.0, 5.0], [5.0, 5.0]])
 
-    with pytest.raises(ValueError, match="identical values"):
+    with pytest.raises(ValueError, match="zero spread"):
         plx.data.ShiftScalePreprocessor.from_data(data)
 
-    with pytest.raises(ValueError, match="identical values"):
+    with pytest.raises(ValueError, match="zero spread"):
         plx.data.ShiftScalePreprocessor.from_data_percentiles(data)
 
 
