@@ -3,9 +3,7 @@
 from collections.abc import Callable
 from typing import Any
 
-from jax.example_libraries.optimizers import Optimizer
 from jaxtyping import Array, Float
-from numpyro.optim import _NumPyroOptim
 
 LatentsT = Float[Array, "latents"]
 
@@ -18,7 +16,10 @@ BatchedOutputT = Float[Array, "#stars output"]
 
 TransformFuncT = Callable[..., OutputT]
 
-OptimizerT = _NumPyroOptim | Optimizer | Any
+# Any numpyro optimizer, or a raw jax optimizer triple. Narrowing this is not
+# worth it: numpyro's own optimizer base class is private, and a union with Any
+# collapses to Any regardless.
+OptimizerT = Any
 
 PackedParamsT = dict[str, Any]
 UnpackedParamsT = dict[str, dict[str, Any] | Array]
