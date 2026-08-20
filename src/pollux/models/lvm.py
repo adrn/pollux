@@ -102,6 +102,26 @@ def select_outputs(
     return selected
 
 
+def _latents_from_pars(
+    pars: Mapping[str, Any], latents: BatchedLatentsT | None
+) -> BatchedLatentsT:
+    """The latents to work with: the ones passed, else the ones in ``pars``.
+
+    Every method that takes both accepts the latents either way round, so the
+    fallback and its error message live here rather than at each call site.
+    """
+    if latents is not None:
+        return latents
+    if "latents" not in pars:
+        msg = (
+            "No latents given and none found in pars['latents']. Either pass "
+            "latents=... explicitly, or pass the parameters returned by "
+            "optimize() / optimize_iterative(), which include the latents."
+        )
+        raise KeyError(msg)
+    return pars["latents"]
+
+
 class LVMOutput(eqx.Module):
     data_transform: AbstractSingleTransform | TransformSequence
     err_transform: AbstractSingleTransform | TransformSequence
@@ -348,15 +368,7 @@ class LVM(eqx.Module):
             )
             raise TypeError(msg)
 
-        if latents is None:
-            if "latents" not in pars:
-                msg = (
-                    "No latents given and none found in pars['latents']. Either pass "
-                    "latents=... explicitly, or pass the parameters returned by "
-                    "optimize() / optimize_iterative(), which include the latents."
-                )
-                raise KeyError(msg)
-            latents = pars["latents"]
+        latents = _latents_from_pars(pars, latents)
 
         if latents.shape[-1] != self.latent_size:
             msg = (
@@ -677,15 +689,7 @@ class LVM(eqx.Module):
         the objective is exactly quadratic and these are the exact posterior widths
         rather than an approximation.
         """
-        if latents is None:
-            if "latents" not in pars:
-                msg = (
-                    "No latents given and none found in pars['latents']. Either pass "
-                    "latents=... explicitly, or pass the parameters returned by "
-                    "optimize() / optimize_iterative(), which include the latents."
-                )
-                raise KeyError(msg)
-            latents = pars["latents"]
+        latents = _latents_from_pars(pars, latents)
 
         if isinstance(names, str):
             names = [names]
