@@ -1927,15 +1927,12 @@ dev = [
     { name = "hatch" },
     { name = "ipykernel" },
     { name = "ipywidgets" },
-    { name = "jupyter-client" },
     { name = "matplotlib" },
     { name = "myst-nb" },
-    { name = "myst-parser" },
     { name = "nbconvert" },
     { name = "pre-commit" },
     { name = "pytest" },
     { name = "pytest-cov" },
-    { name = "pytz" },
     { name = "rtds-action" },
     { name = "ruff" },
     { name = "sphinx" },
@@ -1944,10 +1941,8 @@ dev = [
     { name = "sphinx-copybutton" },
     { name = "sphinx-design" },
     { name = "sphinx-prompt" },
-    { name = "sphinx-tippy" },
     { name = "sphinx-togglebutton" },
     { name = "sphinxext-opengraph" },
-    { name = "sphinxext-rediraffe" },
     { name = "twine" },
     { name = "ty" },
 ]
@@ -1957,12 +1952,9 @@ docs = [
     { name = "h5py" },
     { name = "ipykernel" },
     { name = "ipywidgets" },
-    { name = "jupyter-client" },
     { name = "matplotlib" },
     { name = "myst-nb" },
-    { name = "myst-parser" },
     { name = "nbconvert" },
-    { name = "pytz" },
     { name = "rtds-action" },
     { name = "sphinx" },
     { name = "sphinx-autodoc-typehints" },
@@ -1970,10 +1962,8 @@ docs = [
     { name = "sphinx-copybutton" },
     { name = "sphinx-design" },
     { name = "sphinx-prompt" },
-    { name = "sphinx-tippy" },
     { name = "sphinx-togglebutton" },
     { name = "sphinxext-opengraph" },
-    { name = "sphinxext-rediraffe" },
 ]
 test = [
     { name = "pytest" },
@@ -1997,17 +1987,13 @@ dev = [
     { name = "h5py", specifier = ">=3.16.0" },
     { name = "hatch" },
     { name = "ipykernel", specifier = ">=6.30.1" },
-    { name = "ipywidgets" },
     { name = "ipywidgets", specifier = ">=8.1.7" },
-    { name = "jupyter-client", specifier = ">=8.6.3" },
     { name = "matplotlib", specifier = ">=3.10.8" },
     { name = "myst-nb", specifier = ">=1.1.2" },
-    { name = "myst-parser", specifier = ">=0.13" },
     { name = "nbconvert", specifier = ">=7.17.0" },
     { name = "pre-commit" },
     { name = "pytest", specifier = ">=8.3" },
     { name = "pytest-cov", specifier = ">=3" },
-    { name = "pytz", specifier = ">=2024.2" },
     { name = "rtds-action", specifier = ">=1.1.0" },
     { name = "ruff" },
     { name = "sphinx", specifier = ">=7.0" },
@@ -2016,10 +2002,8 @@ dev = [
     { name = "sphinx-copybutton", specifier = ">=0.5.2" },
     { name = "sphinx-design", specifier = ">=0.6.1" },
     { name = "sphinx-prompt", specifier = ">=1.8.0" },
-    { name = "sphinx-tippy", specifier = ">=0.4.3" },
     { name = "sphinx-togglebutton", specifier = ">=0.3.2" },
     { name = "sphinxext-opengraph", specifier = ">=0.9.1" },
-    { name = "sphinxext-rediraffe", specifier = ">=0.2.7" },
     { name = "twine" },
     { name = "ty", specifier = ">=0.0.70,<0.1" },
 ]
@@ -2029,12 +2013,9 @@ docs = [
     { name = "h5py", specifier = ">=3.16.0" },
     { name = "ipykernel", specifier = ">=6.30.1" },
     { name = "ipywidgets", specifier = ">=8.1.7" },
-    { name = "jupyter-client", specifier = ">=8.6.3" },
     { name = "matplotlib", specifier = ">=3.10.8" },
     { name = "myst-nb", specifier = ">=1.1.2" },
-    { name = "myst-parser", specifier = ">=0.13" },
     { name = "nbconvert", specifier = ">=7.17.0" },
-    { name = "pytz", specifier = ">=2024.2" },
     { name = "rtds-action", specifier = ">=1.1.0" },
     { name = "sphinx", specifier = ">=7.0" },
     { name = "sphinx-autodoc-typehints", specifier = ">=3.0.0" },
@@ -2042,10 +2023,8 @@ docs = [
     { name = "sphinx-copybutton", specifier = ">=0.5.2" },
     { name = "sphinx-design", specifier = ">=0.6.1" },
     { name = "sphinx-prompt", specifier = ">=1.8.0" },
-    { name = "sphinx-tippy", specifier = ">=0.4.3" },
     { name = "sphinx-togglebutton", specifier = ">=0.3.2" },
     { name = "sphinxext-opengraph", specifier = ">=0.9.1" },
-    { name = "sphinxext-rediraffe", specifier = ">=0.2.7" },
 ]
 test = [
     { name = "pytest", specifier = ">=8.3" },
@@ -2226,15 +2205,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/66/c0/0c8b6ad9f17a802ee498c46e004a0eb49bc148f2fd230864601a86dcf6db/python-dateutil-2.9.0.post0.tar.gz", hash = "sha256:37dd54208da7e1cd875388217d5e00ebd4179249f90fb72437e91a35459a0ad3", size = 342432, upload-time = "2024-03-01T18:36:20.211Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/ec/57/56b9bcc3c9c6a792fcbaf139543cee77261f3651ca9da0c93f5c1221264b/python_dateutil-2.9.0.post0-py2.py3-none-any.whl", hash = "sha256:a8b2bc7bffae282281c8140a97d3aa9c14da0b136dfe83f850eea9a5f7470427", size = 229892, upload-time = "2024-03-01T18:36:18.57Z" },
-]
-
-[[package]]
-name = "pytz"
-version = "2025.2"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/f8/bf/abbd3cdfb8fbc7fb3d4d38d320f2441b1e7cbe29be4f23797b4a2b5d8aac/pytz-2025.2.tar.gz", hash = "sha256:360b9e3dbb49a209c21ad61809c7fb453643e048b38924c765813546746e81c3", size = 320884, upload-time = "2025-03-25T02:25:00.538Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/81/c4/34e93fe5f5429d7570ec1fa436f1986fb1f00c3e0f43a589fe2bbcd22c3f/pytz-2025.2-py2.py3-none-any.whl", hash = "sha256:5ddf76296dd8c44c26eb8f4b6f35488f3ccbf6fbbd7adee0b7262d43f0ec2f00", size = 509225, upload-time = "2025-03-25T02:24:58.468Z" },
 ]
 
 [[package]]
@@ -2788,21 +2758,6 @@ wheels = [
 ]
 
 [[package]]
-name = "sphinx-tippy"
-version = "0.4.3"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "beautifulsoup4" },
-    { name = "jinja2" },
-    { name = "requests" },
-    { name = "sphinx" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/1d/2b/411b0a8fdcd6729c0de4ea41fdfa6ac25f5c334ed7a9194075c79f004398/sphinx_tippy-0.4.3.tar.gz", hash = "sha256:255abee0aed8085fdb9ab0cc595cd7a45748ae7f4662156e500a17a3f73ad63d", size = 117195, upload-time = "2024-04-23T13:14:45.461Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/54/5d/60c9da704aee0f269a6d6bbd0e24ca61ef34effa6fd5863ca46f496e7cea/sphinx_tippy-0.4.3-py3-none-any.whl", hash = "sha256:572b0e001baec9b03e2b19ec4e9760ca1a853f4c3226b5cea251f477b2c2b096", size = 9952, upload-time = "2024-04-23T13:14:43.245Z" },
-]
-
-[[package]]
 name = "sphinx-togglebutton"
 version = "0.3.2"
 source = { registry = "https://pypi.org/simple" }
@@ -2881,18 +2836,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/f6/c0/eb6838e3bae624ce6c8b90b245d17e84252863150e95efdb88f92c8aa3fb/sphinxext_opengraph-0.13.0.tar.gz", hash = "sha256:103335d08567ad8468faf1425f575e3b698e9621f9323949a6c8b96d9793e80b", size = 1026875, upload-time = "2025-08-29T12:20:31.066Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/bf/a4/66c1fd4f8fab88faf71cee04a945f9806ba0fef753f2cfc8be6353f64508/sphinxext_opengraph-0.13.0-py3-none-any.whl", hash = "sha256:936c07828edc9ad9a7b07908b29596dc84ed0b3ceaa77acdf51282d232d4d80e", size = 1004152, upload-time = "2025-08-29T12:20:29.072Z" },
-]
-
-[[package]]
-name = "sphinxext-rediraffe"
-version = "0.3.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "sphinx" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/e3/a9/ab13d156049eea633f992424f3e92cb40e3f1b606bb6d01d40a27457d38a/sphinxext_rediraffe-0.3.0.tar.gz", hash = "sha256:f319b3ccb7c3c3b6f63ffa6fd3eeb171b6d272df55075a9e84364394f391f507", size = 22114, upload-time = "2025-09-28T15:31:53.641Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/87/55/ab40a0d1378ee5c859590a633052cf1d0a1f8435af87558a9f7cd576601a/sphinxext_rediraffe-0.3.0-py3-none-any.whl", hash = "sha256:f4220beafa99c99177488276b8e4fcf61fbeeec4253c1e4aae841a18c475330c", size = 7194, upload-time = "2025-09-28T15:31:52.388Z" },
 ]
 
 [[package]]
