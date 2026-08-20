@@ -1,9 +1,10 @@
 <img src="https://pollux-astro.readthedocs.io/en/latest/_static/Pollux-logo.png" alt="Pollux logo" width="200"/>
 
-Pollux is a framework for building data-driven latent variable models in JAX: with
-`pollux.LVM` you define a latent space and compose transforms from it to any number of
-observed outputs. It ships with `pollux.Lux` and `pollux.Cannon` as ready-made
-architectures for stellar spectroscopy, but the model-building pieces are general.
+Pollux is a framework for building data-driven latent variable models in JAX. You can
+define a latent space and then define transforms from the latents to any number of
+observed outputs. Pollux was designed with stellar spectroscopy applications in mind
+(and it comes with `pollux.Lux` and `pollux.Cannon` as ready-made architectures), but
+the model-building pieces are very general.
 
 [![Documentation Status][rtd-badge]][rtd-link]
 [![Actions Status][actions-badge]][actions-link]
