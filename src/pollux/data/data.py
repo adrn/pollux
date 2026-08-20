@@ -10,7 +10,7 @@ from xmmutablemap import ImmutableMap
 
 from ..exceptions import PolluxPreprocessingWarning
 from ..typing import BatchedDataT
-from .preprocessor import AbstractPreprocessor, NullPreprocessor
+from .preprocessor import AbstractPreprocessor
 
 
 class OutputData(eqx.Module):
@@ -83,7 +83,7 @@ class OutputData(eqx.Module):
     err: BatchedDataT = eqx.field(
         default_factory=lambda: jnp.array(0.0), converter=jnp.asarray
     )
-    preprocessor: AbstractPreprocessor = eqx.field(default=NullPreprocessor())
+    preprocessor: AbstractPreprocessor | None = eqx.field(default=None)
     processed: bool = eqx.field(default=False)
 
     def __post_init__(self) -> None:
@@ -106,6 +106,9 @@ class OutputData(eqx.Module):
         """Preprocess the data using the preprocessor."""
         if self.processed:
             return self
+
+        if self.preprocessor is None:
+            return OutputData(data=self.data, err=self.err, processed=True)
 
         return OutputData(
             data=self.preprocessor.transform(self.data),
@@ -133,6 +136,9 @@ class OutputData(eqx.Module):
         if not data.processed:
             msg = "Data is not processed, so it cannot be unprocessed"
             raise ValueError(msg)
+
+        if self.preprocessor is None:
+            return OutputData(data=data.data, err=data.err, processed=False)
 
         return OutputData(
             data=self.preprocessor.inverse_transform(data.data),
@@ -257,8 +263,7 @@ def warn_if_unprocessed(data: PolluxData, caller: str) -> None:
     pending = [
         name
         for name, output in data.items()
-        if not output.processed
-        and not isinstance(output.preprocessor, NullPreprocessor)
+        if not output.processed and output.preprocessor is not None
     ]
     if not pending:
         return

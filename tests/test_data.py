@@ -3,7 +3,7 @@ import jax.numpy as jnp
 import pytest
 
 import pollux as plx
-from pollux.data import NullPreprocessor, OutputData, PolluxData, ShiftScalePreprocessor
+from pollux.data import OutputData, PolluxData, ShiftScalePreprocessor
 from pollux.data.data import warn_if_unprocessed
 from pollux.exceptions import PolluxPreprocessingWarning
 from pollux.models.transforms import LinearTransform
@@ -48,7 +48,7 @@ class TestOutputData:
         col = OutputData(data=sample_arrays["flux"])
         new_col = col.preprocess()
         assert new_col.processed is True
-        assert isinstance(col.preprocessor, NullPreprocessor)
+        assert col.preprocessor is None
         assert jnp.all(new_col.data == col.data)
 
     def test_preprocess_custom(self, sample_arrays):
@@ -167,8 +167,8 @@ class TestWarnIfUnprocessed:
         # pytest is configured to turn warnings into errors, so a warning here fails
         warn_if_unprocessed(data.preprocess(), "optimize()")
 
-    def test_silent_for_null_preprocessor(self, sample_arrays):
-        warn_if_unprocessed(self._data(sample_arrays, NullPreprocessor()), "optimize()")
+    def test_silent_without_preprocessor(self, sample_arrays):
+        warn_if_unprocessed(self._data(sample_arrays, None), "optimize()")
 
     def test_optimize_warns(self, sample_arrays):
         """The guard is wired into the fitting entry points, not just available."""

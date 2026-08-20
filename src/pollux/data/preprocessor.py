@@ -47,48 +47,6 @@ class AbstractPreprocessor(eqx.Module):
         """Apply inverse preprocessing transform to the input data uncertainties."""
 
 
-class NullPreprocessor(AbstractPreprocessor):
-    """A preprocessor that does nothing to the input data.
-
-    Examples
-    --------
-    >>> import jax.numpy as jnp
-    >>> import jax.random as jrnd
-    >>> from pollux.data import NullPreprocessor
-    >>> data = jrnd.normal(jrnd.PRNGKey(0), shape=(1024, 10))
-    >>> preprocessor = NullPreprocessor()
-    >>> new_data = preprocessor.transform(data)
-    >>> assert jnp.all(new_data == data)
-    """
-
-    def __init__(self) -> None:
-        # Explicit (rather than equinox's generated __init__) so that callers
-        # constructing a NullPreprocessor type check.
-        pass
-
-    @classmethod
-    def from_data(cls, data: BatchedDataT) -> "NullPreprocessor":
-        """Return a preprocessor; there is nothing to compute from the data."""
-        del data
-        return cls()
-
-    def transform(self, X: BatchedDataT) -> BatchedDataT:
-        """Apply preprocessing transform to the input data."""
-        return X
-
-    def inverse_transform(self, X: BatchedDataT) -> BatchedDataT:
-        """Apply inverse preprocessing transform to the input data."""
-        return X
-
-    def transform_err(self, X_err: BatchedDataT) -> BatchedDataT:
-        """Apply preprocessing transform to the input data uncertainties."""
-        return X_err
-
-    def inverse_transform_err(self, X_err: BatchedDataT) -> BatchedDataT:
-        """Apply inverse preprocessing transform to the input data uncertainties."""
-        return X_err
-
-
 class ShiftScalePreprocessor(AbstractPreprocessor):
     """Shift and then scale the data.
 
