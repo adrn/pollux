@@ -61,6 +61,7 @@ python_use_unqualified_type_names = True
 exclude_patterns = [
     "_build",
     "_data",
+    "_inventories",
     "**.ipynb_checkpoints",
     "Thumbs.db",
     ".DS_Store",
@@ -70,14 +71,25 @@ exclude_patterns = [
 
 source_suffix = [".md", ".rst", ".ipynb"]
 
+# Bound how long a dead host can stall the build. Without this the fetch waits
+# on the OS connect timeout, which is why a docs failure took minutes to arrive.
+intersphinx_timeout = 15
+
+# docs.kidger.site is not reachable from GitHub's runners even though it serves
+# fine from a browser, and with -W an unreachable inventory is a hard failure.
+#
+# Refresh the local inventory when a new equinox reference will not resolve:
+#   curl -o docs/_inventories/equinox.inv https://docs.kidger.site/equinox/objects.inv
 intersphinx_mapping = {
     "python": ("https://docs.python.org/3", None),
-    "equinox": ("https://docs.kidger.site/equinox/", None),
-    "jax": ("https://jax.readthedocs.io/en/latest/", None),
-    "jaxtyping": ("https://docs.kidger.site/jaxtyping/", None),
+    "equinox": (
+        "https://docs.kidger.site/equinox/",
+        (None, "_inventories/equinox.inv"),
+    ),
+    # Redirects to docs.jax.dev, so point straight at it
+    "jax": ("https://docs.jax.dev/en/latest/", None),
     "numpy": ("https://numpy.org/doc/stable/", None),
     "numpyro": ("https://num.pyro.ai/en/stable", None),
-    "unxt": ("http://unxt.readthedocs.io/en/latest/", None),
 }
 
 # -- Autodoc settings ---------------------------------------------------
