@@ -21,7 +21,7 @@ __all__ = [
 
 import abc
 import inspect
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from itertools import accumulate, combinations_with_replacement
 from math import comb
 from typing import Any
@@ -332,6 +332,36 @@ class AbstractMultiTransform(AbstractTransform):
         """Flat parameter names, for compatibility when nested in another transform."""
         return self.names_flat
 
+    @abc.abstractmethod
+    def _child_input_sizes(self, latent_size: int) -> Iterator[int]:
+        """The input size each child transform sees, in child order.
+
+        This is the only thing the wiring changes about parameter expansion, so it
+        is what subclasses supply and :meth:`get_expanded_priors` is shared.
+        """
+        raise NotImplementedError
+
+    def get_expanded_priors(
+        self, latent_size: int, data_size: int | None = None
+    ) -> ParamPriorsT:
+        """Child priors, flattened under the ``"{index}:{param}"`` naming scheme.
+
+        Each child is expanded at the input size :meth:`_child_input_sizes` gives
+        it, which is where the subclasses differ: a sequence feeds each transform
+        the previous one's output, while a concatenation gives each its own slice
+        of the latents.
+        """
+        sizes = self._child_input_sizes(latent_size)
+        return ImmutableMap(
+            **{
+                f"{i}:{param_name}": prior
+                for i, (transform, size) in enumerate(zip(self.transforms, sizes))
+                for param_name, prior in transform.get_expanded_priors(
+                    latent_size=size, data_size=data_size
+                ).items()
+            }
+        )
+
     def _child_pars(
         self, args: tuple[dict[str, Any], ...], kwargs: dict[str, Any]
     ) -> list[dict[str, Any]]:
@@ -452,34 +482,15 @@ class TransformSequence(AbstractMultiTransform):
             output = transform.apply(output, **transform_pars)
         return output
 
-    def get_expanded_priors(
-        self, latent_size: int, data_size: int | None = None
-    ) -> ParamPriorsT:
-        """Get expanded parameter priors using flat naming scheme.
+    def _child_input_sizes(self, latent_size: int) -> Iterator[int]:
+        """Each transform's input is the previous transform's output.
 
-        Returns flattened parameter priors with index-based naming for
-        compatibility with the AbstractTransform interface.
-        Parameter names will be in the format: "{transform_index}:{param_name}"
-
-        Note: For transform sequences, each transform's "latent_size" is the
-        output size of the previous transform (or the model's latent_size for
-        the first transform).
+        The first one sees the model's own ``latent_size``.
         """
-        priors = {}
-        current_size = latent_size
-
-        for i, transform in enumerate(self.transforms):
-            transform_priors = transform.get_expanded_priors(
-                latent_size=current_size, data_size=data_size
-            )
-            for param_name, prior in transform_priors.items():
-                flat_name = f"{i}:{param_name}"
-                priors[flat_name] = prior
-
-            # The next transform's "latent_size" is this one's output size
-            current_size = transform.get_output_size(current_size)
-
-        return ImmutableMap(**priors)
+        size = latent_size
+        for transform in self.transforms:
+            yield size
+            size = transform.get_output_size(size)
 
 
 class ConcatenateTransform(AbstractMultiTransform):
@@ -585,20 +596,8 @@ class ConcatenateTransform(AbstractMultiTransform):
         ]
         return jnp.concatenate(outputs, axis=-1)
 
-    def get_expanded_priors(
-        self, latent_size: int, data_size: int | None = None
-    ) -> ParamPriorsT:
-        """Get expanded parameter priors using flat naming scheme.
-
-        Each child transform receives its corresponding ``input_sizes[i]`` as
-        its ``latent_size``.
-
-        Parameters
-        ----------
-        latent_size
-            Total latent size (must equal ``sum(input_sizes)``).
-        data_size
-            Number of objects in the dataset, passed through to child transforms.
+    def _child_input_sizes(self, latent_size: int) -> Iterator[int]:
+        """Each child gets the slice of the latents ``input_sizes`` allots it.
 
         Raises
         ------
@@ -606,19 +605,7 @@ class ConcatenateTransform(AbstractMultiTransform):
             If ``latent_size`` does not match ``sum(input_sizes)``.
         """
         self.get_output_size(latent_size)  # validates latent_size
-
-        priors = {}
-        for i, (transform, input_size) in enumerate(
-            zip(self.transforms, self.input_sizes)
-        ):
-            transform_priors = transform.get_expanded_priors(
-                latent_size=input_size, data_size=data_size
-            )
-            for param_name, prior in transform_priors.items():
-                flat_name = f"{i}:{param_name}"
-                priors[flat_name] = prior
-
-        return ImmutableMap(**priors)
+        return iter(self.input_sizes)
 
     def get_output_size(self, input_size: int) -> int:
         """Compute total output size.
