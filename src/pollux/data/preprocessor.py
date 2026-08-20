@@ -8,19 +8,14 @@ from ..typing import BatchedDataT
 
 
 def _check_no_constant_features(scale: jax.Array) -> None:
-    """Raise if any feature has zero spread (e.g. a bad detector pixel).
-
-    Takes the scale the preprocessor is actually going to divide by, rather than
-    re-deriving one: what matters is that *that* quantity is nonzero, and for a
-    percentile scale it is not the standard deviation.
-    """
+    """Raise if any feature has zero spread (e.g. a bad detector pixel)."""
     constant_mask = scale == 0
     if jnp.any(constant_mask):
         (bad_idx,) = jnp.where(jnp.atleast_1d(constant_mask))
         msg = (
-            f"Found {len(bad_idx)} feature(s) with zero spread across all samples "
-            f"(e.g., bad detector pixels holding identical values). These cannot be "
-            f"normalized, as the scale to divide by would be zero. Feature indices: "
+            f"Found {len(bad_idx)} feature(s) with identical values across all "
+            f"samples (e.g., bad detector pixels). These features have zero "
+            f"variance and cannot be normalized. Feature indices: "
             f"{bad_idx.tolist()}. Remove or mask these features before "
             "preprocessing."
         )
@@ -192,7 +187,7 @@ class ShiftScalePreprocessor(AbstractPreprocessor):
             )
             / 2.0
         )[0]
-        _check_no_constant_features(_scale)
+        _check_no_constant_features(jnp.std(data, axis=axis))
         return cls(jnp.nanpercentile(data, loc_percentile, axis=axis), _scale)
 
     def transform(self, X: BatchedDataT) -> BatchedDataT:
