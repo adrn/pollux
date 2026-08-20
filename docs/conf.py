@@ -41,7 +41,6 @@ language = "en"
 
 extensions = [
     "myst_nb",
-    # "myst_parser",
     "sphinx_design",
     "sphinx.ext.autodoc",
     "sphinx.ext.autosummary",
@@ -53,7 +52,6 @@ extensions = [
     "sphinx-prompt",
     "sphinxext.opengraph",
     "sphinx_togglebutton",
-    # "sphinx_tippy",
 ]
 
 python_use_unqualified_type_names = True

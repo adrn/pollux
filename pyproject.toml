@@ -33,6 +33,7 @@ dynamic = ["version"]
 dependencies = [
   "equinox>=0.11.12",
   "jax>=0.7.2",
+  "jaxtyping>=0.3",           # the array-shape aliases in pollux.typing
   "numpyro>=0.19.0",
   "tqdm>=4.67.1",
   "typing-extensions>=4.15.0",  # TypeIs; only in typing from 3.13
@@ -53,29 +54,23 @@ docs = [
   "h5py>=3.16.0",
   "ipykernel>=6.30.1",
   "ipywidgets>=8.1.7",
-  "jupyter-client>=8.6.3",
   "matplotlib>=3.10.8",
   "myst-nb>=1.1.2",
-  "myst_parser>=0.13",
   "nbconvert>=7.17.0",
-  "pytz>=2024.2",               # for copyright date
   "rtds-action>=1.1.0",
   "sphinx-book-theme==1.1.3",
   "sphinx-prompt>=1.8.0",
-  "sphinx-tippy>=0.4.3",
   "sphinx>=7.0",
   "sphinx_autodoc_typehints>=3.0.0",
   "sphinx_copybutton>=0.5.2",
   "sphinx_design>=0.6.1",
   "sphinx_togglebutton>=0.3.2",
   "sphinxext-opengraph>=0.9.1",
-  "sphinxext-rediraffe>=0.2.7",
 ]
 dev = [
   {include-group = "test"},
   {include-group = "docs"},
   "hatch",
-  "ipywidgets",
   "pre-commit",
   "twine",
   "ruff",
@@ -184,18 +179,3 @@ ignore = [
 "tests/**" = ["T20", "F841", "RUF059"]
 "**/__init__.py" = ["F401", "F403"]
 "docs/**" = ["T201"]
-
-
-[tool.pylint]
-py-version = "3.12"
-ignore-paths = [".*/_version.py"]
-reports.output-format = "colorized"
-similarities.ignore-imports = "yes"
-messages_control.disable = [
-  "design",
-  "fixme",
-  "line-too-long",
-  "missing-module-docstring",
-  "missing-function-docstring",
-  "wrong-import-position",
-]
