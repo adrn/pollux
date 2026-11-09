@@ -176,7 +176,7 @@ class OutputData(eqx.Module):
 
 
 class PolluxData(ImmutableMap[str, OutputData]):
-    def __init__(self, **kwargs: OutputData) -> None:
+    def __init__(self, **kwargs: OutputData) -> None:  # noqa: ARG002
         """A data container for observed outputs from a Pollux model.
 
         For example, this could be the observed fluxes, labels, and errors for a set of
@@ -190,7 +190,7 @@ class PolluxData(ImmutableMap[str, OutputData]):
             OutputData instance.
 
         """
-        super().__init__(**kwargs)
+        # ImmutableMap (a frozendict) is filled in __new__.
         self._validate()
 
     def __getitem__(self, key: slice | ArrayLike | str) -> Union["OutputData", Any]:

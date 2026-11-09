@@ -1976,7 +1976,7 @@ requires-dist = [
     { name = "numpyro", specifier = ">=0.19.0" },
     { name = "tqdm", specifier = ">=4.67.1" },
     { name = "typing-extensions", specifier = ">=4.15.0" },
-    { name = "xmmutablemap", specifier = ">=0.2.0" },
+    { name = "xmmutablemap", specifier = ">=0.3" },
 ]
 
 [package.metadata.requires-dev]
@@ -3130,15 +3130,15 @@ wheels = [
 
 [[package]]
 name = "xmmutablemap"
-version = "0.2.0"
+version = "0.3.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "jax" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/d2/a5/700451d046c0cd689f5f6df7cd8d0ff6402cc4cd38676281629db6ca60b9/xmmutablemap-0.2.0.tar.gz", hash = "sha256:631d03aa544abbdf39897a29d6e206aa3bfa7e9676fd7e088661786f254444ca", size = 97716, upload-time = "2025-09-02T18:31:27.196Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/92/f4/ea72d36313924c94c073e7c71af6584e10517e8be2c77ce0774f98913396/xmmutablemap-0.3.1.tar.gz", hash = "sha256:2f38060deb80ae75dc6bd150d0dac87b1e098d08301482267e579ca5b9cb4aa1", size = 176274, upload-time = "2026-10-16T01:47:12.045Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/0f/7d/0a877a71489aca50590cbafdb468291b90e48349e4994538f551f3ce06fc/xmmutablemap-0.2.0-py3-none-any.whl", hash = "sha256:309aaf4f56972bedf12f20872ab6f1d4bfa36cad29f7bb035256e17b8cf3d834", size = 7565, upload-time = "2025-09-02T18:31:25.852Z" },
+    { url = "https://files.pythonhosted.org/packages/b1/2d/fa9208602efe8a8705a6dba55e45e9fb239c07532d08501971d08ba874a5/xmmutablemap-0.3.1-py3-none-any.whl", hash = "sha256:fb5d36c699fb7b80ed2d0cf34a94d6d5f6df1076ad7773adec1cf7f5e76c32ab", size = 13744, upload-time = "2026-10-16T01:47:10.728Z" },
 ]
 
 [[package]]
